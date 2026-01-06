@@ -1,0 +1,22 @@
+# Logs
+*.log
+governance-lifecycle.log
+
+# Archives (large, non-essential)
+archive/
+
+# Migration artifacts (historical, no longer active)
+migration/
+
+# Temporary files
+*.tmp
+*.swp
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test output
+test-output/

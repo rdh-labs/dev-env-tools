@@ -1,0 +1,1 @@
+/home/ichardart/dev/infrastructure/dev-env-docs/scripts/simple-inventory-tracker.py

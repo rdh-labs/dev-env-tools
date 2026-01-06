@@ -1,0 +1,1 @@
+/home/ichardart/dev/infrastructure/dev-env-docs/scripts/governance-shortcuts.sh

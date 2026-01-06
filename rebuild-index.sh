@@ -1,0 +1,1 @@
+/home/ichardart/dev/infrastructure/dev-env-docs/scripts/rebuild-index.sh
