@@ -12,6 +12,7 @@ declare -A CANONICAL_PATHS=(
     ["IDEAS-BACKLOG.md"]="$HOME/dev/infrastructure/dev-env-docs/IDEAS-BACKLOG.md"
     ["DECISIONS-LOG.md"]="$HOME/dev/infrastructure/dev-env-docs/DECISIONS-LOG.md"
     ["ISSUES-TRACKER.md"]="$HOME/dev/infrastructure/dev-env-docs/ISSUES-TRACKER.md"
+    ["CHANGE-LOG.md"]="$HOME/dev/infrastructure/dev-env-docs/CHANGE-LOG.md"
     ["lessons.md"]="$HOME/dev/infrastructure/dev-env-config/lessons.md"
 )
 
@@ -20,6 +21,7 @@ declare -A ALLOWED_SYMLINKS=(
     ["IDEAS-BACKLOG.md"]="$HOME/dev/IDEAS-BACKLOG.md"
     ["DECISIONS-LOG.md"]=""  # No symlink expected
     ["ISSUES-TRACKER.md"]=""  # No symlink expected
+    ["CHANGE-LOG.md"]="$HOME/dev/CHANGE-LOG.md"
     ["lessons.md"]="$HOME/lessons.md"
 )
 
