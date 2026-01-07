@@ -50,6 +50,7 @@ declare -A CANONICAL_PATHS=(
     ["ISSUES-TRACKER.md"]="$HOME/dev/infrastructure/dev-env-docs/ISSUES-TRACKER.md"
     ["CHANGE-LOG.md"]="$HOME/dev/infrastructure/dev-env-docs/CHANGE-LOG.md"
     ["lessons.md"]="$HOME/dev/infrastructure/dev-env-config/lessons.md"
+    ["AUTHORITATIVE.yaml"]="$HOME/dev/infrastructure/dev-env-config/registry/AUTHORITATIVE.yaml"
 )
 
 # Allowed symlink locations (these should point to canonical)
@@ -59,6 +60,7 @@ declare -A ALLOWED_SYMLINKS=(
     ["ISSUES-TRACKER.md"]=""  # No symlink expected
     ["CHANGE-LOG.md"]="$HOME/dev/CHANGE-LOG.md"
     ["lessons.md"]="$HOME/lessons.md"
+    ["AUTHORITATIVE.yaml"]="$HOME/dev/AUTHORITATIVE.yaml"
 )
 
 # Search paths to check for rogue files
@@ -210,7 +212,7 @@ Run: \`~/dev/infrastructure/tools/governance-file-monitor.sh --fix\`
     exit 1
 else
     # Send success notification
-    send_ntfy "✅ Governance OK" "All 5 governance files in correct locations" "low" "white_check_mark"
+    send_ntfy "✅ Governance OK" "All 6 governance files in correct locations" "low" "white_check_mark"
 
     if [ "$QUIET_MODE" = false ]; then
         echo "All governance files OK"
