@@ -20,3 +20,30 @@ __pycache__/
 
 # Test output
 test-output/
+# Symlinks to dev-env-docs/scripts/ (tracked there)
+ESSENTIAL-SCRIPTS.md
+SCRIPTS-INVENTORY.md
+check-skill-updates.sh
+check-tool-updates.sh
+claude-startup.sh
+daily-metrics.sh
+discovery-check.sh
+governance-check.sh
+governance-file-monitor.sh
+governance-regression-check.sh
+governance-shortcuts.sh
+governance-validation.sh
+handoff-metrics.sh
+init-agent-session.sh
+maintenance-health-check.sh
+measure-discovery-success.sh
+metrics-collector.sh
+metrics-summary.sh
+nightly-maintenance.sh
+portfolio-audit.sh
+program-review-packet.sh
+rebuild-index.sh
+setup-automation.sh
+smart-discover.sh
+weekly-report.sh
+governance-integration-plan.md
