@@ -113,10 +113,18 @@ for filename in "${!CANONICAL_PATHS[@]}"; do
         continue
     fi
 
+    # Track processed files to avoid duplicates from overlapping search paths
+    declare -A processed_files
+
     # Check for rogue files in search paths
     for search_path in "${SEARCH_PATHS[@]}"; do
         # Find files with this name (not in infrastructure/)
         while IFS= read -r found_file; do
+            # Skip if already processed (deduplication for overlapping search paths)
+            if [ "${processed_files[$found_file]:-0}" = "1" ]; then
+                continue
+            fi
+            processed_files[$found_file]=1
             # Skip if it's the canonical file
             if [ "$found_file" = "$canonical" ]; then
                 continue
@@ -172,7 +180,7 @@ for filename in "${!CANONICAL_PATHS[@]}"; do
             file_lines=$(wc -l < "$found_file" 2>/dev/null || echo 0)
             alert "ROGUE FILE: $found_file (${file_lines} lines, ${file_size} bytes)"
 
-        done < <(find "$search_path" -maxdepth 2 -name "$filename" -type f 2>/dev/null)
+        done < <(find "$search_path" -maxdepth 2 -name "$filename" 2>/dev/null)
     done
 done
 
