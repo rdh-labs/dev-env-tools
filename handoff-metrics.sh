@@ -110,10 +110,10 @@ print_summary() {
   echo "Total events: $(wc -l < "$LOG_FILE" | tr -d ' ')"
   echo
   echo "By agent:"
-  awk -F'"' '/"agent"/ {a[$4]++} END {for (k in a) printf "  %s: %d\n", k, a[k]}' "$LOG_FILE" | sort
+  awk -F'"' '/"agent"/ {a[$8]++} END {for (k in a) printf "  %s: %d\n", k, a[k]}' "$LOG_FILE" | sort
   echo
   echo "By status:"
-  awk -F'"' '/"status"/ {s[$4]++} END {for (k in s) printf "  %s: %d\n", k, s[k]}' "$LOG_FILE" | sort
+  awk -F'"' '/"status"/ {s[$16]++} END {for (k in s) printf "  %s: %d\n", k, s[k]}' "$LOG_FILE" | sort
 }
 
 load_thresholds() {
@@ -207,10 +207,10 @@ check_thresholds() {
       if [ "$event_time" -gt 0 ]; then
         age=$((current_time - event_time))
         if [ "$age" -le "$lookback_seconds" ]; then
-          ((recent_handoffs++))
+          recent_handoffs=$((recent_handoffs + 1))
         fi
         if [ "$age" -le "$critical_lookback_seconds" ]; then
-          ((very_recent_handoffs++))
+          very_recent_handoffs=$((very_recent_handoffs + 1))
         fi
       fi
     fi
