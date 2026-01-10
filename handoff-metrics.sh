@@ -176,8 +176,8 @@ check_thresholds() {
   local incomplete_rate
 
   total_handoffs=$(wc -l < "$LOG_FILE" | tr -d ' ')
-  complete_count=$(grep -c '"status":"complete"' "$LOG_FILE" || echo "0")
-  incomplete_count=$(grep -c '"status":"incomplete"' "$LOG_FILE" || echo "0")
+  complete_count=$(grep -c '"status":"complete"' "$LOG_FILE" || true)
+  incomplete_count=$(grep -c '"status":"incomplete"' "$LOG_FILE" || true)
 
   if [ "$total_handoffs" -eq 0 ]; then
     incomplete_rate=0
