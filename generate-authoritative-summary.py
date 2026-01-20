@@ -43,14 +43,41 @@ def get_file_hash(filepath: str) -> str:
         return "unknown"
 
 
-def build_summary(auth_yaml: dict) -> dict:
-    """Extract key information from AUTHORITATIVE.yaml."""
+def parse_section_lines(filepath: str) -> dict:
+    """Parse YAML file to find line numbers of top-level sections.
 
+    Returns dict mapping section names to line numbers.
+    """
+    section_lines = {}
+    try:
+        with open(filepath, 'r') as f:
+            for line_num, line in enumerate(f, start=1):
+                # Look for top-level keys (no leading whitespace, ends with :)
+                if line and not line[0].isspace() and ':' in line and not line.startswith('#'):
+                    section_name = line.split(':')[0].strip()
+                    if section_name:
+                        section_lines[section_name] = line_num
+    except Exception as e:
+        print(f"Warning: Could not parse section lines from {filepath}: {e}", file=sys.stderr)
+
+    return section_lines
+
+
+def build_summary(auth_yaml: dict, source_filepath: str) -> dict:
+    """Extract key information from AUTHORITATIVE.yaml.
+
+    Args:
+        auth_yaml: Parsed YAML data
+        source_filepath: Path to source AUTHORITATIVE.yaml file
+
+    Returns:
+        Summary dict
+    """
     summary = {
         'version': '1.0',
         'generated_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         'source_file': '~/dev/AUTHORITATIVE.yaml',
-        'source_hash': get_file_hash(os.path.expanduser('~/dev/AUTHORITATIVE.yaml')),
+        'source_hash': get_file_hash(source_filepath),
         'note': 'Quick lookup index. For full details, read ~/dev/AUTHORITATIVE.yaml'
     }
 
@@ -84,28 +111,24 @@ def build_summary(auth_yaml: dict) -> dict:
     if 'mcp_servers' in auth_yaml:
         mcp_data = auth_yaml['mcp_servers']
         if isinstance(mcp_data, dict):
-            for server_name, server_info in mcp_data.items():
-                if isinstance(server_info, dict):
-                    status = server_info.get('status', 'unknown')
-                    mcp_servers[server_name] = {'status': status}
+            # Extract count and active servers list
+            mcp_servers['count'] = mcp_data.get('count', 0)
+            mcp_servers['location'] = mcp_data.get('location', 'unknown')
+            mcp_servers['active_servers'] = []
 
-    # Build section index for targeted reads
-    sections = []
-    section_map = {
-        'meta': 0,
-        'discovery_protocol': 20,
-        'architecture': 40,
-        'development_environment': 95,
-        'projects': 180,
-        'infrastructure': 260,
-        'mcp_infrastructure': 310,
-        'mcp_servers': 370,
-        'deprecated': 1500,
-        'deprecated_items': 1550,
-    }
+            if 'active_servers' in mcp_data and isinstance(mcp_data['active_servers'], list):
+                for server in mcp_data['active_servers']:
+                    if isinstance(server, str):
+                        # Remove comments if present
+                        server_name = server.split('#')[0].strip()
+                        if server_name:
+                            mcp_servers['active_servers'].append(server_name)
+
+    # Build section index for targeted reads (dynamically parsed)
+    section_lines = parse_section_lines(source_filepath)
     sections = [
-        {'name': name, 'approx_line': line}
-        for name, line in section_map.items()
+        {'name': name, 'line': line}
+        for name, line in sorted(section_lines.items(), key=lambda x: x[1])
     ]
 
     # Extract deprecated items
@@ -171,7 +194,7 @@ def main():
         sys.exit(1)
 
     # Build and write summary
-    summary = build_summary(auth_yaml)
+    summary = build_summary(auth_yaml, auth_yaml_path)
     write_summary(summary, summary_path)
 
     # Calculate tokens (rough estimate: 1 token ≈ 3.5 chars)
