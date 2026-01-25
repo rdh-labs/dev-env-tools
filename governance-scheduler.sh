@@ -303,7 +303,7 @@ PYTHON
 
 # Check one-time events
 check_one_time() {
-    ALLOW_DAY_OF="${ALLOW_DAY_OF:-true}" python3 << 'PYTHON'
+    ALLOW_DAY_OF="${ALLOW_DAY_OF:-true}" SIMULATE_REMINDER="${SIMULATE_REMINDER:-false}" SIMULATE_STAGE="${SIMULATE_STAGE:-both}" python3 << 'PYTHON'
 import yaml
 import sys
 import os
@@ -312,6 +312,8 @@ from datetime import datetime, timedelta
 
 CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 ALLOW_DAY_OF = os.environ.get("ALLOW_DAY_OF", "true").lower() == "true"
+SIMULATE_REMINDER = os.environ.get("SIMULATE_REMINDER", "false").lower() == "true"
+SIMULATE_STAGE = os.environ.get("SIMULATE_STAGE", "both")
 
 try:
     with open(CALENDAR_FILE) as f:
@@ -349,6 +351,19 @@ for event_id, event in one_time.items():
     notified_at = event.get('notified_at', {})
     if not isinstance(notified_at, dict):
         notified_at = {}
+
+    if SIMULATE_REMINDER:
+        tags = event.get('tags', 'calendar')
+        if 'simulated' not in tags.split(','):
+            tags = f"{tags},simulated"
+        stages = []
+        if SIMULATE_STAGE in ("early", "both"):
+            stages.append("early")
+        if SIMULATE_STAGE in ("day_of", "both"):
+            stages.append("day_of")
+        for stage in stages:
+            print(f"{event_id}|{event.get('message', '')}|{event.get('priority', 'default')}|{tags}|{stage}")
+        continue
 
     if now.date() == event_dt.date() and now >= event_dt:
         if ALLOW_DAY_OF and 'day_of' not in notified_at:
@@ -505,6 +520,12 @@ main() {
         stage="${stage:-day_of}"
         local sent_key="onetime:${stage}:${event_id}"
 
+        if [[ "${SIMULATE_REMINDER:-false}" == "true" ]]; then
+            echo "Simulated one-time (${stage}): $event_id"
+            send_ntfy "$message" "$priority" "$tags" || true
+            continue
+        fi
+
         if already_sent "$sent_key"; then
             continue
         fi
@@ -570,6 +591,19 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             ;;
         show|list)
             show_upcoming
+            ;;
+        --simulate)
+            SIMULATE_REMINDER=true
+            case "${2:-both}" in
+                early|day_of|both)
+                    SIMULATE_STAGE="${2:-both}"
+                    ;;
+                *)
+                    echo "ERROR: Invalid simulate stage. Use early, day_of, or both." >&2
+                    exit 1
+                    ;;
+            esac
+            main "$@"
             ;;
         *)
             main "$@"
