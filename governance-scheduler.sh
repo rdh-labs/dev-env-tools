@@ -198,6 +198,8 @@ import yaml
 import sys
 import os
 from datetime import datetime, timedelta
+import re
+import tempfile
 
 CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 
@@ -213,20 +215,34 @@ if not isinstance(config, dict):
     sys.exit(1)
 
 now = datetime.now()
-today = now.strftime("%Y-%m-%d")
-current_time = now.strftime("%H:%M")
 
 one_time = config.get('one_time', {})
 
 for event_id, event in one_time.items():
     event_date = event.get('date', '')
     event_time = event.get('time', '09:00')
+    notify_before = event.get('notify_before_minutes', 0)
 
-    if event_date != today:
+    try:
+        notify_before = max(int(notify_before), 0)
+    except Exception:
+        notify_before = 0
+
+    try:
+        event_dt = datetime.strptime(f"{event_date} {event_time}", "%Y-%m-%d %H:%M")
+    except Exception:
         continue
 
-    # Check if current time is past event time (within same day)
-    if current_time >= event_time:
+    if event_dt.date() != now.date():
+        continue
+
+    start_of_day = event_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    notify_start = event_dt - timedelta(minutes=notify_before)
+    if notify_start < start_of_day:
+        notify_start = start_of_day
+
+    # Check if current time is past notification window (same day)
+    if now >= notify_start:
         # Output: event_id|message|priority|tags
         print(f"{event_id}|{event.get('message', '')}|{event.get('priority', 'default')}|{event.get('tags', 'calendar')}")
 
@@ -241,6 +257,8 @@ import yaml
 import os
 import sys
 from datetime import datetime
+import re
+import tempfile
 
 CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 
@@ -251,6 +269,39 @@ if not isinstance(config, dict):
     raise SystemExit("Calendar file must contain a YAML mapping")
 
 event_id = sys.argv[1]
+
+TIME_RE = re.compile(r"^\\d{1,2}:\\d{2}$")
+DATE_RE = re.compile(r"^\\d{4}-\\d{2}-\\d{2}$")
+
+class Quoted(str):
+    pass
+
+def quoted_representer(dumper, data):
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
+
+yaml.SafeDumper.add_representer(Quoted, quoted_representer)
+
+def quote_strings(obj):
+    if isinstance(obj, dict):
+        return {k: quote_strings(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [quote_strings(v) for v in obj]
+    if isinstance(obj, str) and (TIME_RE.match(obj) or DATE_RE.match(obj)):
+        return Quoted(obj)
+    return obj
+
+def atomic_write(path, data):
+    dir_name = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".governance-calendar.", suffix=".tmp", dir=dir_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 if event_id in config.get('one_time', {}):
     event = config['one_time'].pop(event_id)
@@ -267,8 +318,7 @@ if event_id in config.get('one_time', {}):
     config['completed'] = completed
     completed[event_id] = event
 
-    with open(CALENDAR_FILE, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    atomic_write(CALENDAR_FILE, quote_strings(config))
     print(f"Moved {event_id} to completed")
 PYTHON
 }
