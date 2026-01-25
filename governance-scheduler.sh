@@ -25,18 +25,23 @@ acquire_lock() {
         echo "Another instance is running, exiting" >&2
         exit 0
     fi
+    trap 'flock -u 200 || true' EXIT
 }
 
-# Reset sent-today file at midnight
-TODAY=$(date +%Y-%m-%d)
-if [[ -f "$SENT_FILE" ]]; then
-    SENT_DATE=$(head -1 "$SENT_FILE" 2>/dev/null || echo "")
-    if [[ "$SENT_DATE" != "$TODAY" ]]; then
-        echo "$TODAY" > "$SENT_FILE"
+reset_sent_file() {
+    # Reset sent-today file at midnight
+    local today
+    today=$(date +%Y-%m-%d)
+    if [[ -f "$SENT_FILE" ]]; then
+        local sent_date
+        sent_date=$(head -1 "$SENT_FILE" 2>/dev/null || echo "")
+        if [[ "$sent_date" != "$today" ]]; then
+            echo "$today" > "$SENT_FILE"
+        fi
+    else
+        echo "$today" > "$SENT_FILE"
     fi
-else
-    echo "$TODAY" > "$SENT_FILE"
-fi
+}
 
 # Check if already sent today (to avoid duplicates)
 # Uses -Fx for fixed string matching (prevents regex injection)
@@ -78,7 +83,7 @@ print(config.get('ntfy', {}).get('endpoint', ''))
         --max-time 30 \
         -H "Priority: $priority" \
         -H "Tags: $tags" \
-        -d "$message" \
+        --data-raw "$message" \
         "$endpoint")
 
     if [[ "$response" == "200" ]]; then
@@ -107,16 +112,16 @@ log_notification() {
             --arg st "$status" \
             '{timestamp: $ts, message: $msg, priority: $pri, status: $st}' >> "$LOG_FILE"
     else
-        python3 -c "
+        python3 - "$timestamp" "$message" "$priority" "$status" << 'PYTHON' >> "$LOG_FILE"
 import json
 import sys
 print(json.dumps({
-    'timestamp': '$timestamp',
-    'message': sys.argv[1],
-    'priority': '$priority',
-    'status': '$status'
+    'timestamp': sys.argv[1],
+    'message': sys.argv[2],
+    'priority': sys.argv[3],
+    'status': sys.argv[4]
 }))
-" "$message" >> "$LOG_FILE"
+PYTHON
     fi
 }
 
@@ -132,9 +137,13 @@ CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 
 try:
     with open(CALENDAR_FILE) as f:
-        config = yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(config, dict):
+    print("ERROR: Calendar file must contain a YAML mapping", file=sys.stderr)
     sys.exit(1)
 
 now = datetime.now()
@@ -154,7 +163,10 @@ for event_id, event in recurring.items():
         continue
 
     day_part, time_part = parts
-    event_hour, event_min = map(int, time_part.split(':'))
+    try:
+        event_hour, event_min = map(int, time_part.split(':'))
+    except Exception:
+        continue
 
     # Check if this is the right day
     is_right_day = False
@@ -191,9 +203,13 @@ CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 
 try:
     with open(CALENDAR_FILE) as f:
-        config = yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(config, dict):
+    print("ERROR: Calendar file must contain a YAML mapping", file=sys.stderr)
     sys.exit(1)
 
 now = datetime.now()
@@ -220,26 +236,40 @@ PYTHON
 # Move completed one-time event to completed section
 move_to_completed() {
     local event_id="$1"
-    python3 << PYTHON
+    python3 - "$event_id" << 'PYTHON'
 import yaml
 import os
+import sys
 from datetime import datetime
 
 CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 
 with open(CALENDAR_FILE) as f:
-    config = yaml.safe_load(f)
+    config = yaml.safe_load(f) or {}
 
-if '$event_id' in config.get('one_time', {}):
-    event = config['one_time'].pop('$event_id')
+if not isinstance(config, dict):
+    raise SystemExit("Calendar file must contain a YAML mapping")
+
+event_id = sys.argv[1]
+
+if event_id in config.get('one_time', {}):
+    event = config['one_time'].pop(event_id)
     event['completed_at'] = datetime.now().isoformat()
-    if not isinstance(config.get('completed'), list):
-        config['completed'] = []
-    config['completed'].append({'$event_id': event})
+    completed = config.get('completed', {})
+    if isinstance(completed, list):
+        completed_dict = {}
+        for item in completed:
+            if isinstance(item, dict):
+                completed_dict.update(item)
+        completed = completed_dict
+    elif not isinstance(completed, dict):
+        completed = {}
+    config['completed'] = completed
+    completed[event_id] = event
 
     with open(CALENDAR_FILE, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-    print(f"Moved $event_id to completed")
+    print(f"Moved {event_id} to completed")
 PYTHON
 }
 
@@ -247,6 +277,7 @@ PYTHON
 main() {
     # Acquire lock to prevent race conditions from overlapping cron runs
     acquire_lock
+    reset_sent_file
 
     if [[ ! -f "$CALENDAR_FILE" ]]; then
         echo "ERROR: Calendar file not found: $CALENDAR_FILE" >&2
@@ -266,7 +297,7 @@ main() {
         echo "Sending recurring: $event_id"
         if send_ntfy "$message" "$priority" "$tags"; then
             mark_sent "recurring:$event_id"
-            ((events_sent++)) || true
+            ((++events_sent))
         fi
     done < <(check_recurring)
 
@@ -282,7 +313,7 @@ main() {
         if send_ntfy "$message" "$priority" "$tags"; then
             mark_sent "onetime:$event_id"
             move_to_completed "$event_id"
-            ((events_sent++)) || true
+            ((++events_sent))
         fi
     done < <(check_one_time)
 
