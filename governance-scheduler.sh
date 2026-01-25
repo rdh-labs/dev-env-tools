@@ -6,13 +6,26 @@
 
 set -euo pipefail
 
+# Ensure PATH includes common locations for cron environment
+export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"
+
 # Configuration
 CALENDAR_FILE="$HOME/.claude/governance-calendar.yaml"
 LOG_FILE="$HOME/.claude/logs/governance-notifications.jsonl"
 SENT_FILE="$HOME/.claude/logs/governance-sent-today.txt"
+LOCK_FILE="$HOME/.claude/logs/governance-scheduler.lock"
 
 # Ensure log directory exists
 mkdir -p "$(dirname "$LOG_FILE")"
+
+# Acquire exclusive lock to prevent race conditions
+acquire_lock() {
+    exec 200>"$LOCK_FILE"
+    if ! flock -n 200; then
+        echo "Another instance is running, exiting" >&2
+        exit 0
+    fi
+}
 
 # Reset sent-today file at midnight
 TODAY=$(date +%Y-%m-%d)
@@ -26,9 +39,10 @@ else
 fi
 
 # Check if already sent today (to avoid duplicates)
+# Uses -Fx for fixed string matching (prevents regex injection)
 already_sent() {
     local event_id="$1"
-    grep -q "^$event_id$" "$SENT_FILE" 2>/dev/null
+    grep -Fxq "$event_id" "$SENT_FILE" 2>/dev/null
 }
 
 # Mark as sent
@@ -44,9 +58,11 @@ send_ntfy() {
     local tags="${3:-calendar}"
     local endpoint
 
-    endpoint=$(python3 -c "
+    # Use environment variable to avoid command injection
+    endpoint=$(CALENDAR_FILE="$CALENDAR_FILE" python3 -c "
 import yaml
-with open('$CALENDAR_FILE') as f:
+import os
+with open(os.environ['CALENDAR_FILE']) as f:
     config = yaml.safe_load(f)
 print(config.get('ntfy', {}).get('endpoint', ''))
 ")
@@ -56,8 +72,10 @@ print(config.get('ntfy', {}).get('endpoint', ''))
         return 1
     fi
 
-    # Send notification
+    # Send notification with timeout to prevent cron hangs
     response=$(curl -s -o /dev/null -w "%{http_code}" \
+        --connect-timeout 10 \
+        --max-time 30 \
         -H "Priority: $priority" \
         -H "Tags: $tags" \
         -d "$message" \
@@ -72,17 +90,34 @@ print(config.get('ntfy', {}).get('endpoint', ''))
     fi
 }
 
-# Log notification
+# Log notification with proper JSON escaping
 log_notification() {
     local message="$1"
     local priority="$2"
     local status="$3"
+    local timestamp
+    timestamp=$(date -Iseconds)
 
-    # Escape message for JSON
-    local escaped_message
-    escaped_message=$(echo "$message" | sed 's/"/\\"/g' | tr '\n' ' ')
-
-    echo "{\"timestamp\":\"$(date -Iseconds)\",\"message\":\"$escaped_message\",\"priority\":\"$priority\",\"status\":\"$status\"}" >> "$LOG_FILE"
+    # Use jq for proper JSON escaping if available, otherwise use Python
+    if command -v jq &>/dev/null; then
+        jq -nc \
+            --arg ts "$timestamp" \
+            --arg msg "$message" \
+            --arg pri "$priority" \
+            --arg st "$status" \
+            '{timestamp: $ts, message: $msg, priority: $pri, status: $st}' >> "$LOG_FILE"
+    else
+        python3 -c "
+import json
+import sys
+print(json.dumps({
+    'timestamp': '$timestamp',
+    'message': sys.argv[1],
+    'priority': '$priority',
+    'status': '$status'
+}))
+" "$message" >> "$LOG_FILE"
+    fi
 }
 
 # Check recurring events
@@ -90,9 +125,10 @@ check_recurring() {
     python3 << 'PYTHON'
 import yaml
 import sys
+import os
 from datetime import datetime, timedelta
 
-CALENDAR_FILE = "$HOME/.claude/governance-calendar.yaml".replace("$HOME", __import__('os').environ['HOME'])
+CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 
 try:
     with open(CALENDAR_FILE) as f:
@@ -148,9 +184,10 @@ check_one_time() {
     python3 << 'PYTHON'
 import yaml
 import sys
+import os
 from datetime import datetime, timedelta
 
-CALENDAR_FILE = "$HOME/.claude/governance-calendar.yaml".replace("$HOME", __import__('os').environ['HOME'])
+CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 
 try:
     with open(CALENDAR_FILE) as f:
@@ -180,8 +217,37 @@ for event_id, event in one_time.items():
 PYTHON
 }
 
+# Move completed one-time event to completed section
+move_to_completed() {
+    local event_id="$1"
+    python3 << PYTHON
+import yaml
+import os
+from datetime import datetime
+
+CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
+
+with open(CALENDAR_FILE) as f:
+    config = yaml.safe_load(f)
+
+if '$event_id' in config.get('one_time', {}):
+    event = config['one_time'].pop('$event_id')
+    event['completed_at'] = datetime.now().isoformat()
+    if not isinstance(config.get('completed'), list):
+        config['completed'] = []
+    config['completed'].append({'$event_id': event})
+
+    with open(CALENDAR_FILE, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    print(f"Moved $event_id to completed")
+PYTHON
+}
+
 # Main execution
 main() {
+    # Acquire lock to prevent race conditions from overlapping cron runs
+    acquire_lock
+
     if [[ ! -f "$CALENDAR_FILE" ]]; then
         echo "ERROR: Calendar file not found: $CALENDAR_FILE" >&2
         exit 1
@@ -200,7 +266,7 @@ main() {
         echo "Sending recurring: $event_id"
         if send_ntfy "$message" "$priority" "$tags"; then
             mark_sent "recurring:$event_id"
-            ((events_sent++))
+            ((events_sent++)) || true
         fi
     done < <(check_recurring)
 
@@ -215,7 +281,8 @@ main() {
         echo "Sending one-time: $event_id"
         if send_ntfy "$message" "$priority" "$tags"; then
             mark_sent "onetime:$event_id"
-            ((events_sent++))
+            move_to_completed "$event_id"
+            ((events_sent++)) || true
         fi
     done < <(check_one_time)
 
@@ -243,9 +310,10 @@ show_upcoming() {
     echo
     python3 << 'PYTHON'
 import yaml
+import os
 from datetime import datetime
 
-with open("$HOME/.claude/governance-calendar.yaml".replace("$HOME", __import__('os').environ['HOME'])) as f:
+with open(os.path.expanduser("~/.claude/governance-calendar.yaml")) as f:
     config = yaml.safe_load(f)
 
 print("Recurring events:")
