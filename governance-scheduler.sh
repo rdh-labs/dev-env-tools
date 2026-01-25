@@ -261,46 +261,77 @@ import tempfile
 
 CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 
-with open(CALENDAR_FILE) as f:
-    config = yaml.safe_load(f) or {}
-
-if not isinstance(config, dict):
-    raise SystemExit("Calendar file must contain a YAML mapping")
-
 event_id = sys.argv[1]
 
 TIME_RE = re.compile(r"^\\d{1,2}:\\d{2}$")
 DATE_RE = re.compile(r"^\\d{4}-\\d{2}-\\d{2}$")
+ISO_RE = re.compile(r"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}")
 
-class Quoted(str):
-    pass
+try:
+    from ruamel.yaml import YAML
+    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+    _RUAMEL = True
+except Exception:
+    _RUAMEL = False
 
-def quoted_representer(dumper, data):
-    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
+if not _RUAMEL:
+    class Quoted(str):
+        pass
 
-yaml.SafeDumper.add_representer(Quoted, quoted_representer)
+    def quoted_representer(dumper, data):
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
+
+    yaml.SafeDumper.add_representer(Quoted, quoted_representer)
+
+def quote_scalar(value: str):
+    if _RUAMEL:
+        return DoubleQuotedScalarString(value)
+    return Quoted(value)
+
+def load_yaml(path):
+    if _RUAMEL:
+        yaml_rt = YAML(typ="rt")
+        yaml_rt.preserve_quotes = True
+        with open(path) as f:
+            return yaml_rt, (yaml_rt.load(f) or {})
+    with open(path) as f:
+        return None, (yaml.safe_load(f) or {})
+
+def dump_yaml(data, file_obj, yaml_rt=None):
+    if _RUAMEL:
+        yaml_rt.dump(data, file_obj)
+    else:
+        yaml.safe_dump(data, file_obj, default_flow_style=False, sort_keys=False)
 
 def quote_strings(obj):
     if isinstance(obj, dict):
-        return {k: quote_strings(v) for k, v in obj.items()}
+        for key in list(obj.keys()):
+            obj[key] = quote_strings(obj[key])
+        return obj
     if isinstance(obj, list):
-        return [quote_strings(v) for v in obj]
-    if isinstance(obj, str) and (TIME_RE.match(obj) or DATE_RE.match(obj)):
-        return Quoted(obj)
+        for idx in range(len(obj)):
+            obj[idx] = quote_strings(obj[idx])
+        return obj
+    if isinstance(obj, str) and (TIME_RE.match(obj) or DATE_RE.match(obj) or ISO_RE.match(obj)):
+        return quote_scalar(obj)
     return obj
 
-def atomic_write(path, data):
+def atomic_write(path, data, yaml_rt=None):
     dir_name = os.path.dirname(path) or "."
     fd, tmp_path = tempfile.mkstemp(prefix=".governance-calendar.", suffix=".tmp", dir=dir_name)
     try:
         with os.fdopen(fd, "w") as f:
-            yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+            dump_yaml(data, f, yaml_rt)
         os.replace(tmp_path, path)
     finally:
         try:
             os.unlink(tmp_path)
         except FileNotFoundError:
             pass
+
+yaml_rt, config = load_yaml(CALENDAR_FILE)
+if not isinstance(config, dict):
+    raise SystemExit("Calendar file must contain a YAML mapping")
 
 if event_id in config.get('one_time', {}):
     event = config['one_time'].pop(event_id)
@@ -317,7 +348,8 @@ if event_id in config.get('one_time', {}):
     config['completed'] = completed
     completed[event_id] = event
 
-    atomic_write(CALENDAR_FILE, quote_strings(config))
+    config = quote_strings(config)
+    atomic_write(CALENDAR_FILE, config, yaml_rt)
     print(f"Moved {event_id} to completed")
 PYTHON
 }
