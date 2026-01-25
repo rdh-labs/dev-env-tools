@@ -198,8 +198,7 @@ import yaml
 import sys
 import os
 from datetime import datetime, timedelta
-import re
-import tempfile
+
 
 CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
 
