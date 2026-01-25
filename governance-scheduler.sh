@@ -56,6 +56,116 @@ mark_sent() {
     echo "$event_id" >> "$SENT_FILE"
 }
 
+# Mark one-time event as notified (early/day_of) to prevent duplicate reminders across days
+mark_notified() {
+    local event_id="$1"
+    local stage="${2:-day_of}"
+    python3 - "$event_id" "$stage" << 'PYTHON'
+import yaml
+import os
+import sys
+from datetime import datetime
+import re
+import tempfile
+
+CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
+
+event_id = sys.argv[1]
+stage = sys.argv[2] if len(sys.argv) > 2 else "day_of"
+if stage not in {"early", "day_of"}:
+    stage = "day_of"
+
+TIME_RE = re.compile(r"^\\d{1,2}:\\d{2}$")
+DATE_RE = re.compile(r"^\\d{4}-\\d{2}-\\d{2}$")
+ISO_RE = re.compile(r"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}")
+
+try:
+    from ruamel.yaml import YAML
+    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+    _RUAMEL = True
+except Exception:
+    _RUAMEL = False
+
+if not _RUAMEL:
+    class Quoted(str):
+        pass
+
+    def quoted_representer(dumper, data):
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
+
+    yaml.SafeDumper.add_representer(Quoted, quoted_representer)
+
+def quote_scalar(value: str):
+    if _RUAMEL:
+        return DoubleQuotedScalarString(value)
+    return Quoted(value)
+
+def load_yaml(path):
+    if _RUAMEL:
+        yaml_rt = YAML(typ="rt")
+        yaml_rt.preserve_quotes = True
+        with open(path) as f:
+            return yaml_rt, (yaml_rt.load(f) or {})
+    with open(path) as f:
+        return None, (yaml.safe_load(f) or {})
+
+def dump_yaml(data, file_obj, yaml_rt=None):
+    if _RUAMEL:
+        yaml_rt.dump(data, file_obj)
+    else:
+        yaml.safe_dump(data, file_obj, default_flow_style=False, sort_keys=False)
+
+def quote_strings(obj):
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            obj[key] = quote_strings(obj[key])
+        return obj
+    if isinstance(obj, list):
+        for idx in range(len(obj)):
+            obj[idx] = quote_strings(obj[idx])
+        return obj
+    if isinstance(obj, str) and (TIME_RE.match(obj) or DATE_RE.match(obj) or ISO_RE.match(obj)):
+        return quote_scalar(obj)
+    return obj
+
+def atomic_write(path, data, yaml_rt=None):
+    dir_name = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".governance-calendar.", suffix=".tmp", dir=dir_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            dump_yaml(data, f, yaml_rt)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+
+try:
+    yaml_rt, config = load_yaml(CALENDAR_FILE)
+    if not isinstance(config, dict):
+        raise ValueError("Calendar file must contain a YAML mapping")
+
+    one_time = config.get('one_time', {})
+    if event_id not in one_time:
+        print(f"WARN: Event '{event_id}' not found for notified_at update", file=sys.stderr)
+        raise SystemExit(0)
+
+    event = one_time[event_id]
+    notified_at = event.get('notified_at', {})
+    if not isinstance(notified_at, dict):
+        notified_at = {}
+    notified_at[stage] = datetime.now().isoformat()
+    event['notified_at'] = notified_at
+
+    config = quote_strings(config)
+    atomic_write(CALENDAR_FILE, config, yaml_rt)
+except Exception as e:
+    print(f"WARN: notified_at update failed: {e}", file=sys.stderr)
+    raise SystemExit(0)
+PYTHON
+}
+
 # Send ntfy notification
 send_ntfy() {
     local message="$1"
@@ -193,7 +303,7 @@ PYTHON
 
 # Check one-time events
 check_one_time() {
-    python3 << 'PYTHON'
+    ALLOW_DAY_OF="${ALLOW_DAY_OF:-true}" python3 << 'PYTHON'
 import yaml
 import sys
 import os
@@ -201,6 +311,7 @@ from datetime import datetime, timedelta
 
 
 CALENDAR_FILE = os.path.expanduser("~/.claude/governance-calendar.yaml")
+ALLOW_DAY_OF = os.environ.get("ALLOW_DAY_OF", "true").lower() == "true"
 
 try:
     with open(CALENDAR_FILE) as f:
@@ -232,18 +343,24 @@ for event_id, event in one_time.items():
     except Exception:
         continue
 
-    if event_dt.date() != now.date():
+    if now.date() > event_dt.date():
         continue
 
-    start_of_day = event_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    notify_start = event_dt - timedelta(minutes=notify_before)
-    if notify_start < start_of_day:
-        notify_start = start_of_day
+    notified_at = event.get('notified_at', {})
+    if not isinstance(notified_at, dict):
+        notified_at = {}
 
-    # Check if current time is past notification window (same day)
-    if now >= notify_start:
-        # Output: event_id|message|priority|tags
-        print(f"{event_id}|{event.get('message', '')}|{event.get('priority', 'default')}|{event.get('tags', 'calendar')}")
+    if now.date() == event_dt.date() and now >= event_dt:
+        if ALLOW_DAY_OF and 'day_of' not in notified_at:
+            print(f"{event_id}|{event.get('message', '')}|{event.get('priority', 'default')}|{event.get('tags', 'calendar')}|day_of")
+        continue
+
+    if notify_before <= 0:
+        continue
+
+    notify_start = event_dt - timedelta(minutes=notify_before)
+    if now >= notify_start and 'early' not in notified_at:
+        print(f"{event_id}|{event.get('message', '')}|{event.get('priority', 'default')}|{event.get('tags', 'calendar')}|early")
 
 PYTHON
 }
@@ -383,17 +500,22 @@ main() {
     done < <(check_recurring)
 
     # Check one-time events
-    while IFS='|' read -r event_id message priority tags; do
+    while IFS='|' read -r event_id message priority tags stage; do
         [[ -z "$event_id" ]] && continue
+        stage="${stage:-day_of}"
+        local sent_key="onetime:${stage}:${event_id}"
 
-        if already_sent "onetime:$event_id"; then
+        if already_sent "$sent_key"; then
             continue
         fi
 
-        echo "Sending one-time: $event_id"
+        echo "Sending one-time (${stage}): $event_id"
         if send_ntfy "$message" "$priority" "$tags"; then
-            mark_sent "onetime:$event_id"
-            move_to_completed "$event_id"
+            mark_sent "$sent_key"
+            mark_notified "$event_id" "$stage"
+            if [[ "$stage" == "day_of" ]]; then
+                move_to_completed "$event_id"
+            fi
             ((++events_sent))
         fi
     done < <(check_one_time)
