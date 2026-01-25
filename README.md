@@ -50,6 +50,14 @@
 - `portfolio-audit.sh` - Audit portfolio status
 - `nightly-maintenance.sh` - Nightly maintenance tasks
 
+### Governance Calendar
+
+- `governance-scheduler.sh` - Scheduler (cron)
+- `gov-calendar` - CLI for add/list/due/delete/test
+- **Python runtime:** `~/dev/infrastructure/tools/.venv-governance-scheduler` (default `VENV_MODE=system`)
+- **Optional isolation:** `VENV_MODE=isolated` uses `.venv-governance-scheduler-iso`
+- **Comment preservation:** `ruamel.yaml` preserves YAML comments/formatting
+
 ---
 
 ## Usage Guidelines
