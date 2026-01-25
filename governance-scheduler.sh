@@ -14,9 +14,23 @@ CALENDAR_FILE="$HOME/.claude/governance-calendar.yaml"
 LOG_FILE="$HOME/.claude/logs/governance-notifications.jsonl"
 SENT_FILE="$HOME/.claude/logs/governance-sent-today.txt"
 LOCK_FILE="$HOME/.claude/logs/governance-scheduler.lock"
+VENV_DIR="$HOME/dev/infrastructure/tools/.venv-governance-scheduler"
+PYTHON_BIN="${PYTHON_BIN:-$VENV_DIR/bin/python}"
 
 # Ensure log directory exists
 mkdir -p "$(dirname "$LOG_FILE")"
+
+# Ensure Python venv is available
+ensure_python() {
+    if [[ ! -x "$PYTHON_BIN" ]]; then
+        echo "ERROR: Python venv not found: $PYTHON_BIN" >&2
+        echo "Create it with:" >&2
+        echo "  python3 -m venv \"$VENV_DIR\"" >&2
+        echo "  \"$PYTHON_BIN\" -m pip install --upgrade pip" >&2
+        echo "  \"$PYTHON_BIN\" -m pip install ruamel.yaml" >&2
+        exit 1
+    fi
+}
 
 # Acquire exclusive lock to prevent race conditions
 acquire_lock() {
@@ -60,7 +74,8 @@ mark_sent() {
 mark_notified() {
     local event_id="$1"
     local stage="${2:-day_of}"
-    python3 - "$event_id" "$stage" << 'PYTHON'
+    ensure_python
+    "$PYTHON_BIN" - "$event_id" "$stage" << 'PYTHON'
 import yaml
 import os
 import sys
@@ -172,9 +187,10 @@ send_ntfy() {
     local priority="${2:-default}"
     local tags="${3:-calendar}"
     local endpoint
+    ensure_python
 
     # Use environment variable to avoid command injection
-    endpoint=$(CALENDAR_FILE="$CALENDAR_FILE" python3 -c "
+    endpoint=$(CALENDAR_FILE="$CALENDAR_FILE" "$PYTHON_BIN" -c "
 import yaml
 import os
 with open(os.environ['CALENDAR_FILE']) as f:
@@ -222,7 +238,7 @@ log_notification() {
             --arg st "$status" \
             '{timestamp: $ts, message: $msg, priority: $pri, status: $st}' >> "$LOG_FILE"
     else
-        python3 - "$timestamp" "$message" "$priority" "$status" << 'PYTHON' >> "$LOG_FILE"
+        "$PYTHON_BIN" - "$timestamp" "$message" "$priority" "$status" << 'PYTHON' >> "$LOG_FILE"
 import json
 import sys
 print(json.dumps({
@@ -237,7 +253,7 @@ PYTHON
 
 # Check recurring events
 check_recurring() {
-    python3 << 'PYTHON'
+    "$PYTHON_BIN" << 'PYTHON'
 import yaml
 import sys
 import os
@@ -303,7 +319,7 @@ PYTHON
 
 # Check one-time events
 check_one_time() {
-    ALLOW_DAY_OF="${ALLOW_DAY_OF:-true}" SIMULATE_REMINDER="${SIMULATE_REMINDER:-false}" SIMULATE_STAGE="${SIMULATE_STAGE:-both}" python3 << 'PYTHON'
+    ALLOW_DAY_OF="${ALLOW_DAY_OF:-true}" SIMULATE_REMINDER="${SIMULATE_REMINDER:-false}" SIMULATE_STAGE="${SIMULATE_STAGE:-both}" "$PYTHON_BIN" << 'PYTHON'
 import yaml
 import sys
 import os
@@ -383,7 +399,7 @@ PYTHON
 # Move completed one-time event to completed section
 move_to_completed() {
     local event_id="$1"
-    python3 - "$event_id" << 'PYTHON'
+    "$PYTHON_BIN" - "$event_id" << 'PYTHON'
 import yaml
 import os
 import sys
@@ -490,6 +506,7 @@ PYTHON
 main() {
     # Acquire lock to prevent race conditions from overlapping cron runs
     acquire_lock
+    ensure_python
     reset_sent_file
 
     if [[ ! -f "$CALENDAR_FILE" ]]; then
@@ -563,7 +580,8 @@ show_upcoming() {
     echo "=== Governance Calendar ==="
     echo "Today: $(date '+%A %Y-%m-%d %H:%M')"
     echo
-    python3 << 'PYTHON'
+    ensure_python
+    "$PYTHON_BIN" << 'PYTHON'
 import yaml
 import os
 from datetime import datetime
