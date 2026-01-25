@@ -17,6 +17,7 @@ migration/
 __pycache__/
 *.pyc
 *.pyo
+.venv-governance-scheduler/
 
 # Test output
 test-output/
