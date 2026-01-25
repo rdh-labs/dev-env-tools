@@ -14,7 +14,19 @@ CALENDAR_FILE="$HOME/.claude/governance-calendar.yaml"
 LOG_FILE="$HOME/.claude/logs/governance-notifications.jsonl"
 SENT_FILE="$HOME/.claude/logs/governance-sent-today.txt"
 LOCK_FILE="$HOME/.claude/logs/governance-scheduler.lock"
-VENV_DIR="$HOME/dev/infrastructure/tools/.venv-governance-scheduler"
+VENV_MODE="${VENV_MODE:-system}"
+case "$VENV_MODE" in
+    system)
+        VENV_DIR="$HOME/dev/infrastructure/tools/.venv-governance-scheduler"
+        ;;
+    isolated)
+        VENV_DIR="$HOME/dev/infrastructure/tools/.venv-governance-scheduler-iso"
+        ;;
+    *)
+        echo "ERROR: Invalid VENV_MODE '$VENV_MODE' (use 'system' or 'isolated')" >&2
+        exit 1
+        ;;
+esac
 PYTHON_BIN="${PYTHON_BIN:-$VENV_DIR/bin/python}"
 
 # Ensure log directory exists
@@ -25,10 +37,16 @@ ensure_python() {
     if [[ ! -x "$PYTHON_BIN" ]]; then
         echo "ERROR: Python venv not found: $PYTHON_BIN" >&2
         echo "Create it with:" >&2
-        echo "  python3 -m venv --system-site-packages \"$VENV_DIR\"" >&2
-        echo "  \"$PYTHON_BIN\" -m pip install --upgrade pip" >&2
-        echo "  # If ruamel.yaml not available via system packages:" >&2
-        echo "  \"$PYTHON_BIN\" -m pip install ruamel.yaml" >&2
+        if [[ "$VENV_MODE" == "isolated" ]]; then
+            echo "  python3 -m venv \"$VENV_DIR\"" >&2
+            echo "  \"$PYTHON_BIN\" -m pip install --upgrade pip" >&2
+            echo "  \"$PYTHON_BIN\" -m pip install ruamel.yaml PyYAML" >&2
+        else
+            echo "  python3 -m venv --system-site-packages \"$VENV_DIR\"" >&2
+            echo "  \"$PYTHON_BIN\" -m pip install --upgrade pip" >&2
+            echo "  # If ruamel.yaml not available via system packages:" >&2
+            echo "  \"$PYTHON_BIN\" -m pip install ruamel.yaml" >&2
+        fi
         exit 1
     fi
 }
