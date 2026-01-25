@@ -26,8 +26,9 @@ ensure_python() {
     if [[ ! -x "$PYTHON_BIN" ]]; then
         echo "ERROR: Python venv not found: $PYTHON_BIN" >&2
         echo "Create it with:" >&2
-        echo "  python3 -m venv \"$VENV_DIR\"" >&2
+        echo "  python3 -m venv --system-site-packages \"$VENV_DIR\"" >&2
         echo "  \"$PYTHON_BIN\" -m pip install --upgrade pip" >&2
+        echo "  # If ruamel.yaml not available via system packages:" >&2
         echo "  \"$PYTHON_BIN\" -m pip install ruamel.yaml" >&2
         exit 1
     fi
