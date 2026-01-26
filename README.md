@@ -55,6 +55,7 @@
 
 - `governance-scheduler.sh` - Scheduler (cron)
 - `gov-calendar` - CLI for add/list/due/delete/test
+  - Supports `gov-calendar add --allow-past` for historical backfills
 - **Python runtime:** `~/dev/infrastructure/tools/.venv-governance-scheduler` (default `VENV_MODE=system`)
 - **Optional isolation:** `VENV_MODE=isolated` uses `.venv-governance-scheduler-iso`
 - **Comment preservation:** `ruamel.yaml` preserves YAML comments/formatting
