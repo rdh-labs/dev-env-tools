@@ -333,13 +333,14 @@ PYTHON
 # List all events
 list_events() {
     ensure_python
-    "$PYTHON_BIN" << 'PYTHON'
+    "$PYTHON_BIN" - "$CALENDAR_FILE" << 'PYTHON'
 import yaml
 import os
 import re
+import sys
 from datetime import datetime, timedelta
 
-calendar_file = os.path.expanduser("~/.claude/governance-calendar.yaml")
+calendar_file = os.path.expanduser(sys.argv[1])
 
 def clean(text: str) -> str:
     return re.sub(r'[\x00-\x1F\x7F-\x9F]', '', str(text))
@@ -419,13 +420,14 @@ PYTHON
 # Show due/overdue items
 show_due() {
     ensure_python
-    "$PYTHON_BIN" << 'PYTHON'
+    "$PYTHON_BIN" - "$CALENDAR_FILE" << 'PYTHON'
 import yaml
 import os
 import re
+import sys
 from datetime import datetime
 
-calendar_file = os.path.expanduser("~/.claude/governance-calendar.yaml")
+calendar_file = os.path.expanduser(sys.argv[1])
 
 def clean(text: str) -> str:
     return re.sub(r'[\x00-\x1F\x7F-\x9F]', '', str(text))
