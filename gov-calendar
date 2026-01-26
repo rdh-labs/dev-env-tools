@@ -58,7 +58,7 @@ show_help() {
 gov-calendar - Governance Calendar Management
 
 USAGE:
-  gov-calendar add "Description" --date YYYY-MM-DD [--time HH:MM] [--remind Nd|Nh]
+  gov-calendar add "Description" --date YYYY-MM-DD [--time HH:MM] [--remind Nd|Nh] [--allow-past]
   gov-calendar list              Show all upcoming events
   gov-calendar due               Show overdue/due-today items
   gov-calendar delete <event_id> Remove one-time event
@@ -75,6 +75,7 @@ OPTIONS:
   --date YYYY-MM-DD    Event date (required for add)
   --time HH:MM         Event time (default: 09:00)
   --remind Nd|Nh       Reminder before event (e.g., 1d, 2h, 30m)
+  --allow-past         Allow adding events with past dates
 
 EOF
 }
@@ -119,6 +120,7 @@ add_event() {
     local date=""
     local time="09:00"
     local remind_before="0"
+    local allow_past="0"
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -134,6 +136,10 @@ add_event() {
             --remind)
                 remind_before=$(parse_reminder "$2")
                 shift 2
+                ;;
+            --allow-past)
+                allow_past="1"
+                shift
                 ;;
             *)
                 if [[ -z "$description" ]]; then
@@ -167,7 +173,7 @@ add_event() {
     # Validate date is not in the past
     local today
     today=$(date '+%Y-%m-%d')
-    if [[ "$date" < "$today" ]]; then
+    if [[ "$allow_past" != "1" && "$date" < "$today" ]]; then
         echo "ERROR: Date cannot be in the past. Earliest valid date: $today" >&2
         exit 1
     fi
