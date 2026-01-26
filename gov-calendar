@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-CALENDAR_FILE="$HOME/.claude/governance-calendar.yaml"
+CALENDAR_FILE="${CALENDAR_FILE:-$HOME/.claude/governance-calendar.yaml}"
 SCHEDULER_SCRIPT="$HOME/dev/infrastructure/tools/governance-scheduler.sh"
 LOCK_FILE="$HOME/.claude/logs/governance-scheduler.lock"
 VENV_MODE="${VENV_MODE:-system}"
