@@ -37,6 +37,7 @@
 - `weekly-report.sh` - Weekly summary report (uses paths.sh)
 - `governance-check.sh` - Simple governance check
 - `skill_update_checker.py` - Monitor external GitHub repos
+- `project-memory-metrics.sh` - Log project-memory save/restore metrics
 
 ### Session Management
 
