@@ -288,14 +288,40 @@ def validate_governance_files() -> bool:
     return all_valid
 
 
+def path_to_tilde(filepath: Path) -> str:
+    """Convert absolute path to ~/... format to avoid leaking usernames."""
+    home = Path.home()
+    try:
+        rel = filepath.relative_to(home)
+        return f"~/{rel}"
+    except ValueError:
+        return str(filepath)
+
+
+# MCP tool name mapping (actual tool names, not generated from item_type)
+MCP_TOOL_NAMES = {
+    'decision': 'query_decisions',  # Actual MCP tool name
+    'issue': 'query_issues',        # Actual MCP tool name
+    'idea': None,                   # No MCP tool yet - read file directly
+}
+
+
 def write_summary(data: dict, output_path: Path, source_path: Path, item_type: str):
     """Write summary YAML file."""
+    source_tilde = path_to_tilde(source_path)
+    mcp_tool = MCP_TOOL_NAMES.get(item_type.lower())
+
+    # Build note based on whether MCP tool exists
+    if mcp_tool:
+        note = f'Quick lookup index. For full details, use governance MCP {mcp_tool}(id) or read {source_path.name}'
+    else:
+        note = f'Quick lookup index. For full details, read {source_path.name} (no MCP query tool yet)'
 
     header = f"""# {item_type.upper()}-SUMMARY.yaml
 # Generated lightweight index for fast discovery
 # Created: {datetime.now().isoformat()}
 # Source hash: {get_file_hash(source_path)}
-# Full file: {source_path}
+# Full file: {source_tilde}
 # Use summary for quick lookups; query MCP or read full file for details
 #
 """
@@ -303,10 +329,10 @@ def write_summary(data: dict, output_path: Path, source_path: Path, item_type: s
     summary = {
         'version': '1.0',
         'generated_at': datetime.now().isoformat(),
-        'source_file': str(source_path),
+        'source_file': source_tilde,
         'source_hash': get_file_hash(source_path),
         'total_count': len(data),
-        'note': f'Quick lookup index. For full details, use governance MCP query_{item_type.lower()}(id) or read {source_path.name}',
+        'note': note,
         f'{item_type.lower()}s': data
     }
 
