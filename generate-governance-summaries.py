@@ -13,8 +13,10 @@ Usage: python3 generate-governance-summaries.py
 
 import re
 import yaml
+import argparse
 from pathlib import Path
 from datetime import datetime
+from collections import Counter
 import hashlib
 
 DEV_ENV_DOCS = Path.home() / "dev/infrastructure/dev-env-docs"
@@ -74,8 +76,8 @@ def parse_issues(filepath: Path) -> dict:
     issues = {}
 
     # Pattern 1: ### ISSUE-NNN | STATUS | CATEGORY | Title (current 4-field format)
-    # Status is OPEN, RESOLVED, PARTIAL, etc.
-    pattern1 = r'^### (ISSUE-\d+) \| (OPEN|RESOLVED|PARTIAL|CLOSED|DEFERRED) \| (\w+) \| (.+)$'
+    # Status is OPEN, RESOLVED, PARTIAL, etc. Category can have hyphens (e.g., DATA-QUALITY)
+    pattern1 = r'^### (ISSUE-\d+) \| (OPEN|RESOLVED|PARTIAL|CLOSED|DEFERRED) \| ([\w-]+) \| (.+)$'
     for match in re.finditer(pattern1, content, re.MULTILINE):
         issue_id, status, category, title = match.groups()
         issues[issue_id] = {
@@ -203,6 +205,89 @@ def parse_ideas(filepath: Path) -> dict:
 
     return ideas
 
+def find_duplicates(filepath: Path, pattern: str) -> dict:
+    """Find duplicate IDs in a governance file.
+
+    Returns dict mapping duplicate IDs to list of (line_num, full_line) tuples.
+    """
+    content = filepath.read_text()
+    lines = content.split('\n')
+
+    # Find all IDs with their line numbers
+    id_locations = {}
+    for i, line in enumerate(lines, 1):
+        match = re.match(pattern, line)
+        if match:
+            item_id = match.group(1)
+            if item_id not in id_locations:
+                id_locations[item_id] = []
+            id_locations[item_id].append((i, line.strip()))
+
+    # Filter to only duplicates
+    duplicates = {k: v for k, v in id_locations.items() if len(v) > 1}
+    return duplicates
+
+
+def validate_governance_files() -> bool:
+    """Validate governance files for duplicates and format issues.
+
+    Returns True if all files pass validation, False otherwise.
+    """
+    all_valid = True
+    total_duplicates = 0
+
+    print("Validating governance files...")
+    print()
+
+    # Check DECISIONS-LOG.md
+    decisions_path = DEV_ENV_DOCS / "DECISIONS-LOG.md"
+    if decisions_path.exists():
+        duplicates = find_duplicates(decisions_path, r'^### (DEC-\d+)')
+        if duplicates:
+            all_valid = False
+            total_duplicates += len(duplicates)
+            print(f"✗ DECISIONS-LOG.md: {len(duplicates)} duplicate IDs found")
+            for dec_id, locations in sorted(duplicates.items()):
+                print(f"  {dec_id}: lines {', '.join(str(loc[0]) for loc in locations)}")
+        else:
+            print(f"✓ DECISIONS-LOG.md: No duplicates")
+
+    # Check ISSUES-TRACKER.md
+    issues_path = DEV_ENV_DOCS / "ISSUES-TRACKER.md"
+    if issues_path.exists():
+        duplicates = find_duplicates(issues_path, r'^### (ISSUE-\d+)')
+        if duplicates:
+            all_valid = False
+            total_duplicates += len(duplicates)
+            print(f"✗ ISSUES-TRACKER.md: {len(duplicates)} duplicate IDs found")
+            for issue_id, locations in sorted(duplicates.items()):
+                print(f"  {issue_id}: lines {', '.join(str(loc[0]) for loc in locations)}")
+        else:
+            print(f"✓ ISSUES-TRACKER.md: No duplicates")
+
+    # Check IDEAS-BACKLOG.md
+    ideas_path = DEV_ENV_DOCS / "IDEAS-BACKLOG.md"
+    if ideas_path.exists():
+        duplicates = find_duplicates(ideas_path, r'^### (IDEA-\d+)')
+        if duplicates:
+            all_valid = False
+            total_duplicates += len(duplicates)
+            print(f"✗ IDEAS-BACKLOG.md: {len(duplicates)} duplicate IDs found")
+            for idea_id, locations in sorted(duplicates.items()):
+                print(f"  {idea_id}: lines {', '.join(str(loc[0]) for loc in locations)}")
+        else:
+            print(f"✓ IDEAS-BACKLOG.md: No duplicates")
+
+    print()
+    if all_valid:
+        print("All governance files pass validation.")
+    else:
+        print(f"Validation failed: {total_duplicates} duplicate IDs found across governance files.")
+        print("See ISSUE-130 for remediation guidance.")
+
+    return all_valid
+
+
 def write_summary(data: dict, output_path: Path, source_path: Path, item_type: str):
     """Write summary YAML file."""
 
@@ -231,7 +316,8 @@ def write_summary(data: dict, output_path: Path, source_path: Path, item_type: s
 
     return len(data)
 
-def main():
+def generate_summaries():
+    """Generate all governance summary files."""
     print("Generating governance summary files...")
     print(f"Output directory: {OUTPUT_DIR}")
     print()
@@ -280,7 +366,36 @@ def main():
 
     print()
     print("Summary generation complete.")
-    print("Next: Update CLAUDE.md to reference these summaries instead of full files.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate governance summary YAML files from full governance documents."
+    )
+    parser.add_argument(
+        '--validate',
+        action='store_true',
+        help="Validate governance files for duplicates without generating summaries"
+    )
+    parser.add_argument(
+        '--validate-and-generate',
+        action='store_true',
+        help="Validate governance files, then generate summaries regardless of result"
+    )
+    args = parser.parse_args()
+
+    if args.validate:
+        valid = validate_governance_files()
+        exit(0 if valid else 1)
+    elif args.validate_and_generate:
+        validate_governance_files()
+        print()
+        print("-" * 60)
+        print()
+        generate_summaries()
+    else:
+        generate_summaries()
+
 
 if __name__ == "__main__":
     main()
