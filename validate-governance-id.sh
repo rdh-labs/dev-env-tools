@@ -75,6 +75,12 @@ if [[ -z "$ID" ]]; then
     usage
 fi
 
+# Validate ID format (PREFIX-NUMBER)
+if ! [[ "$ID" =~ ^(DEC|ISSUE|IDEA)-[0-9]+$ ]]; then
+    echo "Error: Invalid ID format '$ID'. Expected: DEC-123, ISSUE-45, or IDEA-67" >&2
+    exit 2
+fi
+
 # Determine file based on ID prefix
 case "$ID" in
     DEC-*)
@@ -126,14 +132,17 @@ if [[ $TOTAL_MATCHES -gt 0 ]]; then
         echo "Found $SUMMARY_MATCHES occurrence(s) in $SUMMARY"
         echo ""
         echo "Locations:"
-        grep -n "^#{2,3} $ID" "$FILE" 2>/dev/null | head -5 || true
+        grep -nE "^#{2,3} $ID[^0-9]|^#{2,3} $ID$" "$FILE" 2>/dev/null | head -5 || true
         echo ""
         echo "Action: Use a different ID or update the existing entry."
         echo ""
-        # Suggest next available ID
+        # Suggest next available ID (only if numeric suffix)
         PREFIX="${ID%%-*}"
         CURRENT_NUM="${ID##*-}"
-        NEXT_NUM=$((CURRENT_NUM + 1))
+        if [[ "$CURRENT_NUM" =~ ^[0-9]+$ ]]; then
+            NEXT_NUM=$((CURRENT_NUM + 1))
+            echo "Suggestion: Try $PREFIX-$NEXT_NUM"
+        fi
         echo "Suggestion: Try $PREFIX-$NEXT_NUM"
     fi
     exit 1
