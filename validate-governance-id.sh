@@ -143,7 +143,6 @@ if [[ $TOTAL_MATCHES -gt 0 ]]; then
             NEXT_NUM=$((CURRENT_NUM + 1))
             echo "Suggestion: Try $PREFIX-$NEXT_NUM"
         fi
-        echo "Suggestion: Try $PREFIX-$NEXT_NUM"
     fi
     exit 1
 else
