@@ -6,7 +6,7 @@
 # Usage: Run after adding new governance entries
 #
 # Created: 2026-02-04
-# Updated: 2026-02-04 - Bug fixes per Codex review
+# Updated: 2026-02-04 - R2 fixes: safe arithmetic, exit-code detection, injection-safe state parsing
 
 set -e
 
@@ -59,15 +59,18 @@ curate_with_retry() {
     local retry=0
 
     while [ $retry -lt $MAX_RETRIES ]; do
-        if timeout $TIMEOUT brv curate "$content" --headless 2>&1 | grep -q "Stream complete"; then
+        local exit_code=0
+        timeout $TIMEOUT brv curate "$content" --headless &>/dev/null || exit_code=$?
+
+        if [ $exit_code -eq 0 ]; then
             log "INFO" "Curated: ${content:0:50}..."
             echo "  ✓ Curated"
             return 0
         fi
-        ((retry++))
+        retry=$((retry + 1))
         if [ $retry -lt $MAX_RETRIES ]; then
-            echo "  ⚠ Retry $retry/$MAX_RETRIES..."
-            log "WARN" "Retry $retry for: ${content:0:50}..."
+            echo "  ⚠ Retry $retry/$MAX_RETRIES (exit=$exit_code)..."
+            log "WARN" "Retry $retry (exit=$exit_code) for: ${content:0:50}..."
             sleep $((retry * 2))
         fi
     done
@@ -142,13 +145,10 @@ if [ ! -f "$SYNC_STATE_FILE" ]; then
     update_state 0 0 0
 fi
 
-# Source and validate sync state
-source "$SYNC_STATE_FILE"
-
-# Validate state values (default to 0 if invalid)
-LAST_DEC=$(parse_number "${LAST_DEC:-0}")
-LAST_ISSUE=$(parse_number "${LAST_ISSUE:-0}")
-LAST_IDEA=$(parse_number "${LAST_IDEA:-0}")
+# Read sync state safely (no source - prevents code injection)
+LAST_DEC=$(parse_number "$(grep '^LAST_DEC=' "$SYNC_STATE_FILE" 2>/dev/null | cut -d'=' -f2)")
+LAST_ISSUE=$(parse_number "$(grep '^LAST_ISSUE=' "$SYNC_STATE_FILE" 2>/dev/null | cut -d'=' -f2)")
+LAST_IDEA=$(parse_number "$(grep '^LAST_IDEA=' "$SYNC_STATE_FILE" 2>/dev/null | cut -d'=' -f2)")
 
 # Check governance files exist
 if [ ! -f "$GOVERNANCE_DIR/DECISIONS-SUMMARY.yaml" ]; then
@@ -225,9 +225,9 @@ if [ "$NEW_DECS" -gt 0 ]; then
             echo "  $DEC_ID: $SUMMARY"
             if curate_with_retry "Decision $DEC_ID: $SUMMARY. See DECISIONS-LOG.md for details."; then
                 SYNCED_DEC=$i
-                ((TOTAL_SYNCED++))
+                TOTAL_SYNCED=$((TOTAL_SYNCED + 1))
             else
-                ((TOTAL_FAILED++))
+                TOTAL_FAILED=$((TOTAL_FAILED + 1))
             fi
             sleep 2
         else
@@ -251,9 +251,9 @@ if [ "$NEW_ISSUES" -gt 0 ]; then
             echo "  $ISSUE_ID: $SUMMARY"
             if curate_with_retry "Issue $ISSUE_ID: $SUMMARY. See ISSUES-TRACKER.md for details."; then
                 SYNCED_ISSUE=$i
-                ((TOTAL_SYNCED++))
+                TOTAL_SYNCED=$((TOTAL_SYNCED + 1))
             else
-                ((TOTAL_FAILED++))
+                TOTAL_FAILED=$((TOTAL_FAILED + 1))
             fi
             sleep 2
         else
@@ -277,9 +277,9 @@ if [ "$NEW_IDEAS" -gt 0 ]; then
             echo "  $IDEA_ID: $SUMMARY"
             if curate_with_retry "Idea $IDEA_ID: $SUMMARY. See IDEAS-BACKLOG.md for details."; then
                 SYNCED_IDEA=$i
-                ((TOTAL_SYNCED++))
+                TOTAL_SYNCED=$((TOTAL_SYNCED + 1))
             else
-                ((TOTAL_FAILED++))
+                TOTAL_FAILED=$((TOTAL_FAILED + 1))
             fi
             sleep 2
         else

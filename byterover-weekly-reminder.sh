@@ -7,7 +7,7 @@
 #   0 9 * * 1 ~/dev/infrastructure/tools/byterover-weekly-reminder.sh
 #
 # Created: 2026-02-04
-# Updated: 2026-02-04 - Bug fixes per Codex review
+# Updated: 2026-02-04 - R2 fixes: injection-safe state parsing
 
 SYNC_STATE_FILE="$HOME/.brv-governance-sync-state"
 LOG_FILE="$HOME/.brv-reminder.log"
@@ -26,7 +26,8 @@ if [ ! -x "$HOME/bin/notify.sh" ]; then
 fi
 
 if [ -f "$SYNC_STATE_FILE" ]; then
-    source "$SYNC_STATE_FILE"
+    # Read state safely (no source - prevents code injection)
+    LAST_SYNC=$(grep '^LAST_SYNC=' "$SYNC_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
 
     # Validate LAST_SYNC format (ISO 8601: YYYY-MM-DD...)
     if ! [[ "$LAST_SYNC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
