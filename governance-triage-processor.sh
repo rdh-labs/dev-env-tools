@@ -25,6 +25,7 @@ set -euo pipefail
 
 QUEUE_FILE="$HOME/.claude/queues/governance-triage.jsonl"
 DLQ_FILE="$HOME/.claude/queues/governance-triage-dlq.jsonl"
+QUARANTINE_FILE="$HOME/.claude/queues/governance-triage-quarantine.jsonl"
 LOCK_FILE="$HOME/.claude/locks/governance-triage.lock"
 INVENTORY="$HOME/dev/infrastructure/dev-env-docs/CAPABILITIES-INVENTORY.md"
 METRICS_SCRIPT="$HOME/dev/infrastructure/dev-env-docs/scripts/governance-triage-metrics.sh"
@@ -59,6 +60,37 @@ fi
 if [[ ! -f "$QUEUE_FILE" ]] || [[ $queue_size -eq 0 ]]; then
     echo "Queue empty or not found"
     exit 0
+fi
+
+# HIGH FIX (Codex #3): Validate and quarantine corrupted queue lines
+# Prevents one malformed line from stopping entire processor
+quarantined_count=0
+temp_clean_queue=$(mktemp)
+
+while IFS= read -r line; do
+    # Skip empty lines
+    if [[ -z "$line" ]]; then
+        continue
+    fi
+
+    # Validate JSON structure
+    if echo "$line" | jq -e . >/dev/null 2>&1; then
+        # Valid JSON - keep it
+        echo "$line" >> "$temp_clean_queue"
+    else
+        # Invalid JSON - quarantine it
+        echo "$line" >> "$QUARANTINE_FILE"
+        ((quarantined_count++))
+    fi
+done < "$QUEUE_FILE"
+
+# Replace queue with clean version if any lines were quarantined
+if [ "$quarantined_count" -gt 0 ]; then
+    mv "$temp_clean_queue" "$QUEUE_FILE"
+    "$METRICS_SCRIPT" record queue_quarantine '{"quarantined": '"$quarantined_count"'}' || true
+    echo "Quarantined $quarantined_count malformed entries"
+else
+    rm "$temp_clean_queue"
 fi
 
 # Process queue entries
