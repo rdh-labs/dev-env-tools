@@ -138,15 +138,27 @@ compare_terms() {
 }
 
 # Extract status from DEC entry
+# Format: ### DEC-### | DATE | CATEGORY | STATUS | Title
+# Status is field 4 (zero-indexed field 3 in awk after split on |)
 extract_status_from_dec() {
     local dec_content=$1
-    grep -oP '(?<=\| )[A-Z]+(?= \|)' "$dec_content" | head -1 || echo "UNKNOWN"
+    grep -m1 -E '^### DEC-[0-9]+ \|' "$dec_content" | \
+        awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4); print toupper($4)}' || echo "UNKNOWN"
 }
 
 # Extract status from detailed doc
 extract_status_from_detailed() {
     local detailed_doc=$1
-    grep -iE '^\*\*Status:\*\*' "$detailed_doc" | grep -oE '[A-Z]+' | head -1 || echo "UNKNOWN"
+    sed -nE 's/^\*\*Status:\*\*[[:space:]]*(.+)$/\1/p' "$detailed_doc" | \
+        head -1 | sed 's/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]' || echo "UNKNOWN"
+}
+
+# Normalize status values for comparison
+normalize_status() {
+    case "$1" in
+        DECIDED) echo "ACCEPTED" ;;
+        *) echo "$1" ;;
+    esac
 }
 
 # Check a single DEC entry for consistency
@@ -175,14 +187,35 @@ check_dec_consistency() {
         return 0
     fi
 
-    # Expand ~ to home directory
-    detailed_path="${detailed_path/#\~/$HOME}"
+    # Expand ~ to home directory and validate path is within allowed scope
+    case "$detailed_path" in
+        ~/*) detailed_path="${detailed_path/#\~/$HOME}" ;;
+        /*) ;; # absolute path, keep as-is
+        *) detailed_path="$HOME/dev/infrastructure/dev-env-docs/$detailed_path" ;; # relative path
+    esac
 
-    if [[ ! -f "$detailed_path" ]]; then
-        log ERROR "$dec_id: Referenced detailed doc not found: $detailed_path"
-        echo "INCONSISTENCY|$dec_id|MISSING_DETAILED_DOC|$detailed_path"
+    # Resolve to canonical path and validate it's within $HOME/dev/
+    local resolved_path
+    resolved_path=$(realpath -m "$detailed_path" 2>/dev/null || echo "$detailed_path")
+
+    case "$resolved_path" in
+        "$HOME/dev/"*)
+            # Path is within allowed scope
+            ;;
+        *)
+            log ERROR "$dec_id: Referenced doc outside allowed scope: $resolved_path"
+            echo "INCONSISTENCY|$dec_id|INVALID_DOC_PATH|$resolved_path"
+            return 1
+            ;;
+    esac
+
+    if [[ ! -f "$resolved_path" ]]; then
+        log ERROR "$dec_id: Referenced detailed doc not found: $resolved_path"
+        echo "INCONSISTENCY|$dec_id|MISSING_DETAILED_DOC|$resolved_path"
         return 1
     fi
+
+    detailed_path="$resolved_path"
 
     log DEBUG "$dec_id: Checking consistency with $detailed_path"
 
@@ -200,6 +233,10 @@ check_dec_consistency() {
     local detailed_status
     source_status=$(extract_status_from_dec "$dec_section")
     detailed_status=$(extract_status_from_detailed "$detailed_path")
+
+    # Normalize status values for comparison
+    source_status=$(normalize_status "$source_status")
+    detailed_status=$(normalize_status "$detailed_status")
 
     if [[ "$source_status" != "UNKNOWN" ]] && [[ "$detailed_status" != "UNKNOWN" ]] && [[ "$source_status" != "$detailed_status" ]]; then
         log WARN "$dec_id: Status mismatch - DECISIONS-LOG: $source_status, Detailed doc: $detailed_status"
