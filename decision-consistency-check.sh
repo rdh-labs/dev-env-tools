@@ -22,9 +22,23 @@ GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
 # Parse arguments
-if [[ "${1:-}" == "--verbose" ]]; then
-    VERBOSE=true
-fi
+JSON_OUTPUT=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --verbose)
+            VERBOSE=true
+            shift
+            ;;
+        --json)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        *)
+            echo "Usage: $0 [--verbose] [--json]"
+            exit 2
+            ;;
+    esac
+done
 
 log() {
     local level=$1
@@ -150,10 +164,11 @@ check_dec_consistency() {
 
     # Look for reference to detailed document
     # Matches patterns like: "**Full experiment results:** `path/to/doc.md`"
+    # MUST have backticks to avoid false positives
     local detailed_path
 
-    # Extract path from lines containing "Full" and ending in .md
-    detailed_path=$(grep -i "Full.*\.md" "$dec_section" | sed -n 's/.*\(\~[^`]*\.md\).*/\1/p' | head -1 || true)
+    # Extract path - require backticks to ensure it's a file reference, not just text containing ".md"
+    detailed_path=$(grep -E '`[^`]*\.md`' "$dec_section" | sed -n 's/.*`\([^`]*\.md\)`.*/\1/p' | head -1 || true)
 
     if [[ -z "$detailed_path" ]]; then
         log DEBUG "$dec_id: No detailed document reference found (this is OK)"
@@ -241,16 +256,42 @@ main() {
     done <<< "$dec_ids"
 
     # Summary
+    if [[ -f "$inconsistencies_file" ]]; then
+        inconsistency_count=$(wc -l < "$inconsistencies_file")
+    fi
+
+    # JSON output mode
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        echo "{"
+        echo "  \"timestamp\": \"$(date -Iseconds)\","
+        echo "  \"total_entries\": $total_count,"
+        echo "  \"entries_with_detailed_docs\": $checked_count,"
+        echo "  \"inconsistencies_found\": $inconsistency_count,"
+        if [[ $inconsistency_count -gt 0 ]]; then
+            echo "  \"inconsistencies\": ["
+            local first=true
+            while IFS='|' read -r _ dec_id issue_type details; do
+                if [[ "$first" == "false" ]]; then
+                    echo ","
+                fi
+                first=false
+                echo -n "    {\"dec_id\": \"$dec_id\", \"type\": \"$issue_type\", \"details\": \"$details\"}"
+            done < "$inconsistencies_file"
+            echo ""
+            echo "  ],"
+        fi
+        echo "  \"status\": \"$([ $inconsistency_count -eq 0 ] && echo 'pass' || echo 'fail')\""
+        echo "}"
+        exit $([ $inconsistency_count -eq 0 ] && echo 0 || echo 1)
+    fi
+
+    # Human-readable output
     echo ""
     log INFO "========================================"
     log INFO "Consistency Check Summary"
     log INFO "========================================"
     log INFO "Total DEC entries: $total_count"
     log INFO "Entries with detailed docs: $checked_count"
-
-    if [[ -f "$inconsistencies_file" ]]; then
-        inconsistency_count=$(wc -l < "$inconsistencies_file")
-    fi
 
     if [[ $inconsistency_count -eq 0 ]]; then
         log INFO "Inconsistencies found: 0 ✓"
