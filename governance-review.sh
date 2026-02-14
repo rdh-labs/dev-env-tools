@@ -12,6 +12,7 @@
 #   governance-review.sh --stale      # Show only stale items
 #   governance-review.sh --deps       # Include downstream reference counts
 #   governance-review.sh --output FILE  # Write results to FILE
+#   governance-review.sh --notify     # Send notification based on health status
 #
 # Header formats parsed:
 #   DEC:   ### DEC-NNN | YYYY-MM-DD | CATEGORY | STATUS | Title
@@ -20,6 +21,11 @@
 #          ### IDEA-NNN | YYYY-MM-DD | Title  (20 items with header date)
 #
 # Date parsing uses GNU date (-d flag). Requires: bash 4+, GNU coreutils.
+#
+# Exit codes (DEC-102 evaluation pipeline):
+#   0 = healthy (0 stale items)
+#   1 = warning (1-5 stale items)
+#   2 = critical (>5 stale items OR any HIGH/CRITICAL severity stale)
 
 set -euo pipefail
 
@@ -28,11 +34,15 @@ DECISIONS_FILE="${DOCS_DIR}/DECISIONS-LOG.md"
 ISSUES_FILE="${DOCS_DIR}/ISSUES-TRACKER.md"
 IDEAS_FILE="${DOCS_DIR}/IDEAS-BACKLOG.md"
 TODAY_EPOCH=$(date +%s)
+METRICS_FILE="${HOME}/.metrics/governance-review-events.jsonl"
+NOTIFY_BIN="${HOME}/bin/notify.sh"
 
 # Defaults
 SHOW_STALE_ONLY=false
 SHOW_DEPS=false
 OUTPUT_FILE=""
+SEND_NOTIFICATION=false
+RUN_TRIGGER="manual"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -40,11 +50,15 @@ while [[ $# -gt 0 ]]; do
         --stale)   SHOW_STALE_ONLY=true; shift ;;
         --deps)    SHOW_DEPS=true; shift ;;
         --output)  OUTPUT_FILE="$2"; shift 2 ;;
+        --notify)  SEND_NOTIFICATION=true; shift ;;
+        --trigger) RUN_TRIGGER="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: governance-review.sh [--stale] [--deps] [--output FILE]"
-            echo "  --stale   Show only stale items (past threshold)"
-            echo "  --deps    Include downstream reference counts"
-            echo "  --output  Write markdown output to FILE"
+            echo "Usage: governance-review.sh [--stale] [--deps] [--output FILE] [--notify] [--trigger TYPE]"
+            echo "  --stale    Show only stale items (past threshold)"
+            echo "  --deps     Include downstream reference counts"
+            echo "  --output   Write markdown output to FILE"
+            echo "  --notify   Send notification based on health status"
+            echo "  --trigger  Set run trigger (cron/manual/event) for logging"
             exit 0
             ;;
         *)
@@ -265,6 +279,92 @@ while IFS=: read -r line_num rest; do
     RESULTS+=("| ${item_id} | ${item_date} | ${days}d | ${severity} | ${stale_flag:-ok} | IDEA | ${item_title}${refs} |")
 done < <(grep -nE "^### IDEA-[0-9]+:" "$IDEAS_FILE")
 
+# ─── Log Event to JSONL ──────────────────────────────────────────
+log_event() {
+    mkdir -p "$(dirname "$METRICS_FILE")"
+
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local stale_items=()
+    local critical_stale=false
+
+    # Extract stale item IDs and check for HIGH/CRITICAL severity
+    if [[ ${#RESULTS[@]} -gt 0 ]]; then
+        for result in "${RESULTS[@]}"; do
+            if echo "$result" | grep -q "STALE"; then
+                local item_id=$(echo "$result" | cut -d'|' -f2 | tr -d ' ')
+                local severity=$(echo "$result" | cut -d'|' -f5 | tr -d ' ')
+                stale_items+=("$item_id")
+
+                if [[ "$severity" == "CRITICAL" || "$severity" == "HIGH" ]]; then
+                    critical_stale=true
+                fi
+            fi
+        done
+    fi
+
+    # Convert array to JSON array
+    local stale_json="[]"
+    if [[ ${#stale_items[@]} -gt 0 ]]; then
+        stale_json=$(printf '%s\n' "${stale_items[@]}" | jq -R . | jq -s .)
+    fi
+
+    # Create JSONL event (compact format)
+    jq -nc \
+        --arg ts "$timestamp" \
+        --arg trigger "$RUN_TRIGGER" \
+        --argjson total "$total_count" \
+        --argjson stale "$stale_count" \
+        --argjson items "$stale_json" \
+        --argjson critical "$critical_stale" \
+        '{
+            timestamp: $ts,
+            event: "governance_review",
+            run_trigger: $trigger,
+            total_scanned: $total,
+            stale_count: $stale,
+            stale_items: $items,
+            critical_stale: $critical
+        }' >> "$METRICS_FILE"
+}
+
+# ─── Send Notification ───────────────────────────────────────────
+send_notification() {
+    local priority="low"
+    local message=""
+
+    # Determine priority based on health criteria
+    if [[ $stale_count -eq 0 ]]; then
+        priority="low"
+        message="✅ Healthy: ${total_count} items scanned, 0 stale"
+    elif [[ $stale_count -le 5 ]]; then
+        priority="medium"
+        message="⚠️  Warning: ${stale_count} stale items found (${total_count} total scanned)"
+    else
+        priority="high"
+        message="🚨 Critical: ${stale_count} stale items found (${total_count} total scanned)"
+    fi
+
+    # Check for HIGH/CRITICAL severity stale items
+    local has_critical=false
+    if [[ ${#RESULTS[@]} -gt 0 ]]; then
+        for result in "${RESULTS[@]}"; do
+            if echo "$result" | grep -q "STALE"; then
+                local severity=$(echo "$result" | cut -d'|' -f5 | tr -d ' ')
+                if [[ "$severity" == "CRITICAL" || "$severity" == "HIGH" ]]; then
+                    has_critical=true
+                    priority="high"
+                    message="🚨 Critical: ${stale_count} stale items (including HIGH/CRITICAL severity)"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    if [[ -x "$NOTIFY_BIN" ]]; then
+        "$NOTIFY_BIN" "Governance Review" "$message" --priority "$priority" --channel auto 2>/dev/null || true
+    fi
+}
+
 # ─── Generate Output ─────────────────────────────────────────────
 generate_output() {
     echo "# Governance Review Queue"
@@ -314,4 +414,34 @@ if [[ -n "$OUTPUT_FILE" ]]; then
     echo "Summary: ${total_count} active items, ${stale_count} stale"
 else
     generate_output
+fi
+
+# ─── Log Event & Send Notification ──────────────────────────────
+log_event
+
+if [[ "$SEND_NOTIFICATION" == "true" ]]; then
+    send_notification
+fi
+
+# ─── Exit with appropriate status code ──────────────────────────
+# Determine health status and exit code
+has_critical_stale=false
+if [[ ${#RESULTS[@]} -gt 0 ]]; then
+    for result in "${RESULTS[@]}"; do
+        if echo "$result" | grep -q "STALE"; then
+            local severity=$(echo "$result" | cut -d'|' -f5 | tr -d ' ')
+            if [[ "$severity" == "CRITICAL" || "$severity" == "HIGH" ]]; then
+                has_critical_stale=true
+                break
+            fi
+        fi
+    done
+fi
+
+if [[ $stale_count -eq 0 ]]; then
+    exit 0  # Healthy
+elif [[ $stale_count -le 5 && "$has_critical_stale" == "false" ]]; then
+    exit 1  # Warning
+else
+    exit 2  # Critical
 fi
