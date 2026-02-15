@@ -8,12 +8,47 @@ Integrates governance_analyzer.py (pattern matching) and governance_file_editor.
 
 import sys
 import json
+import time
+import fcntl
+from datetime import datetime, timezone
 from typing import List, Dict
 from pathlib import Path
 
 # Import the modules we just created
 from governance_analyzer import GovernanceAnalyzer, GovernanceItem
 from governance_file_editor import GovernanceFileEditor, GovernanceFileError, IDCollisionError
+
+
+# Metrics infrastructure
+METRICS_DIR = Path.home() / ".metrics/capture-analyze"
+METRICS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log_metric(metric_type: str, data: Dict) -> None:
+    """
+    Log metric to JSONL file.
+
+    Args:
+        metric_type: "usage", "performance", or "accuracy"
+        data: Metric data dict
+    """
+    metric_file = METRICS_DIR / f"{metric_type}.jsonl"
+
+    # Add timestamp if not present
+    if "timestamp" not in data:
+        data["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        with open(metric_file, 'a') as f:
+            # Acquire lock for append
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(data) + '\n')
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        # Fail-safe: don't crash on metrics failure
+        print(f"⚠️  Metrics logging failed: {e}", file=sys.stderr)
 
 
 class CaptureAnalyzer:
@@ -176,6 +211,9 @@ class CaptureAnalyzer:
         Returns:
             Dict with formatted items for display
         """
+        # Performance tracking
+        start_time = time.time()
+
         items = self.analyzer.analyze_text(text)
 
         presented = []
@@ -205,6 +243,24 @@ class CaptureAnalyzer:
                 "signals": item.signals,
                 "explanation": why
             })
+
+        # Log performance metrics
+        duration_ms = int((time.time() - start_time) * 1000)
+        log_metric("performance", {
+            "operation": "analyze_and_present",
+            "duration_ms": duration_ms,
+            "text_length": len(text),
+            "items_extracted": len(presented),
+            "types_found": list(set(item["type"] for item in presented))
+        })
+
+        # Log usage metrics
+        log_metric("usage", {
+            "text_length": len(text),
+            "items_found": len(presented),
+            "types": [item["type"] for item in presented],
+            "avg_confidence": sum(item["confidence"] for item in presented) / len(presented) if presented else 0.0
+        })
 
         return {
             "items": presented,

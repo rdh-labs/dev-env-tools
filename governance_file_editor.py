@@ -14,11 +14,45 @@ and DECISIONS-LOG.md with:
 import re
 import sys
 import os
+import time
+import json
 import tempfile
 import fcntl
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from datetime import date
+from datetime import date, datetime, timezone
+
+
+# Metrics infrastructure
+METRICS_DIR = Path.home() / ".metrics/capture-analyze"
+METRICS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log_metric(metric_type: str, data: Dict) -> None:
+    """
+    Log metric to JSONL file.
+
+    Args:
+        metric_type: "performance" or "accuracy"
+        data: Metric data dict
+    """
+    metric_file = METRICS_DIR / f"{metric_type}.jsonl"
+
+    # Add timestamp if not present
+    if "timestamp" not in data:
+        data["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        with open(metric_file, 'a') as f:
+            # Acquire lock for append
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(data) + '\n')
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        # Fail-safe: don't crash on metrics failure
+        pass
 
 
 class GovernanceFileError(Exception):
@@ -126,15 +160,29 @@ class GovernanceFileEditor:
         if not file_path.exists():
             raise GovernanceFileNotFoundError(f"File not found: {file_path}")
 
+        # Track lock wait time for contention metrics
+        lock_wait_start = time.time()
+
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 # Acquire exclusive lock (blocks until available)
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                lock_wait_ms = int((time.time() - lock_wait_start) * 1000)
+
                 try:
                     content = f.read()
                 finally:
                     # Release lock
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+                # Log lock contention if significant wait
+                if lock_wait_ms > 10:  # >10ms indicates contention
+                    log_metric("performance", {
+                        "operation": "get_next_id",
+                        "item_type": item_type,
+                        "lock_wait_ms": lock_wait_ms,
+                        "contention_detected": True
+                    })
         except PermissionError as e:
             raise GovernanceFileError(f"Permission denied reading {file_path}: {e}")
         except UnicodeDecodeError as e:
