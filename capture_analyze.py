@@ -239,57 +239,68 @@ def main():
     """CLI interface."""
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Analyze text for governance items"
-    )
-    parser.add_argument('text', nargs='?', help='Text to analyze (or stdin)')
-    parser.add_argument('--format', choices=['human', 'json'], default='human',
-                       help='Output format')
-    parser.add_argument('--present', action='store_true',
-                       help='Format for user presentation')
+    try:
+        parser = argparse.ArgumentParser(
+            description="Analyze text for governance items"
+        )
+        parser.add_argument('text', nargs='?', help='Text to analyze (or stdin)')
+        parser.add_argument('--format', choices=['human', 'json'], default='human',
+                           help='Output format')
+        parser.add_argument('--present', action='store_true',
+                           help='Format for user presentation')
 
-    args = parser.parse_args()
+        args = parser.parse_args()
 
-    # Get text from args or stdin
-    if args.text:
-        text = args.text
-    else:
-        text = sys.stdin.read()
+        # Get text from args or stdin
+        if args.text:
+            text = args.text
+        else:
+            text = sys.stdin.read()
 
-    if not text.strip():
-        print("Error: No text provided", file=sys.stderr)
+        if not text.strip():
+            print("Error: No text provided", file=sys.stderr)
+            sys.exit(1)
+
+        analyzer = CaptureAnalyzer()
+
+        if args.present:
+            result = analyzer.analyze_and_present(text)
+
+            if args.format == 'json':
+                print(json.dumps(result, indent=2))
+            else:
+                print(f"🔍 Analyzed your input. Found {result['count']} potential governance items:\n")
+
+                for item in result['items']:
+                    print("━" * 60)
+                    print(f"\n{item['number']}️⃣ {item['type']}: {item['title']}")
+                    print(f"\n   📍 Signals: {', '.join(s.split(':')[1] for s in item['signals'][:3])}")
+                    print(f"\n   📝 Text: {item['text']}")
+                    print(f"\n   💡 Suggested Category: {item['suggested_category']}")
+                    print(f"   🎯 Suggested Priority/Severity: {item['suggested_priority']}")
+                    print(f"\n   Why {item['type']}? {item['explanation']}")
+                    print(f"\n   Confidence: {item['confidence']:.0%}\n")
+
+        else:
+            result = analyzer.analyze(text, format=args.format)
+
+            if args.format == 'json':
+                print(json.dumps(result, indent=2))
+            else:
+                print(f"Found {result['count']} items:")
+                for item in result['items']:
+                    print(f"\n- {item.type}: {item.text[:80]}...")
+                    print(f"  Score: {item.score}, Confidence: {item.confidence:.1%}")
+
+    except GovernanceFileError as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
-    analyzer = CaptureAnalyzer()
-
-    if args.present:
-        result = analyzer.analyze_and_present(text)
-
-        if args.format == 'json':
-            print(json.dumps(result, indent=2))
-        else:
-            print(f"🔍 Analyzed your input. Found {result['count']} potential governance items:\n")
-
-            for item in result['items']:
-                print("━" * 60)
-                print(f"\n{item['number']}️⃣ {item['type']}: {item['title']}")
-                print(f"\n   📍 Signals: {', '.join(s.split(':')[1] for s in item['signals'][:3])}")
-                print(f"\n   📝 Text: {item['text']}")
-                print(f"\n   💡 Suggested Category: {item['suggested_category']}")
-                print(f"   🎯 Suggested Priority/Severity: {item['suggested_priority']}")
-                print(f"\n   Why {item['type']}? {item['explanation']}")
-                print(f"\n   Confidence: {item['confidence']:.0%}\n")
-
-    else:
-        result = analyzer.analyze(text, format=args.format)
-
-        if args.format == 'json':
-            print(json.dumps(result, indent=2))
-        else:
-            print(f"Found {result['count']} items:")
-            for item in result['items']:
-                print(f"\n- {item.type}: {item.text[:80]}...")
-                print(f"  Score: {item.score}, Confidence: {item.confidence:.1%}")
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == '__main__':

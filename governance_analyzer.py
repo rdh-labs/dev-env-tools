@@ -292,8 +292,8 @@ class GovernanceAnalyzer:
                 current.text = f"{current.text} {next_item.text}"
                 # Update context to include both
                 current.context = f"{current.context} {next_item.context}"
-                # Combine scores
-                current.score = max(current.score, next_item.score)
+                # Combine scores (accumulate, don't take max)
+                current.score = current.score + next_item.score
                 # Combine signals
                 current.signals.extend(next_item.signals)
             else:

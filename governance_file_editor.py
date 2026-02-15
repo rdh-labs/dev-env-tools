@@ -13,6 +13,9 @@ and DECISIONS-LOG.md with:
 
 import re
 import sys
+import os
+import tempfile
+import fcntl
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import date
@@ -28,9 +31,44 @@ class IDCollisionError(GovernanceFileError):
     pass
 
 
-class FileNotFoundError(GovernanceFileError):
+class GovernanceFileNotFoundError(GovernanceFileError):
     """Raised when governance file doesn't exist."""
     pass
+
+
+def atomic_write(file_path: Path, content: str) -> None:
+    """
+    Write file atomically to prevent corruption.
+
+    Uses tempfile + os.replace() for atomic write operation.
+    Safe for concurrent access and crash recovery.
+
+    Args:
+        file_path: Path to file
+        content: Content to write
+
+    Raises:
+        GovernanceFileError: On write failure
+    """
+    dir_path = file_path.parent
+
+    # Create temp file in same directory (required for atomic replace)
+    fd, temp_path = tempfile.mkstemp(dir=str(dir_path), text=True)
+
+    try:
+        # Write to temp file
+        os.write(fd, content.encode('utf-8'))
+        os.close(fd)
+
+        # Atomic replace (POSIX guarantees atomicity)
+        os.replace(temp_path, str(file_path))
+    except Exception as e:
+        # Clean up temp file on failure
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        raise GovernanceFileError(f"Atomic write failed: {e}")
 
 
 class GovernanceFileEditor:
@@ -72,6 +110,8 @@ class GovernanceFileEditor:
         """
         Get next available ID for item type.
 
+        Uses exclusive file lock to prevent race conditions in multi-agent environment.
+
         Args:
             item_type: "IDEAS", "ISSUES", or "DECISIONS"
 
@@ -84,11 +124,17 @@ class GovernanceFileEditor:
         file_path = self.paths[item_type]
 
         if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
 
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+                # Acquire exclusive lock (blocks until available)
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+                finally:
+                    # Release lock
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except PermissionError as e:
             raise GovernanceFileError(f"Permission denied reading {file_path}: {e}")
         except UnicodeDecodeError as e:
@@ -133,7 +179,9 @@ class GovernanceFileEditor:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            return item_id in content
+            # Use word boundary regex to avoid false positives (IDEA-1 shouldn't match IDEA-10)
+            pattern = r'\b' + re.escape(item_id) + r'\b'
+            return bool(re.search(pattern, content))
         except Exception as e:
             # Fail-safe: assume collision on error (safer)
             print(f"⚠️  Error checking ID collision: {e}", file=sys.stderr)
@@ -212,33 +260,36 @@ class GovernanceFileEditor:
 
 """
 
-        # Read existing content
+        # Read-modify-write with exclusive lock
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            with open(file_path, 'r+', encoding='utf-8') as f:
+                # Acquire exclusive lock for entire read-modify-write sequence
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+
+                    # Insert after "## Active Ideas" header
+                    if "## Active Ideas" not in content:
+                        raise GovernanceFileError("Malformed file: '## Active Ideas' header not found")
+
+                    content = content.replace(
+                        "## Active Ideas\n",
+                        f"## Active Ideas\n{new_idea}"
+                    )
+
+                    # Update metadata
+                    content = self._update_ideas_metadata(content, idea_id)
+
+                    # Write atomically (still using atomic write for crash safety)
+                    # Note: lock is held during atomic write
+                    atomic_write(file_path, content)
+                finally:
+                    # Release lock
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except FileNotFoundError:
-            raise FileNotFoundError(f"File not found: {file_path}")
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
         except PermissionError as e:
             raise GovernanceFileError(f"Permission denied: {e}")
-
-        # Insert after "## Active Ideas" header
-        if "## Active Ideas" not in content:
-            raise GovernanceFileError("Malformed file: '## Active Ideas' header not found")
-
-        content = content.replace(
-            "## Active Ideas\n",
-            f"## Active Ideas\n{new_idea}"
-        )
-
-        # Update metadata
-        content = self._update_ideas_metadata(content, idea_id)
-
-        # Write atomically
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-        except PermissionError as e:
-            raise GovernanceFileError(f"Permission denied writing: {e}")
 
     def insert_issue(
         self,
@@ -306,33 +357,36 @@ class GovernanceFileEditor:
 
 """
 
-        # Read existing content
+        # Read-modify-write with exclusive lock
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            with open(file_path, 'r+', encoding='utf-8') as f:
+                # Acquire exclusive lock for entire read-modify-write sequence
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+
+                    # Insert after "## Open Issues" header
+                    if "## Open Issues" not in content:
+                        raise GovernanceFileError("Malformed file: '## Open Issues' header not found")
+
+                    content = content.replace(
+                        "## Open Issues\n",
+                        f"## Open Issues\n{new_issue}"
+                    )
+
+                    # Update metadata
+                    content = self._update_issues_metadata(content)
+
+                    # Write atomically (still using atomic write for crash safety)
+                    # Note: lock is held during atomic write
+                    atomic_write(file_path, content)
+                finally:
+                    # Release lock
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except FileNotFoundError:
-            raise FileNotFoundError(f"File not found: {file_path}")
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
         except PermissionError as e:
             raise GovernanceFileError(f"Permission denied: {e}")
-
-        # Insert after "## Open Issues" header
-        if "## Open Issues" not in content:
-            raise GovernanceFileError("Malformed file: '## Open Issues' header not found")
-
-        content = content.replace(
-            "## Open Issues\n",
-            f"## Open Issues\n{new_issue}"
-        )
-
-        # Update metadata
-        content = self._update_issues_metadata(content)
-
-        # Write atomically
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-        except PermissionError as e:
-            raise GovernanceFileError(f"Permission denied writing: {e}")
 
     def _update_ideas_metadata(self, content: str, new_id: str) -> str:
         """Update IDEAS-BACKLOG.md metadata header."""
