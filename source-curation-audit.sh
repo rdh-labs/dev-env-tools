@@ -43,11 +43,11 @@ After completing audit:
 HEADER
 
 # Replace placeholders
-sed -i "s/DATE_PLACEHOLDER/$(date -Iseconds)/" "$AUDIT_LOG"
+sed -i "s|DATE_PLACEHOLDER|$(date -Iseconds)|" "$AUDIT_LOG"
 
 # Count sources
-total_sources=$(grep -c "^  - name:" "$REGISTRY" 2>/dev/null || echo "0")
-sed -i "s/TOTAL_PLACEHOLDER/$total_sources/" "$AUDIT_LOG"
+total_sources=$(grep -c "^      - name:" "$REGISTRY" 2>/dev/null || echo "0")
+sed -i "s|TOTAL_PLACEHOLDER|$total_sources|" "$AUDIT_LOG"
 
 # Extract all sources and generate review templates
 echo "" >> "$AUDIT_LOG"
