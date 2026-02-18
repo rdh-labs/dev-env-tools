@@ -33,8 +33,10 @@ def parse_decisions(filepath: Path) -> dict:
     decisions = {}
 
     # Pattern 1: ### DEC-NNN | DATE | CATEGORY | STATUS | Title (standard 5-field)
-    # Status can be multi-word like "PARTIALLY SUPERSEDED"
-    pattern1 = r'^### (DEC-\d+) \| (\d{4}-\d{2}-\d{2}) \| (\w+) \| ([\w\s]+?) \| (.+)$'
+    # Status can be multi-word ("PARTIALLY SUPERSEDED") or include → notation ("SUPERSEDED → DEC-122")
+    # Fixes DEC-070 which uses "SUPERSEDED → DEC-122" as the status field
+    # [^\n|] prevents cross-line matching
+    pattern1 = r'^### (DEC-\d+) \| (\d{4}-\d{2}-\d{2}) \| (\w+) \| ([^\n|]+?) \| (.+)$'
     for match in re.finditer(pattern1, content, re.MULTILINE):
         dec_id, date, category, status, title = match.groups()
         decisions[dec_id] = {
@@ -75,20 +77,33 @@ def parse_issues(filepath: Path) -> dict:
     content = filepath.read_text()
     issues = {}
 
-    # Pattern 1: ### ISSUE-NNN | STATUS | CATEGORY | Title (current 4-field format)
-    # Status is OPEN, RESOLVED, PARTIAL, etc. Category can have hyphens (e.g., DATA-QUALITY)
-    pattern1 = r'^### (ISSUE-\d+) \| (OPEN|RESOLVED|PARTIAL|CLOSED|DEFERRED) \| ([\w-]+) \| (.+)$'
-    for match in re.finditer(pattern1, content, re.MULTILINE):
-        issue_id, status, category, title = match.groups()
+    # Pattern 1a: ### ISSUE-NNN | DATE | STATUS | SEVERITY | Title (5-field, current standard)
+    # Handles any status text including multi-word ("IN PROGRESS") and compound ("WONT_FIX")
+    # [^\n|] prevents cross-line matching
+    pattern1a = r'^### (ISSUE-[\d]+[-\w]*) \| (\d{4}-\d{2}-\d{2}) \| ([^\n|]+?) \| ([^\n|]+?) \| (.+)$'
+    for match in re.finditer(pattern1a, content, re.MULTILINE):
+        issue_id, date, status, severity, title = match.groups()
         issues[issue_id] = {
             'title': title.strip(),
-            'status': status,
-            'category': category
+            'status': status.strip(),
+            'date': date,
+            'severity': severity.strip()
         }
 
-    # Pattern 2: ### ISSUE-NNN | SEVERITY | Title (legacy 3-field format)
-    # Severity is Critical, High, Medium, Low
-    pattern2 = r'^### (ISSUE-\d+) \| (Critical|High|Medium|Low|HIGH) \| (.+)$'
+    # Pattern 1b: ### ISSUE-NNN | STATUS | CATEGORY | Title (4-field format, no date)
+    # Status is OPEN, RESOLVED, PARTIAL, CLOSED, DEFERRED
+    pattern1b = r'^### (ISSUE-[\d]+[-\w]*) \| (OPEN|RESOLVED|PARTIAL|PARTIALLY_RESOLVED|CLOSED|DEFERRED|WONT_FIX) \| ([\w-]+) \| (.+)$'
+    for match in re.finditer(pattern1b, content, re.MULTILINE):
+        issue_id, status, category, title = match.groups()
+        if issue_id not in issues:
+            issues[issue_id] = {
+                'title': title.strip(),
+                'status': status,
+                'category': category
+            }
+
+    # Pattern 2: ### ISSUE-NNN | SEVERITY | Title (legacy 3-field, severity-first)
+    pattern2 = r'^### (ISSUE-[\d]+[-\w]*) \| (Critical|High|Medium|Low|HIGH|CRITICAL|MEDIUM|LOW) \| (.+)$'
     for match in re.finditer(pattern2, content, re.MULTILINE):
         issue_id, severity, title = match.groups()
         if issue_id not in issues:
@@ -98,19 +113,20 @@ def parse_issues(filepath: Path) -> dict:
                 'severity': severity
             }
 
-    # Pattern 3: ### ISSUE-NNN | DATE | STATUS | Title (date-prefixed format)
-    pattern3 = r'^### (ISSUE-\d+) \| (\d{4}-\d{2}-\d{2}) \| (OPEN|RESOLVED|PARTIAL) \| (.+)$'
+    # Pattern 3: ### ISSUE-NNN | DATE | Title (3-field date+title, no explicit status)
+    # Fixes ISSUE-133, ISSUE-134 which use this format
+    pattern3 = r'^### (ISSUE-[\d]+[-\w]*) \| (\d{4}-\d{2}-\d{2}) \| ([^\n|]+)$'
     for match in re.finditer(pattern3, content, re.MULTILINE):
-        issue_id, date, status, title = match.groups()
+        issue_id, date, title = match.groups()
         if issue_id not in issues:
             issues[issue_id] = {
                 'title': title.strip(),
-                'status': status,
+                'status': 'OPEN',
                 'date': date
             }
 
     # Pattern 4: ### ISSUE-NNN: Title (colon format)
-    pattern4 = r'^### (ISSUE-\d+): (.+)$'
+    pattern4 = r'^### (ISSUE-[\d]+[-\w]*): (.+)$'
     for match in re.finditer(pattern4, content, re.MULTILINE):
         issue_id, title = match.groups()
         if issue_id not in issues:
@@ -119,8 +135,8 @@ def parse_issues(filepath: Path) -> dict:
                 'status': 'OPEN'
             }
 
-    # Pattern 5: ### ISSUE-NNN | Title | Severity (title-first 3-field format)
-    pattern5 = r'^### (ISSUE-\d+) \| ([^|]+) \| (Critical|High|Medium|Low)$'
+    # Pattern 5: ### ISSUE-NNN | Title | Severity (title-first 3-field)
+    pattern5 = r'^### (ISSUE-[\d]+[-\w]*) \| ([^|]+) \| (Critical|High|Medium|Low|CRITICAL|HIGH|MEDIUM|LOW)$'
     for match in re.finditer(pattern5, content, re.MULTILINE):
         issue_id, title, severity = match.groups()
         if issue_id not in issues:
@@ -130,8 +146,8 @@ def parse_issues(filepath: Path) -> dict:
                 'severity': severity
             }
 
-    # Pattern 6: ### ISSUE-NNN | DATE | Title | STATUS (date-title-status 4-field)
-    pattern6 = r'^### (ISSUE-\d+) \| (\d{4}-\d{2}-\d{2}) \| ([^|]+) \| (OPEN|RESOLVED|PARTIAL)$'
+    # Pattern 6: ### ISSUE-NNN | DATE | Title | STATUS (date-title-status)
+    pattern6 = r'^### (ISSUE-[\d]+[-\w]*) \| (\d{4}-\d{2}-\d{2}) \| ([^|]+) \| (OPEN|RESOLVED|PARTIAL|PARTIALLY_RESOLVED)$'
     for match in re.finditer(pattern6, content, re.MULTILINE):
         issue_id, date, title, status = match.groups()
         if issue_id not in issues:
@@ -141,8 +157,19 @@ def parse_issues(filepath: Path) -> dict:
                 'date': date
             }
 
+    # Pattern 7: ### ISSUE-NNN | Title (simple 2-field pipe, no date or status)
+    # Fixes ISSUE-139 which uses this minimal format
+    pattern7 = r'^### (ISSUE-[\d]+[-\w]*) \| ([^\n|]+)$'
+    for match in re.finditer(pattern7, content, re.MULTILINE):
+        issue_id, title = match.groups()
+        if issue_id not in issues:
+            issues[issue_id] = {
+                'title': title.strip(),
+                'status': 'OPEN'
+            }
+
     # Also look for status markers in body text
-    status_pattern = r'(ISSUE-\d+).*\*\*Status:\*\* (\w+)'
+    status_pattern = r'(ISSUE-[\d]+[-\w]*).*\*\*Status:\*\* (\w+)'
     for match in re.finditer(status_pattern, content):
         issue_id, status = match.groups()
         if issue_id in issues:
