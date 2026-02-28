@@ -436,6 +436,97 @@ class GovernanceFileEditor:
         except PermissionError as e:
             raise GovernanceFileError(f"Permission denied: {e}")
 
+    def insert_decision(
+        self,
+        decision_id: str,
+        title: str,
+        category: str,
+        status: str,
+        context: str,
+        decision: str,
+        rationale: str,
+        related: List[str] = None,
+        source: str = "User capture"
+    ) -> None:
+        """
+        Insert new DECISION into DECISIONS-LOG.md.
+
+        Args:
+            decision_id: DECISION ID (e.g., "DEC-247")
+            title: Short title
+            category: Category (e.g., "ARCH", "CONFIG", "TOOL", "PROC", "MAINT")
+            status: ACCEPTED/PROPOSED/SUPERSEDED/DEPRECATED/UNDER REVIEW
+            context: Background and why this decision was needed
+            decision: What was decided
+            rationale: Why this decision was made
+            related: List of related item IDs
+            source: How this was captured
+
+        Raises:
+            IDCollisionError: If ID already exists
+            GovernanceFileError: On file operation failure
+        """
+        if self.check_id_collision("DECISIONS", decision_id):
+            raise IDCollisionError(f"ID already exists: {decision_id}")
+
+        file_path = self.paths["DECISIONS"]
+
+        # Build content
+        related_str = ", ".join(related) if related else "None"
+        today = date.today().strftime("%Y-%m-%d")
+
+        new_decision = f"""
+### {decision_id} | {today} | {category} | {status} | {title}
+
+**Context:** {context}
+
+**Decision:** {decision}
+
+**Rationale:** {rationale}
+
+**Status:** {status}
+
+**Category:** {category}
+
+**Related:** {related_str}
+
+**Source:** {source}
+
+---
+
+"""
+
+        # Read-modify-write with exclusive lock
+        try:
+            with open(file_path, 'r+', encoding='utf-8') as f:
+                # Acquire exclusive lock for entire read-modify-write sequence
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+
+                    # Insert after "## Active Decisions" header
+                    if "## Active Decisions" not in content:
+                        raise GovernanceFileError("Malformed file: '## Active Decisions' header not found")
+
+                    content = content.replace(
+                        "## Active Decisions\n",
+                        f"## Active Decisions\n{new_decision}"
+                    )
+
+                    # Update metadata
+                    content = self._update_decisions_metadata(content)
+
+                    # Write atomically (still using atomic write for crash safety)
+                    # Note: lock is held during atomic write
+                    atomic_write(file_path, content)
+                finally:
+                    # Release lock
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except FileNotFoundError:
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+        except PermissionError as e:
+            raise GovernanceFileError(f"Permission denied: {e}")
+
     def _update_ideas_metadata(self, content: str, new_id: str) -> str:
         """Update IDEAS-BACKLOG.md metadata header."""
         # Extract current count
@@ -483,6 +574,28 @@ class GovernanceFileEditor:
         content = re.sub(
             r'\*\*Summary:\*\* \d+ Open',
             f'**Summary:** {open_count} Open',
+            content
+        )
+
+        return content
+
+    def _update_decisions_metadata(self, content: str) -> str:
+        """Update DECISIONS-LOG.md metadata header."""
+        # Count accepted decisions
+        accepted_count = len(re.findall(r'\| ACCEPTED \|', content))
+
+        # Update Last Updated
+        today = date.today().strftime("%Y-%m-%d")
+
+        content = re.sub(
+            r'\*\*Last Updated:\*\* \d{4}-\d{2}-\d{2}',
+            f'**Last Updated:** {today}',
+            content
+        )
+
+        content = re.sub(
+            r'\*\*Summary:\*\* \d+ Accepted',
+            f'**Summary:** {accepted_count} Accepted',
             content
         )
 
