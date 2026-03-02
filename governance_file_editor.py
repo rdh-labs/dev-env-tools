@@ -582,7 +582,9 @@ class GovernanceFileEditor:
 
         new_lesson = "".join(lines)
 
-        # Append to end of file with exclusive lock
+        # Append to end of file with exclusive lock.
+        # Unlike insert_idea/issue/decision (which find a section header and insert after it),
+        # LESSONS-LOG.md has no section header — lessons accumulate sequentially. Append is correct.
         try:
             with open(file_path, 'a', encoding='utf-8') as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -637,7 +639,7 @@ class GovernanceFileEditor:
             # Fail-safe: summary update failure doesn't break lesson insert
             pass
 
-    def insert_task(
+    def format_task_for_dart(
         self,
         title: str,
         description: str,

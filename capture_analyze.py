@@ -282,7 +282,7 @@ class CaptureAnalyzer:
         if not description:
             description = text
 
-        return self.editor.insert_task(
+        return self.editor.format_task_for_dart(
             title=title,
             description=description,
             priority=priority,
