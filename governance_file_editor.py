@@ -227,9 +227,10 @@ class GovernanceFileEditor:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            # Use word boundary regex to avoid false positives (IDEA-1 shouldn't match IDEA-10)
-            pattern = r'\b' + re.escape(item_id) + r'\b'
-            return bool(re.search(pattern, content))
+            # Only match ID as an entry header, not in body text (Related fields, etc.)
+            # Header formats: "### IDEA-XXX: Title" or "### ISSUE-XXX | ..." or "### DEC-XXX | ..."
+            pattern = r'^### ' + re.escape(item_id) + r'[: |]'
+            return bool(re.search(pattern, content, re.MULTILINE))
         except Exception as e:
             # Fail-safe: assume collision on error (safer)
             print(f"⚠️  Error checking ID collision: {e}", file=sys.stderr)
