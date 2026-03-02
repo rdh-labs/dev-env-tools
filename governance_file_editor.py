@@ -3,7 +3,7 @@
 Governance File Editor - Reusable module for governance item operations.
 
 Provides safe, reliable file operations for IDEAS-BACKLOG.md, ISSUES-TRACKER.md,
-and DECISIONS-LOG.md with:
+DECISIONS-LOG.md, and LESSONS-LOG.md with:
 - Automatic ID collision detection and avoidance
 - Comprehensive error handling
 - Atomic file operations
@@ -113,6 +113,7 @@ class GovernanceFileEditor:
         "IDEAS": Path.home() / "dev/infrastructure/dev-env-docs/IDEAS-BACKLOG.md",
         "ISSUES": Path.home() / "dev/infrastructure/dev-env-docs/ISSUES-TRACKER.md",
         "DECISIONS": Path.home() / "dev/infrastructure/dev-env-docs/DECISIONS-LOG.md",
+        "LESSONS": Path.home() / "dev/infrastructure/dev-env-docs/LESSONS-LOG.md",
     }
 
     def __init__(self, scope: str = "global"):
@@ -138,6 +139,7 @@ class GovernanceFileEditor:
                 "IDEAS": docs_dir / "ideas.md",
                 "ISSUES": docs_dir / "issues.md",
                 "DECISIONS": docs_dir / "decisions.md",
+                "LESSONS": docs_dir / "lessons.md",
             }
 
     def get_next_id(self, item_type: str) -> str:
@@ -147,10 +149,10 @@ class GovernanceFileEditor:
         Uses exclusive file lock to prevent race conditions in multi-agent environment.
 
         Args:
-            item_type: "IDEAS", "ISSUES", or "DECISIONS"
+            item_type: "IDEAS", "ISSUES", "DECISIONS", or "LESSONS"
 
         Returns:
-            Next ID (e.g., "IDEA-414")
+            Next ID (e.g., "IDEA-414", "L-058")
 
         Raises:
             FileNotFoundError: If governance file doesn't exist
@@ -188,11 +190,12 @@ class GovernanceFileEditor:
         except UnicodeDecodeError as e:
             raise GovernanceFileError(f"Encoding error in {file_path}: {e}")
 
-        # Extract prefix (IDEA, ISSUE, DEC)
+        # Extract prefix (IDEA, ISSUE, DEC, L)
         prefix_map = {
             "IDEAS": "IDEA",
             "ISSUES": "ISSUE",
             "DECISIONS": "DEC",
+            "LESSONS": "L",
         }
         prefix = prefix_map[item_type]
 
@@ -213,8 +216,8 @@ class GovernanceFileEditor:
         Check if ID already exists.
 
         Args:
-            item_type: "IDEAS", "ISSUES", or "DECISIONS"
-            item_id: ID to check (e.g., "IDEA-414")
+            item_type: "IDEAS", "ISSUES", "DECISIONS", or "LESSONS"
+            item_id: ID to check (e.g., "IDEA-414", "L-058")
 
         Returns:
             True if ID exists, False otherwise
@@ -528,6 +531,166 @@ class GovernanceFileEditor:
         except PermissionError as e:
             raise GovernanceFileError(f"Permission denied: {e}")
 
+    def insert_lesson(
+        self,
+        lesson_id: str,
+        title: str,
+        context: str,
+        principle: str = "",
+        rule: str = "",
+        applies_to: str = "",
+        related: List[str] = None,
+        source: str = "User capture"
+    ) -> None:
+        """
+        Append new LESSON to LESSONS-LOG.md.
+
+        Args:
+            lesson_id: LESSON ID (e.g., "L-058")
+            title: Short title
+            context: Background — what happened that prompted this lesson
+            principle: The underlying principle (use for observations/discoveries)
+            rule: The actionable rule (use for behavioral mandates)
+            applies_to: Scope string (e.g., "All sessions", "Evaluation tasks")
+            related: List of related item IDs
+            source: How this was captured
+
+        Raises:
+            IDCollisionError: If ID already exists
+            GovernanceFileError: On file operation failure
+        """
+        if self.check_id_collision("LESSONS", lesson_id):
+            raise IDCollisionError(f"ID already exists: {lesson_id}")
+
+        file_path = self.paths["LESSONS"]
+
+        related_str = ", ".join(related) if related else "None"
+        today = date.today().strftime("%Y-%m-%d")
+
+        # Build entry — include optional sections only when provided
+        lines = [f"\n### {lesson_id}: {title}\n", f"\n**Date:** {today}\n"]
+        lines.append(f"**Context:** {context}\n")
+        if principle:
+            lines.append(f"\n**The Principle:** {principle}\n")
+        if rule:
+            lines.append(f"\n**The Rule:** {rule}\n")
+        if applies_to:
+            lines.append(f"\n**Applies to:** {applies_to}\n")
+        lines.append(f"\n**Related:** {related_str}\n")
+        lines.append(f"\n**Source:** {source}\n")
+        lines.append("\n---\n")
+
+        new_lesson = "".join(lines)
+
+        # Append to end of file with exclusive lock
+        try:
+            with open(file_path, 'a', encoding='utf-8') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.write(new_lesson)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except FileNotFoundError:
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+        except PermissionError as e:
+            raise GovernanceFileError(f"Permission denied: {e}")
+
+        # Update LESSONS-SUMMARY.yaml if it exists
+        summary_path = file_path.parent / "LESSONS-SUMMARY.yaml"
+        if summary_path.exists():
+            self._update_lessons_summary(summary_path, lesson_id, title, today)
+
+    def _update_lessons_summary(
+        self, summary_path: Path, lesson_id: str, title: str, date_str: str
+    ) -> None:
+        """Append new lesson entry to LESSONS-SUMMARY.yaml."""
+        try:
+            with open(summary_path, 'r+', encoding='utf-8') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+
+                    # Update total_count
+                    match = re.search(r'^total_count: (\d+)', content, re.MULTILINE)
+                    if match:
+                        new_count = int(match.group(1)) + 1
+                        content = re.sub(
+                            r'^total_count: \d+',
+                            f'total_count: {new_count}',
+                            content,
+                            flags=re.MULTILINE
+                        )
+
+                    # Append new entry before end
+                    entry = (
+                        f"  {lesson_id}:\n"
+                        f"    date: '{date_str}'\n"
+                        f"    title: '{title}'\n"
+                    )
+                    # Insert after last lesson entry (before trailing newline)
+                    content = content.rstrip('\n') + '\n' + entry
+
+                    atomic_write(summary_path, content)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            # Fail-safe: summary update failure doesn't break lesson insert
+            pass
+
+    def insert_task(
+        self,
+        title: str,
+        description: str,
+        priority: str = "MEDIUM",
+        dartboard: str = None,
+        assignee: str = None,
+        related: List[str] = None,
+        source: str = "User capture"
+    ) -> Dict:
+        """
+        Format a task for creation via Dart MCP.
+
+        NOTE: Tasks are NOT stored in local markdown files — Dart is the
+        canonical task tracker for this ecosystem. This method returns a
+        formatted dict suitable for use with the Dart MCP create_task() tool.
+
+        Decision: Tasks → Dart MCP (evaluated in ISSUE-2084 item #3).
+        Local markdown fallback was rejected: split tracking creates drift,
+        and Dart provides priority, assignee, dartboard, status, and due date
+        tracking that flat files cannot replicate without reimplementing a
+        task management system.
+
+        Args:
+            title: Short task title
+            description: Full task description
+            priority: HIGH/MEDIUM/LOW (maps to Dart priority)
+            dartboard: Target dartboard name (optional)
+            assignee: Assignee name or email (optional)
+            related: Related governance item IDs
+            source: How this task was captured
+
+        Returns:
+            Dict with task fields ready for Dart MCP create_task()
+            (calling agent should pass these fields to mcp__dart__create_task)
+        """
+        related_str = ", ".join(related) if related else ""
+        today = date.today().strftime("%Y-%m-%d")
+
+        description_body = description
+        if related_str:
+            description_body += f"\n\n**Related:** {related_str}"
+        description_body += f"\n\n**Source:** {source}\n**Captured:** {today}"
+
+        return {
+            "dart_action": "create_task",
+            "title": title,
+            "description": description_body,
+            "priority": priority,
+            "dartboard": dartboard,
+            "assignee": assignee,
+            "related": related_str,
+        }
+
     def _update_ideas_metadata(self, content: str, new_id: str) -> str:
         """Update IDEAS-BACKLOG.md metadata header."""
         # Extract current count
@@ -608,7 +771,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Governance file editor")
-    parser.add_argument('--get-next-id', choices=['IDEAS', 'ISSUES', 'DECISIONS'],
+    parser.add_argument('--get-next-id', choices=['IDEAS', 'ISSUES', 'DECISIONS', 'LESSONS'],
                        help='Get next available ID')
     parser.add_argument('--check-id', help='Check if ID exists (format: IDEA-414)')
 
@@ -632,6 +795,8 @@ def main():
             item_type = 'ISSUES'
         elif args.check_id.startswith('DEC'):
             item_type = 'DECISIONS'
+        elif args.check_id.startswith('L-'):
+            item_type = 'LESSONS'
         else:
             print("Error: Invalid ID format", file=sys.stderr)
             sys.exit(1)

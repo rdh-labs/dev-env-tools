@@ -201,6 +201,97 @@ class CaptureAnalyzer:
 
         return issue_id
 
+    def capture_lesson(
+        self,
+        text: str,
+        title: str,
+        context: str = "",
+        principle: str = "",
+        rule: str = "",
+        applies_to: str = "",
+        related: List[str] = None,
+        **kwargs
+    ) -> str:
+        """
+        Capture LESSON to LESSONS-LOG.md.
+
+        Args:
+            text: Original extracted text
+            title: Short title
+            context: Background (defaults to text if empty)
+            principle: The underlying principle
+            rule: The actionable rule
+            applies_to: Scope string
+            related: Related governance item IDs
+            **kwargs: Additional fields
+
+        Returns:
+            Created LESSON ID
+
+        Raises:
+            GovernanceFileError: On file operation failure
+        """
+        lesson_id = self.editor.get_next_id("LESSONS")
+
+        if not context:
+            context = text
+
+        self.editor.insert_lesson(
+            lesson_id=lesson_id,
+            title=title,
+            context=context,
+            principle=principle,
+            rule=rule,
+            applies_to=applies_to,
+            related=related,
+            source="Automated extraction via /capture-analyze",
+            **kwargs
+        )
+
+        return lesson_id
+
+    def capture_task(
+        self,
+        text: str,
+        title: str,
+        priority: str = "MEDIUM",
+        description: str = "",
+        dartboard: str = None,
+        assignee: str = None,
+        related: List[str] = None,
+        **kwargs
+    ) -> Dict:
+        """
+        Prepare a TASK for creation via Dart MCP.
+
+        Tasks are NOT written to local markdown files — Dart is canonical.
+        Returns a formatted dict for use with the Dart MCP create_task() tool.
+
+        Args:
+            text: Original extracted text
+            title: Short task title
+            priority: HIGH/MEDIUM/LOW
+            description: Full description (defaults to text if empty)
+            dartboard: Target dartboard name (optional)
+            assignee: Assignee name (optional)
+            related: Related governance item IDs
+
+        Returns:
+            Dict with task fields for mcp__dart__create_task
+        """
+        if not description:
+            description = text
+
+        return self.editor.insert_task(
+            title=title,
+            description=description,
+            priority=priority,
+            dartboard=dartboard,
+            assignee=assignee,
+            related=related,
+            source="Automated extraction via /capture-analyze",
+        )
+
     def analyze_and_present(self, text: str) -> Dict:
         """
         Analyze text and format for user presentation.
