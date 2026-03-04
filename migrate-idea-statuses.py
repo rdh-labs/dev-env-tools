@@ -221,7 +221,7 @@ def extract_suffix_note(status_value: str) -> str | None:
 def reconstruct_entry(entry: dict, new_status: str, parking_note: str | None) -> list[str]:
     """
     Rebuild entry lines with updated status and optional parking note.
-    Returns new lines list.
+    Returns new lines list. Removes duplicate **Status:** fields.
     """
     lines = list(entry["lines"])
     si = entry["status_line_idx"]
@@ -233,7 +233,7 @@ def reconstruct_entry(entry: dict, new_status: str, parking_note: str | None) ->
             lines.insert(2, f"**Parking Note:** {parking_note}\n")
         return lines
 
-    # Replace status line
+    # Replace the primary status line
     lines[si] = f"**Status:** {new_status}\n"
 
     # Add parking note immediately after status if we have one and it doesn't already exist
@@ -241,7 +241,20 @@ def reconstruct_entry(entry: dict, new_status: str, parking_note: str | None) ->
     if parking_note and not has_parking_note:
         lines.insert(si + 1, f"**Parking Note:** {parking_note}\n")
 
-    return lines
+    # Remove any DUPLICATE **Status:** lines (entries with 2+ status fields)
+    # Keep only the first occurrence (si, which we already set above)
+    seen_status = False
+    cleaned = []
+    for idx, line in enumerate(lines):
+        if line.startswith("**Status:**"):
+            if not seen_status:
+                seen_status = True
+                cleaned.append(line)
+            # else: skip duplicate status line
+        else:
+            cleaned.append(line)
+
+    return cleaned
 
 
 # ── IDEAS-ACTIVE.md Population ─────────────────────────────────────────────────
