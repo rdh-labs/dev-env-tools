@@ -59,7 +59,8 @@ def parse_decisions(filepath: Path) -> dict:
             }
 
     # Pattern 3: ### DEC-NNN | Title (minimal 2-field)
-    pattern3 = r'^### (DEC-\d+) \| ([^|]+)$'
+    # Use [^\n|]+ not [^|]+ — [^|] matches newlines, causing multi-line capture
+    pattern3 = r'^### (DEC-\d+) \| ([^\n|]+)$'
     for match in re.finditer(pattern3, content, re.MULTILINE):
         dec_id, title = match.groups()
         if dec_id not in decisions:
@@ -214,7 +215,8 @@ def parse_ideas(filepath: Path) -> dict:
             }
 
     # Pattern 4: ### IDEA-NNN | Title (simple pipe format)
-    pattern4 = r'^### (IDEA-\d+) \| ([^|]+)$'
+    # Use [^\n|]+ not [^|]+ — [^|] matches newlines, causing multi-line capture
+    pattern4 = r'^### (IDEA-\d+) \| ([^\n|]+)$'
     for match in re.finditer(pattern4, content, re.MULTILINE):
         idea_id, title = match.groups()
         if idea_id not in ideas:
@@ -230,7 +232,74 @@ def parse_ideas(filepath: Path) -> dict:
         if idea_id in ideas:
             ideas[idea_id]['status'] = status
 
+    # Extract **Added:** dates from body text for all ideas (most use colon header, no date in header)
+    # Scan each block between ### headers to find the Added date
+    blocks = re.split(r'\n(?=### IDEA-)', content)
+    for block in blocks:
+        header_match = re.match(r'### (IDEA-\d+)', block)
+        if not header_match:
+            continue
+        idea_id = header_match.group(1)
+        if idea_id not in ideas:
+            continue
+        if 'date' not in ideas[idea_id]:
+            date_match = re.search(r'\*\*Added:\*\*\s*(\d{4}-\d{2}-\d{2})', block)
+            if date_match:
+                ideas[idea_id]['date'] = date_match.group(1)
+
     return ideas
+
+
+def write_ideas_summary_compact(data: dict, output_path: Path, source_path: Path) -> int:
+    """Write IDEAS-SUMMARY.yaml in compact single-line format.
+
+    Target: ~30KB for 400+ entries (vs 131KB in block YAML format).
+    Format per entry: IDEA-NNN: {title: '...', status: Parked, added: '2026-01-15'}
+
+    Phase 1 of governance operability fix (ISSUE-2141, DEC-116 restoration).
+    """
+    source_tilde = path_to_tilde(source_path)
+    now = datetime.now().isoformat()
+    source_hash = get_file_hash(source_path)
+    note = (
+        f'Compact lookup index (ID+title+status+added). '
+        f'{len(data)} ideas. For full details, read {source_path.name}. '
+        f'No MCP query tool yet (ISSUE-2142 — Phase 2).'
+    )
+
+    lines = [
+        '# IDEAS-SUMMARY.yaml',
+        '# Compact governance index — restored Summary-First pattern (DEC-116, ISSUE-2141)',
+        f'# Generated: {now}',
+        f'# Source: {source_tilde}  hash: {source_hash}',
+        '#',
+        f'version: 1.0',
+        f'generated_at: {now!r}',
+        f'source_file: {source_tilde!r}',
+        f'source_hash: {source_hash!r}',
+        f'total_count: {len(data)}',
+        f'note: {note!r}',
+        'ideas:',
+    ]
+
+    # Sort by numeric ID for deterministic output
+    def idea_sort_key(item):
+        m = re.search(r'\d+', item[0])
+        return int(m.group()) if m else 0
+
+    for idea_id, fields in sorted(data.items(), key=idea_sort_key):
+        # Normalize title: strip whitespace/newlines, collapse internal newlines to space,
+        # escape single quotes for YAML single-quoted string ('' not \')
+        title = fields.get('title', '').strip().replace('\n', ' ').replace("'", "''")
+        status = fields.get('status', 'Parking')
+        added = fields.get('date', '')
+        if added:
+            lines.append(f"  {idea_id}: {{title: '{title}', status: {status}, added: '{added}'}}")
+        else:
+            lines.append(f"  {idea_id}: {{title: '{title}', status: {status}}}")
+
+    output_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return len(data)
 
 def find_duplicates(filepath: Path, pattern: str) -> dict:
     """Find duplicate IDs in a governance file.
@@ -403,17 +472,17 @@ def generate_summaries():
     else:
         print(f"✗ ISSUES-TRACKER.md not found at {issues_path}")
 
-    # Ideas
+    # Ideas — compact format to restore Summary-First token efficiency (ISSUE-2141, DEC-116)
     ideas_path = DEV_ENV_DOCS / "IDEAS-BACKLOG.md"
     if ideas_path.exists():
         ideas = parse_ideas(ideas_path)
-        count = write_summary(
+        count = write_ideas_summary_compact(
             ideas,
             OUTPUT_DIR / "IDEAS-SUMMARY.yaml",
             ideas_path,
-            "idea"
         )
-        print(f"✓ IDEAS-SUMMARY.yaml: {count} ideas indexed")
+        size_kb = (OUTPUT_DIR / "IDEAS-SUMMARY.yaml").stat().st_size // 1024
+        print(f"✓ IDEAS-SUMMARY.yaml: {count} ideas indexed ({size_kb}KB compact)")
     else:
         print(f"✗ IDEAS-BACKLOG.md not found at {ideas_path}")
 
