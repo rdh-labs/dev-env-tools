@@ -416,7 +416,13 @@ def main():
             if args.format == 'json':
                 print(json.dumps(result, indent=2))
             else:
-                print(f"🔍 Analyzed your input. Found {result['count']} potential governance items:\n")
+                if result['count'] == 0:
+                    print("🔍 Pattern matching found 0 items.")
+                    print("   Note: This tool uses keyword/phrase matching — it may miss behavioral,")
+                    print("   observational, or nuanced text. Agent direct analysis can identify")
+                    print("   additional items that pattern matching doesn't catch.\n")
+                else:
+                    print(f"🔍 Analyzed your input. Found {result['count']} potential governance items:\n")
 
                 for item in result['items']:
                     print("━" * 60)

@@ -18,7 +18,11 @@ SIGNALS = {
             "broken", "doesn't work", "failing", "not working",
             "bug", "error", "gap", "missing", "lacking",
             "unclear", "uncertain", "not sure if", "don't know if",
-            "problem", "issue", "blocker", "stuck"
+            "problem", "issue", "blocker", "stuck",
+            # Behavioral/meta/observational signals (ISSUE-2161)
+            "recurring", "repeatedly", "keeps happening", "unnoticed",
+            "overlooked", "still not", "not attending", "not being caught",
+            "without recognizing", "same issue"
         ],
         "phrases": [
             "we can't rely on",
@@ -26,7 +30,15 @@ SIGNALS = {
             "doesn't ensure",
             "doesn't guarantee",
             "uncertain whether",
-            "not sure if our"
+            "not sure if our",
+            # Behavioral/meta phrases (ISSUE-2161)
+            "popping up repeatedly",
+            "same issues",
+            "keeps recurring",
+            "not attending to",
+            "without agents recognizing",
+            "still not attending",
+            "same problem keeps"
         ]
     },
 
@@ -64,7 +76,10 @@ SIGNALS = {
     "LESSON": {
         "keywords": [
             "learned", "discovered", "found out", "realized",
-            "turned out", "it appears", "observation"
+            "turned out", "it appears", "observation",
+            # Observational/pattern signals (ISSUE-2161)
+            "seems to be", "appears to", "looks like", "notice that",
+            "pattern of", "feels like"
         ],
         "phrases": [
             "we learned that",
@@ -72,7 +87,11 @@ SIGNALS = {
             "found out that",
             "turned out that",
             "key insight:",
-            "lesson learned:"
+            "lesson learned:",
+            # Observational phrases (ISSUE-2161)
+            "seems to be a pattern",
+            "pattern of behavior",
+            "appears to be"
         ]
     },
 
