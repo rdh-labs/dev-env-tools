@@ -116,6 +116,14 @@ class GovernanceFileEditor:
         "LESSONS": Path.home() / "dev/infrastructure/dev-env-docs/LESSONS-LOG.md",
     }
 
+    # Archive paths — IDs here must be included in collision checks (ISSUE-2168)
+    ARCHIVE_PATHS = {
+        "IDEAS": Path.home() / "dev/infrastructure/dev-env-docs/archive/governance/IDEAS-BACKLOG-archive.md",
+        "ISSUES": Path.home() / "dev/infrastructure/dev-env-docs/archive/governance/ISSUES-TRACKER-archive.md",
+        "DECISIONS": Path.home() / "dev/infrastructure/dev-env-docs/archive/governance/DECISIONS-LOG-archive.md",
+        "LESSONS": None,  # No archive for lessons yet
+    }
+
     def __init__(self, scope: str = "global"):
         """
         Initialize editor.
@@ -126,6 +134,15 @@ class GovernanceFileEditor:
         """
         self.scope = scope
         self._detect_paths()
+
+    def _get_archive_path(self, item_type: str):
+        """Return archive file path for item_type, or None if not applicable.
+
+        Archive paths only apply for global scope — project-scoped repos have no archive.
+        """
+        if self.scope != "global":
+            return None
+        return self.ARCHIVE_PATHS.get(item_type)
 
     def _detect_paths(self):
         """Detect file paths based on scope."""
@@ -203,6 +220,15 @@ class GovernanceFileEditor:
         pattern = rf'{prefix}-(\d+)'
         matches = re.findall(pattern, content)
 
+        # Also check archive file to avoid collisions with archived IDs (ISSUE-2168)
+        archive_path = self._get_archive_path(item_type)
+        if archive_path and archive_path.exists():
+            try:
+                with open(archive_path, 'r', encoding='utf-8') as af:
+                    matches.extend(re.findall(pattern, af.read()))
+            except (PermissionError, UnicodeDecodeError):
+                pass  # Non-blocking: if archive is unreadable, proceed without it
+
         if not matches:
             return f"{prefix}-001"
 
@@ -233,7 +259,18 @@ class GovernanceFileEditor:
             # Only match ID as an entry header, not in body text (Related fields, etc.)
             # Header formats: "### IDEA-XXX: Title" or "### ISSUE-XXX | ..." or "### DEC-XXX | ..."
             pattern = r'^### ' + re.escape(item_id) + r'[: |]'
-            return bool(re.search(pattern, content, re.MULTILINE))
+            if bool(re.search(pattern, content, re.MULTILINE)):
+                return True
+            # Also check archive file — archived IDs must not be reused (ISSUE-2168)
+            archive_path = self._get_archive_path(item_type)
+            if archive_path and archive_path.exists():
+                try:
+                    with open(archive_path, 'r', encoding='utf-8') as af:
+                        if bool(re.search(pattern, af.read(), re.MULTILINE)):
+                            return True
+                except (PermissionError, UnicodeDecodeError):
+                    pass  # Non-blocking: if archive unreadable, don't assume collision
+            return False
         except Exception as e:
             # Fail-safe: assume collision on error (safer)
             print(f"⚠️  Error checking ID collision: {e}", file=sys.stderr)
