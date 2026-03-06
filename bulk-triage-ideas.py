@@ -4,11 +4,16 @@ bulk-triage-ideas.py — Day Zero AI-assisted mass triage of Parked ideas
 Part of IDEA-568: Idea Management Pipeline (PATT-020)
 
 Proposes EXPIRE/MERGE/HOLD/PROMOTE for all Parked items using objective criteria:
-  1. Age check: >12 months + no cross-references → EXPIRE (LOW confidence)
+  1. Age check: >12 months + no cross-references + no revival trigger → EXPIRE (LOW confidence)
   2. Reference check: cross-references in DECISIONS-LOG, ISSUES-TRACKER, other IDEAs
   3. Duplicate detection: title similarity (difflib.SequenceMatcher > 0.7)
   4. Keyword freshness: references tool/project absent from AUTHORITATIVE.yaml → EXPIRE (HIGH)
-  5. Default: HOLD
+  5. Revival trigger: **Revival Trigger:** field present → blocks EXPIRE (idea has exit conditions, HOLD)
+  6. Default: HOLD
+
+Multi-factor criteria (IDEA-591): age alone is insufficient. An idea with a revival trigger has
+explicit exit conditions and must NOT be expired — it is waiting for a future event/condition.
+EXPIRE requires: old age AND zero cross-refs AND no revival trigger AND no domain activity.
 
 Output: BULK-TRIAGE-PROPOSALS.md (category-grouped, human-review-ready)
 
@@ -117,6 +122,7 @@ def _build_entry(lines: list[str]) -> dict | None:
         "related": fields.get("Related", ""),
         "blocker": fields.get("Blocker", ""),
         "parking_note": fields.get("Parking Note", ""),
+        "revival_trigger": fields.get("Revival Trigger", ""),
         "description": " ".join(desc_lines[:3]),
         "_age_days": compute_age_days(fields.get("Added", "")),
     }
@@ -298,17 +304,19 @@ def triage_entries(
 
         # --- EXPIRE checks (only if not already PROMOTE) ---
         if proposal is None:
-            # Age + zero refs
-            if age_months and age_months > AGE_EXPIRE_MONTHS and n_refs == 0:
+            revival_trigger = entry.get("revival_trigger", "")
+            # Age + zero refs + no revival trigger (multi-factor criteria, IDEA-591)
+            if age_months and age_months > AGE_EXPIRE_MONTHS and n_refs == 0 and not revival_trigger:
                 proposal = "EXPIRE"
                 reason = (
-                    f"Age: {age_months:.0f} months with 0 cross-references — "
+                    f"Age: {age_months:.0f} months with 0 cross-references and no revival trigger — "
                     f"problem likely dissolved or superseded"
                 )
                 confidence = "LOW"
 
             # Parking note indicates it was conditionally deferred and condition is now stale
-            elif age_months and age_months > 6 and n_refs == 0:
+            # Revival trigger also blocks this path (idea has explicit exit conditions)
+            elif age_months and age_months > 6 and n_refs == 0 and not revival_trigger:
                 parking_note = entry.get("parking_note", "")
                 staleness_signals = [
                     "current.*adequate",
@@ -334,8 +342,16 @@ def triage_entries(
         if proposal is None:
             proposal = "HOLD"
             ref_str = f"{n_refs} refs ({', '.join(cross_refs[:2])})" if cross_refs else "0 refs"
-            age_str = f"{age_months:.0f}mo" if age_months else "age unknown"
-            reason = f"Age: {age_str}, {ref_str} — no expiry/merge/promote signal"
+            age_str_val = f"{age_months:.0f}mo" if age_months else "age unknown"
+            revival_trigger = entry.get("revival_trigger", "")
+            if revival_trigger and age_months and age_months > AGE_EXPIRE_MONTHS and n_refs == 0:
+                # Revival trigger blocked EXPIRE — note this explicitly
+                reason = (
+                    f"Age: {age_str_val}, {ref_str} — EXPIRE blocked by revival trigger: "
+                    f"'{revival_trigger[:70]}'"
+                )
+            else:
+                reason = f"Age: {age_str_val}, {ref_str} — no expiry/merge/promote signal"
             confidence = "HIGH"
 
         entry["_proposal"] = proposal
@@ -545,8 +561,8 @@ def main() -> int:
     all_entries = parse_backlog_entries(backlog_text)
     print(f" {len(all_entries)} entries")
 
-    # Filter to Parked entries only
-    parked_entries = [e for e in all_entries if e["status"] in ("Parked", "Parked:Deferred", "Parked:Stale", "")]
+    # Filter to Parked entries only ("Parking" is the current canonical status; "Parked" is legacy)
+    parked_entries = [e for e in all_entries if e["status"] in ("Parked", "Parked:Deferred", "Parked:Stale", "Parking", "")]
     print(f"Parked entries: {len(parked_entries)}")
 
     if batch_size:
