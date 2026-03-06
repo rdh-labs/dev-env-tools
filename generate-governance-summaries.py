@@ -232,8 +232,8 @@ def parse_ideas(filepath: Path) -> dict:
         if idea_id in ideas:
             ideas[idea_id]['status'] = status
 
-    # Extract **Added:** dates from body text for all ideas (most use colon header, no date in header)
-    # Scan each block between ### headers to find the Added date
+    # Extract **Added:** dates and **Revival Trigger:** from body text
+    # Scan each block between ### headers
     blocks = re.split(r'\n(?=### IDEA-)', content)
     for block in blocks:
         header_match = re.match(r'### (IDEA-\d+)', block)
@@ -246,6 +246,10 @@ def parse_ideas(filepath: Path) -> dict:
             date_match = re.search(r'\*\*Added:\*\*\s*(\d{4}-\d{2}-\d{2})', block)
             if date_match:
                 ideas[idea_id]['date'] = date_match.group(1)
+        # Extract revival trigger (IDEA-589)
+        revival_match = re.search(r'^\*\*Revival Trigger:\*\*\s*(.+)', block, re.MULTILINE)
+        if revival_match:
+            ideas[idea_id]['revival'] = revival_match.group(1).strip()
 
     return ideas
 
@@ -264,7 +268,7 @@ def write_ideas_summary_compact(data: dict, output_path: Path, source_path: Path
     note = (
         f'Compact lookup index (ID+title+status+added). '
         f'{len(data)} ideas. For full details, read {source_path.name}. '
-        f'No MCP query tool yet (ISSUE-2142 — Phase 2).'
+        f'Use query_ideas MCP tool for body-content search (Phase 2, ISSUE-2145).'
     )
 
     lines = [
@@ -293,10 +297,14 @@ def write_ideas_summary_compact(data: dict, output_path: Path, source_path: Path
         title = fields.get('title', '').strip().replace('\n', ' ').replace("'", "''")
         status = fields.get('status', 'Parking')
         added = fields.get('date', '')
+        revival = fields.get('revival', '')
+        parts = [f"title: '{title}'", f"status: {status}"]
         if added:
-            lines.append(f"  {idea_id}: {{title: '{title}', status: {status}, added: '{added}'}}")
-        else:
-            lines.append(f"  {idea_id}: {{title: '{title}', status: {status}}}")
+            parts.append(f"added: '{added}'")
+        if revival:
+            revival_escaped = revival.replace("'", "''")
+            parts.append(f"revival: '{revival_escaped}'")
+        lines.append(f"  {idea_id}: {{{', '.join(parts)}}}")
 
     output_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     return len(data)
@@ -398,7 +406,7 @@ def path_to_tilde(filepath: Path) -> str:
 MCP_TOOL_NAMES = {
     'decision': 'query_decisions',  # Actual MCP tool name
     'issue': 'query_issues',        # Actual MCP tool name
-    'idea': None,                   # No MCP tool yet - read file directly
+    'idea': 'query_ideas',          # Added Phase 2 (ISSUE-2145)
 }
 
 

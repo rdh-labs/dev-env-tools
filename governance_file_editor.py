@@ -251,7 +251,8 @@ class GovernanceFileEditor:
         effort: str = "MEDIUM",
         related: List[str] = None,
         validation: List[str] = None,
-        source: str = "User capture"
+        source: str = "User capture",
+        revival_trigger: str = ""
     ) -> None:
         """
         Insert new IDEA into IDEAS-BACKLOG.md.
@@ -286,6 +287,8 @@ class GovernanceFileEditor:
 
         today = date.today().strftime("%Y-%m-%d")
 
+        revival_line = f"\n**Revival Trigger:** {revival_trigger}" if revival_trigger else ""
+
         new_idea = f"""
 ### {idea_id}: {title}
 
@@ -293,7 +296,7 @@ class GovernanceFileEditor:
 **Priority:** {priority}
 **Status:** Parking
 **Added:** {today}
-**Source:** {source}
+**Source:** {source}{revival_line}
 
 **Description:** {description}
 
