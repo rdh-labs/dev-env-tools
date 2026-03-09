@@ -480,6 +480,124 @@ class GovernanceFileEditor:
         except PermissionError as e:
             raise GovernanceFileError(f"Permission denied: {e}")
 
+    def allocate_and_insert_issue(
+        self,
+        title: str,
+        severity: str,
+        category: str,
+        description: str,
+        impact: str,
+        resolution: List[str],
+        related: List[str] = None,
+        source: str = "GERA auto-resolve",
+    ) -> str:
+        """
+        Allocate next ISSUE-NNN and insert it in a SINGLE flock transaction.
+
+        Fixes HIGH-1 TOCTOU vulnerability: the existing pattern of calling
+        get_next_id() (acquires + releases flock) then insert_issue() (acquires +
+        releases flock) leaves a window between the two acquisitions where another
+        process can allocate the same ID. This method holds flock across the entire
+        read-allocate-write sequence.
+
+        Used by GERA Phase 4 ACT-03 (register-issue). Callers receive the allocated
+        issue_id so they can record it in the audit log.
+
+        Args:
+            title: Short issue title
+            severity: CRITICAL/HIGH/MEDIUM/LOW
+            category: Category (e.g., "Automation", "Governance")
+            description: Full description
+            impact: What fails if not fixed
+            resolution: List of resolution steps
+            related: List of related item IDs
+            source: How this was captured (default: "GERA auto-resolve")
+
+        Returns:
+            Allocated issue_id string (e.g., "ISSUE-2206")
+
+        Raises:
+            GovernanceFileError: On file operation failure
+            GovernanceFileNotFoundError: If ISSUES-TRACKER.md is missing
+        """
+        file_path = self.paths["ISSUES"]
+
+        if not file_path.exists():
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+
+        related_str = ", ".join(related) if related else "None"
+        resolution_str = "\n".join(
+            f"{i+1}. {step}" for i, step in enumerate(resolution)
+        )
+        today = date.today().strftime("%Y-%m-%d")
+
+        try:
+            with open(file_path, "r+", encoding="utf-8") as f:
+                # Acquire exclusive lock — held for the ENTIRE read-allocate-write sequence
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+
+                    # ── Allocate ID (under lock — no TOCTOU window) ──────────
+                    # Also check archive to prevent collision with archived IDs (ISSUE-2168)
+                    matches = re.findall(r"ISSUE-(\d+)", content)
+                    archive_path = self._get_archive_path("ISSUES")
+                    if archive_path and archive_path.exists():
+                        try:
+                            matches.extend(
+                                re.findall(r"ISSUE-(\d+)", archive_path.read_text())
+                            )
+                        except (PermissionError, UnicodeDecodeError):
+                            pass
+
+                    if matches:
+                        highest = max(int(n) for n in matches)
+                        issue_num = highest + 1
+                    else:
+                        issue_num = 1
+                    issue_id = f"ISSUE-{issue_num:04d}"
+
+                    # ── Build block ──────────────────────────────────────────
+                    new_issue = (
+                        f"\n### {issue_id} | {today} | OPEN | {severity} | {title}\n"
+                        f"\n**Severity:** {severity}\n"
+                        f"**Category:** {category}\n"
+                        f"**Discovered:** {today}\n"
+                        f"**Source:** {source}\n"
+                        f"\n**Description:** {description}\n"
+                        f"\n**Impact:** {impact}\n"
+                        f"\n**Resolution Required:**\n{resolution_str}\n"
+                        f"\n**Related:** {related_str}\n"
+                        f"\n**Status:** OPEN\n"
+                        f"\n---\n\n"
+                    )
+
+                    # ── Insert after "## Open Issues" header ─────────────────
+                    if "## Open Issues" not in content:
+                        raise GovernanceFileError(
+                            "Malformed file: '## Open Issues' header not found"
+                        )
+                    content = content.replace(
+                        "## Open Issues\n",
+                        f"## Open Issues\n{new_issue}",
+                    )
+
+                    content = self._update_issues_metadata(content)
+
+                    # ── Atomic write (crash-safe tempfile+os.replace) ─────────
+                    # Lock is held during write so no other process reads mid-write
+                    atomic_write(file_path, content)
+
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        except FileNotFoundError:
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+        except PermissionError as e:
+            raise GovernanceFileError(f"Permission denied: {e}")
+
+        return issue_id
+
     def insert_decision(
         self,
         decision_id: str,
