@@ -470,6 +470,31 @@ def generate_summaries():
     issues_path = DEV_ENV_DOCS / "ISSUES-TRACKER.md"
     if issues_path.exists():
         issues = parse_issues(issues_path)
+
+        # Merge: preserve non-OPEN statuses from existing YAML where tracker header still says OPEN.
+        # Prevents regression where triage-only YAML updates are silently overwritten on next
+        # regeneration (ISSUE-2255). If tracker header = OPEN but existing YAML = RESOLVED/WONT_FIX,
+        # honour the YAML. The correct long-term fix is to always update tracker headers, but this
+        # merge guard makes the system resilient to tracker/YAML drift.
+        existing_yaml_path = OUTPUT_DIR / "ISSUES-SUMMARY.yaml"
+        if existing_yaml_path.exists():
+            try:
+                with open(existing_yaml_path) as _ef:
+                    _existing = yaml.safe_load(_ef)
+                _existing_issues = (_existing or {}).get('issues', {})
+                _preserved = 0
+                for _iid, _fields in _existing_issues.items():
+                    if _iid not in issues:
+                        continue
+                    _ex_status = (_fields.get('status', 'OPEN') if isinstance(_fields, dict) else 'OPEN')
+                    if _ex_status not in ('OPEN', None) and issues[_iid].get('status') == 'OPEN':
+                        issues[_iid]['status'] = _ex_status
+                        _preserved += 1
+                if _preserved:
+                    print(f"  (Preserved {_preserved} non-OPEN statuses from existing YAML — tracker/YAML drift guard)")
+            except Exception as _e:
+                print(f"  Warning: could not merge existing ISSUES-SUMMARY.yaml: {_e} — proceeding with tracker values")
+
         count = write_summary(
             issues,
             OUTPUT_DIR / "ISSUES-SUMMARY.yaml",
