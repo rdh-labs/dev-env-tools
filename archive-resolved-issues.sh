@@ -37,7 +37,7 @@ import re
 from datetime import datetime
 
 tracker_path, archive_path, dry_run_str = sys.argv[1], sys.argv[2], sys.argv[3]
-dry_run = dry_run_str == "True"
+dry_run = dry_run_str.lower() == "true"
 
 with open(tracker_path, 'r') as f:
     content = f.read()
