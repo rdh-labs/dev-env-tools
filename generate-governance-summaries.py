@@ -250,6 +250,11 @@ def parse_ideas(filepath: Path) -> dict:
         revival_match = re.search(r'^\*\*Revival Trigger:\*\*\s*(.+)', block, re.MULTILINE)
         if revival_match:
             ideas[idea_id]['revival'] = revival_match.group(1).strip()
+        # Extract status from block body (fixes silent failure in status_pattern pass
+        # which used re.finditer without DOTALL, so couldn't cross line boundaries)
+        status_match = re.search(r'^\*\*Status:\*\*\s*(\S+)', block, re.MULTILINE)
+        if status_match:
+            ideas[idea_id]['status'] = status_match.group(1)
 
     return ideas
 
