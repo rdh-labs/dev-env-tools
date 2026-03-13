@@ -457,14 +457,23 @@ class GovernanceFileEditor:
                 try:
                     content = f.read()
 
-                    # Insert after "## Open Issues" header
-                    if "## Open Issues" not in content:
-                        raise GovernanceFileError("Malformed file: '## Open Issues' header not found")
-
-                    content = content.replace(
-                        "## Open Issues\n",
-                        f"## Open Issues\n{new_issue}"
-                    )
+                    # Insert after "## Open Issues" header; fallback to before first ### ISSUE- entry
+                    if "## Open Issues" in content:
+                        content = content.replace(
+                            "## Open Issues\n",
+                            f"## Open Issues\n{new_issue}",
+                            1
+                        )
+                    else:
+                        # Fallback: ISSUES-TRACKER.md may lack the section header —
+                        # insert before the first ### ISSUE-NNNN entry instead (IDEA-652)
+                        match = re.search(r'^### ISSUE-\d+', content, re.MULTILINE)
+                        if match:
+                            content = content[:match.start()] + new_issue + "\n" + content[match.start():]
+                        else:
+                            raise GovernanceFileError(
+                                "Malformed file: no '## Open Issues' header and no '### ISSUE-NNNN' entry found"
+                            )
 
                     # Update metadata
                     content = self._update_issues_metadata(content)
@@ -572,15 +581,23 @@ class GovernanceFileEditor:
                         f"\n---\n\n"
                     )
 
-                    # ── Insert after "## Open Issues" header ─────────────────
-                    if "## Open Issues" not in content:
-                        raise GovernanceFileError(
-                            "Malformed file: '## Open Issues' header not found"
+                    # ── Insert after "## Open Issues" header; fallback to before first ### ISSUE- entry ──
+                    if "## Open Issues" in content:
+                        content = content.replace(
+                            "## Open Issues\n",
+                            f"## Open Issues\n{new_issue}",
+                            1,
                         )
-                    content = content.replace(
-                        "## Open Issues\n",
-                        f"## Open Issues\n{new_issue}",
-                    )
+                    else:
+                        # Fallback: ISSUES-TRACKER.md may lack the section header —
+                        # insert before the first ### ISSUE-NNNN entry instead (IDEA-652)
+                        _m = re.search(r'^### ISSUE-\d+', content, re.MULTILINE)
+                        if _m:
+                            content = content[:_m.start()] + new_issue + "\n" + content[_m.start():]
+                        else:
+                            raise GovernanceFileError(
+                                "Malformed file: no '## Open Issues' header and no '### ISSUE-NNNN' entry found"
+                            )
 
                     content = self._update_issues_metadata(content)
 
