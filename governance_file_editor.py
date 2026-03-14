@@ -615,6 +615,98 @@ class GovernanceFileEditor:
 
         return issue_id
 
+    def resolve_issue(
+        self,
+        issue_id: str,
+        e2e_evidence: str,
+        resolved_by: str = "",
+    ) -> None:
+        """
+        Mark an ISSUE as RESOLVED in ISSUES-TRACKER.md.
+
+        e2e_evidence is REQUIRED (ISSUE-2292): must be the exact command run
+        and the actual output observed — not a claim of having tested it.
+
+        Args:
+            issue_id: ISSUE ID to resolve (e.g., "ISSUE-2294")
+            e2e_evidence: Live invocation evidence, e.g.
+                "python3 capture_analyze.py --present '...' → Found 1 item, 90% confidence"
+            resolved_by: Optional commit hash, PR, or session reference
+
+        Raises:
+            ValueError: If e2e_evidence is empty or a placeholder
+            GovernanceFileNotFoundError: If file not found
+            GovernanceFileError: If issue_id not found or on file failure
+        """
+        if not e2e_evidence or not e2e_evidence.strip():
+            raise ValueError(
+                "e2e_evidence is required to resolve an issue (ISSUE-2292). "
+                "Provide the exact command run and output observed."
+            )
+        placeholder_patterns = ["tbd", "todo", "n/a", "none", "see above", "as above"]
+        if e2e_evidence.strip().lower() in placeholder_patterns:
+            raise ValueError(
+                f"e2e_evidence '{e2e_evidence}' looks like a placeholder. "
+                "Provide real evidence: the command run and actual output observed."
+            )
+
+        today = date.today().strftime("%Y-%m-%d")
+        resolved_suffix = f" | {resolved_by}" if resolved_by else ""
+        new_status = (
+            f"**Status:** RESOLVED | {today}{resolved_suffix} | "
+            f"E2E evidence: {e2e_evidence}"
+        )
+
+        file_path = self.paths["ISSUES"]
+        try:
+            with open(file_path, 'r+', encoding='utf-8') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+
+                    # Find the issue header and its Status line
+                    header_pattern = re.compile(
+                        rf'^(### {re.escape(issue_id)} \| \d{{4}}-\d{{2}}-\d{{2}} \| )(\w+)( \|)',
+                        re.MULTILINE
+                    )
+                    header_match = header_pattern.search(content)
+                    if not header_match:
+                        raise GovernanceFileError(f"Issue not found: {issue_id}")
+
+                    # Update header status field
+                    content = header_pattern.sub(
+                        lambda m: m.group(1) + "RESOLVED" + m.group(3),
+                        content,
+                        count=1
+                    )
+
+                    # Replace the **Status:** line within this issue's block
+                    # Find the issue block (from header to next ---)
+                    issue_start = content.find(f"### {issue_id}")
+                    next_sep = content.find("\n---\n", issue_start)
+                    block = content[issue_start:next_sep] if next_sep != -1 else content[issue_start:]
+
+                    status_pattern = re.compile(r'\*\*Status:\*\*.*', re.MULTILINE)
+                    if status_pattern.search(block):
+                        updated_block = status_pattern.sub(new_status, block, count=1)
+                    else:
+                        updated_block = block.rstrip() + f"\n\n{new_status}\n"
+
+                    content = (
+                        content[:issue_start]
+                        + updated_block
+                        + (content[next_sep:] if next_sep != -1 else "")
+                    )
+
+                    content = self._update_issues_metadata(content)
+                    atomic_write(file_path, content)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except FileNotFoundError:
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+        except PermissionError as e:
+            raise GovernanceFileError(f"Permission denied: {e}")
+
     def insert_decision(
         self,
         decision_id: str,
