@@ -22,7 +22,10 @@ SIGNALS = {
             # Behavioral/meta/observational signals (ISSUE-2161)
             "recurring", "repeatedly", "keeps happening", "unnoticed",
             "overlooked", "still not", "not attending", "not being caught",
-            "without recognizing", "same issue"
+            "without recognizing", "same issue",
+            # Agent compliance / trust-erosion signals (ISSUE-2284)
+            "red text", "not monitored", "not assessed", "not evaluated",
+            "without flagging", "without assessing", "silently", "no confidence"
         ],
         "phrases": [
             "we can't rely on",
@@ -38,7 +41,18 @@ SIGNALS = {
             "not attending to",
             "without agents recognizing",
             "still not attending",
-            "same problem keeps"
+            "same problem keeps",
+            # Agent compliance / trust-erosion phrases (ISSUE-2284)
+            "no confidence that",
+            "passed silently",
+            "continuing without",
+            "without flagging",
+            "without assessing",
+            "not being assessed",
+            "attending to errors",
+            "agent is not",
+            "agent did not flag",
+            "agent did not assess"
         ]
     },
 
