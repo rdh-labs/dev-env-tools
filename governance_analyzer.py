@@ -25,7 +25,13 @@ SIGNALS = {
             "without recognizing", "same issue",
             # Agent compliance / trust-erosion signals (ISSUE-2284)
             "red text", "not monitored", "not assessed", "not evaluated",
-            "without flagging", "without assessing", "silently", "no confidence"
+            "without flagging", "without assessing", "silently", "no confidence",
+            # QC / validation failure signals (ISSUE-2284 broadened — ISSUE-2286)
+            "not validated", "not tested", "not verified", "not run",
+            "skipping", "skipped", "not running", "were not run",
+            "qc processes", "qc gates", "e2e", "end-to-end",
+            "inflection point", "validation gap", "not followed",
+            "not following", "not adhering", "guidance not"
         ],
         "phrases": [
             "we can't rely on",
@@ -52,7 +58,22 @@ SIGNALS = {
             "attending to errors",
             "agent is not",
             "agent did not flag",
-            "agent did not assess"
+            "agent did not assess",
+            # QC/validation failure phrases (ISSUE-2286)
+            "not running all",
+            "not running the",
+            "qc processes were not",
+            "were not run",
+            "not tested and validated",
+            "validated in real life",
+            "validated e2e",
+            "tested e2e",
+            "follow the guidance",
+            "agents are not",
+            "agent's response indicates",
+            "response indicates that",
+            "relevant qc",
+            "all relevant"
         ]
     },
 
