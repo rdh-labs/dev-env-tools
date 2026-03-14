@@ -71,9 +71,7 @@ SIGNALS = {
             "follow the guidance",
             "agents are not",
             "agent's response indicates",
-            "response indicates that",
-            "relevant qc",
-            "all relevant"
+            "relevant qc"
         ]
     },
 
