@@ -70,7 +70,20 @@ SIGNALS = {
             "not validated e2e",
             "not tested e2e",
             "not following the guidance",
-            "agents are not"
+            "agents are not",
+            # L-197 false-completeness phrases (ISSUE-2302, IDEA-661)
+            # "tracked by X; no issue needed" = automated detection ≠ automated resolution
+            # when agent judgment is required for each resolution step.
+            "no issue needed",
+            "no separate issue needed",
+            "no tracking needed",
+            "no separate tracking",
+            "tracked by the health check",
+            "tracked by health check",
+            "tracked by the monitor",
+            "handled automatically",
+            "this is tracked",
+            "already tracked"
         ]
     },
 
