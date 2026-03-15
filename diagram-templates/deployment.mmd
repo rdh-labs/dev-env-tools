@@ -1,0 +1,49 @@
+%% Deployment / Infrastructure Diagram Template
+%% Usage: Map deployment topology — hosts, containers, services, networking.
+%% Rendered natively by GitHub in markdown code blocks: ```mermaid ... ```
+
+graph TB
+    %% User access
+    Internet(("Internet"))
+
+    %% Edge
+    subgraph edge ["Edge / CDN"]
+        CDN["CDN<br/><i>Static assets</i>"]
+        DNS["DNS<br/><i>Route53 / Cloudflare</i>"]
+    end
+
+    %% Application tier
+    subgraph app ["Application Tier"]
+        LB["Load Balancer<br/><i>nginx / ALB</i>"]
+        App1["App Server 1<br/><i>Node.js / Python</i>"]
+        App2["App Server 2<br/><i>Node.js / Python</i>"]
+    end
+
+    %% Data tier
+    subgraph data ["Data Tier"]
+        Primary[("Primary DB<br/><i>PostgreSQL</i>")]
+        Replica[("Read Replica<br/><i>PostgreSQL</i>")]
+        Cache["Cache<br/><i>Redis</i>"]
+    end
+
+    %% Connections
+    Internet --> DNS --> CDN
+    Internet --> DNS --> LB
+    LB --> App1
+    LB --> App2
+    App1 --> Primary
+    App1 --> Cache
+    App2 --> Replica
+    App2 --> Cache
+    Primary -.->|"replication"| Replica
+
+    %% Styling
+    classDef internet fill:#e74c3c,stroke:#c0392b,color:#fff
+    classDef edge_style fill:#f39c12,stroke:#d68910,color:#fff
+    classDef app_style fill:#1168bd,stroke:#0b4884,color:#fff
+    classDef data_style fill:#438dd5,stroke:#2e6295,color:#fff
+
+    class Internet internet
+    class CDN,DNS edge_style
+    class LB,App1,App2 app_style
+    class Primary,Replica,Cache data_style

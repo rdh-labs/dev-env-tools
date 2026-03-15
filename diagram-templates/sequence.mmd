@@ -1,0 +1,28 @@
+%% Sequence Diagram Template
+%% Usage: Copy this template and replace participants/messages with your flow.
+%% Rendered natively by GitHub in markdown code blocks: ```mermaid ... ```
+
+sequenceDiagram
+    participant Client
+    participant API as API Server
+    participant Auth as Auth Service
+    participant DB as Database
+
+    %% Authentication flow
+    Client->>+API: POST /action (with token)
+    API->>+Auth: Validate token
+    Auth-->>-API: Token valid (user context)
+
+    %% Business logic
+    API->>+DB: Query data
+    DB-->>-API: Result set
+
+    %% Response
+    API-->>-Client: 200 OK (response payload)
+
+    %% Error path (uncomment to use)
+    %% Note over Client,DB: Error scenario
+    %% Client->>+API: POST /action (expired token)
+    %% API->>+Auth: Validate token
+    %% Auth-->>-API: Token expired
+    %% API-->>-Client: 401 Unauthorized

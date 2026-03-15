@@ -1,0 +1,45 @@
+%% Component / Dependency Diagram Template
+%% Usage: Map components and their dependencies within a system.
+%% Rendered natively by GitHub in markdown code blocks: ```mermaid ... ```
+
+graph LR
+    %% Entry points
+    CLI["CLI<br/><i>User interface</i>"]
+    WebUI["Web UI<br/><i>Browser interface</i>"]
+
+    %% Core components
+    subgraph core ["Core Services"]
+        Router["Router<br/><i>Request dispatch</i>"]
+        Handler["Handler<br/><i>Business logic</i>"]
+        Validator["Validator<br/><i>Input validation</i>"]
+    end
+
+    %% Infrastructure
+    subgraph infra ["Infrastructure"]
+        Cache["Cache<br/><i>Redis / in-memory</i>"]
+        DB[("Database<br/><i>PostgreSQL</i>")]
+        Queue["Queue<br/><i>Message broker</i>"]
+    end
+
+    %% External
+    ExtSvc["External Service<br/><i>Third-party API</i>"]
+
+    %% Connections
+    CLI --> Router
+    WebUI --> Router
+    Router --> Validator --> Handler
+    Handler --> Cache
+    Handler --> DB
+    Handler --> Queue
+    Handler --> ExtSvc
+
+    %% Styling
+    classDef entry fill:#2d8659,stroke:#1e5c3d,color:#fff
+    classDef core_style fill:#1168bd,stroke:#0b4884,color:#fff
+    classDef infra_style fill:#438dd5,stroke:#2e6295,color:#fff
+    classDef external fill:#999,stroke:#666,color:#fff
+
+    class CLI,WebUI entry
+    class Router,Handler,Validator core_style
+    class Cache,DB,Queue infra_style
+    class ExtSvc external

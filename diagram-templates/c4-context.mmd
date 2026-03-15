@@ -1,0 +1,33 @@
+%% C4 Context Diagram Template
+%% Usage: Copy this template and replace placeholders with your system's components.
+%% Rendered natively by GitHub in markdown code blocks: ```mermaid ... ```
+%% Reference: https://c4model.com/
+
+graph TB
+    %% External actors
+    User["<b>User</b><br/>Description of user role"]
+
+    %% System boundary
+    subgraph boundary ["System Name"]
+        System["<b>System Name</b><br/>Brief description of<br/>what the system does"]
+    end
+
+    %% External systems
+    ExtAPI["<b>External API</b><br/>Third-party service<br/>the system depends on"]
+    Database[("<b>Database</b><br/>Primary data store")]
+
+    %% Relationships
+    User -->|"Uses via browser/CLI"| System
+    System -->|"Reads/writes data"| Database
+    System -->|"Calls API"| ExtAPI
+
+    %% Styling
+    classDef person fill:#08427b,stroke:#052e56,color:#fff
+    classDef system fill:#1168bd,stroke:#0b4884,color:#fff
+    classDef external fill:#999,stroke:#666,color:#fff
+    classDef db fill:#438dd5,stroke:#2e6295,color:#fff
+
+    class User person
+    class System system
+    class ExtAPI external
+    class Database db
