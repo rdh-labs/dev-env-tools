@@ -76,16 +76,26 @@ parse_prisma() {
     awk '
     /^[[:space:]]*model[[:space:]]+/ {
         model = $2
-        print "    " model " {"
+        mapped_name = model
         in_model = 1
+        field_count = 0
+        rel_count = 0
         next
     }
     in_model && /^[[:space:]]*\}/ {
+        # Finding #10: flush buffered model output with mapped name (@@map support)
+        print "    " mapped_name " {"
+        for (i = 1; i <= field_count; i++) {
+            print fields[i]
+        }
         print "    }"
-        # Print buffered relationships after closing brace
+        # Relationships: apply mapped_name as source (Judge 2 amendment)
         for (i = 1; i <= rel_count; i++) {
+            # Replace original model name with mapped_name in relationship source
+            gsub("^    " model " ", "    " mapped_name " ", rels[i])
             print rels[i]
         }
+        field_count = 0
         rel_count = 0
         in_model = 0
         next
@@ -93,6 +103,13 @@ parse_prisma() {
     in_model {
         # Remove comments
         sub(/\/\/.*/, "")
+        # Finding #10: detect @@map("tablename") directive
+        if (match($0, /@@map\("([^"]+)"/, arr)) {
+            mapped_name = arr[1]
+            next
+        }
+        # Skip @@index and other @@ directives
+        if ($0 ~ /^[[:space:]]*@@/) next
         # Match field lines: name Type ...
         if (match($0, /^[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]+([A-Za-z]+)/, arr)) {
             fname = arr[1]
@@ -111,10 +128,11 @@ parse_prisma() {
                 if ($0 ~ /@id/) constraint = "PK"
                 else if ($0 ~ /@unique/) constraint = "UK"
 
+                field_count++
                 if (constraint != "")
-                    printf "        %s %s %s\n", mtype, fname, constraint
+                    fields[field_count] = sprintf("        %s %s %s", mtype, fname, constraint)
                 else
-                    printf "        %s %s\n", mtype, fname
+                    fields[field_count] = sprintf("        %s %s", mtype, fname)
             } else if (ftype ~ /^[A-Z]/ && $0 ~ /@relation/) {
                 # Buffer relationship for output after entity block
                 rel_count++
