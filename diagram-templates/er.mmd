@@ -1,0 +1,55 @@
+%% Entity-Relationship Diagram Template
+%% Usage: Copy this template and replace placeholders with your data model.
+%% Rendered natively by GitHub in markdown code blocks: ```mermaid ... ```
+%% NOTE: erDiagram is NOT supported by Figma MCP generate_diagram — docs only.
+%% Reference: https://mermaid.js.org/syntax/entityRelationshipDiagram.html
+
+erDiagram
+    %% Core entities — replace with your domain models
+    USER {
+        uuid id PK "Primary key"
+        string email UK "Unique, indexed"
+        string name "Display name"
+        timestamp created_at "Auto-set on insert"
+        timestamp updated_at "Auto-set on update"
+    }
+
+    ORGANIZATION {
+        uuid id PK
+        string name "Organization display name"
+        string slug UK "URL-safe identifier"
+        enum plan "free | pro | enterprise"
+    }
+
+    PROJECT {
+        uuid id PK
+        string title "Project name"
+        text description "Optional long description"
+        enum status "draft | active | archived"
+        uuid org_id FK "References ORGANIZATION"
+        uuid owner_id FK "References USER"
+    }
+
+    TASK {
+        uuid id PK
+        string title
+        text description
+        enum priority "low | medium | high | critical"
+        enum status "todo | in_progress | review | done"
+        date due_date "Optional deadline"
+        uuid project_id FK "References PROJECT"
+        uuid assignee_id FK "References USER"
+    }
+
+    %% Relationships — cardinality notation:
+    %% ||--o{ = one to zero-or-many
+    %% ||--|| = one to exactly one
+    %% }o--o{ = zero-or-many to zero-or-many
+    ORGANIZATION ||--o{ USER : "has members"
+    ORGANIZATION ||--o{ PROJECT : "owns"
+    USER ||--o{ PROJECT : "owns"
+    PROJECT ||--o{ TASK : "contains"
+    USER ||--o{ TASK : "assigned to"
+
+    %% Styling note: Mermaid ER diagrams auto-layout.
+    %% Keep entities to ≤8 per diagram; split into sub-diagrams for larger schemas.

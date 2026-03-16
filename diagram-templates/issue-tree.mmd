@@ -1,0 +1,41 @@
+%% MECE Issue Tree / Mindmap Template
+%% Usage: Decompose complex problems into Mutually Exclusive, Collectively Exhaustive branches.
+%% Useful for: consulting proposals, root cause analysis, strategic planning.
+%% Rendered natively by GitHub in markdown code blocks: ```mermaid ... ```
+%% Source: Gemini Q1 2026 Visual Retrospective - Management Consultant Workflows
+%% Note: mindmap is supported in Mermaid v10+. Use flowchart TD for older versions.
+
+mindmap
+  root["Root Problem Statement"]
+    Branch_A["Branch A: Category 1"]
+      A1["Sub-issue A1"]
+        A1a["Evidence / data point"]
+        A1b["Evidence / data point"]
+      A2["Sub-issue A2"]
+        A2a["Evidence / data point"]
+    Branch_B["Branch B: Category 2"]
+      B1["Sub-issue B1"]
+        B1a["Evidence / data point"]
+        B1b["Evidence / data point"]
+      B2["Sub-issue B2"]
+        B2a["Evidence / data point"]
+    Branch_C["Branch C: Category 3"]
+      C1["Sub-issue C1"]
+        C1a["Evidence / data point"]
+      C2["Sub-issue C2"]
+        C2a["Evidence / data point"]
+        C2b["Evidence / data point"]
+
+%% MECE Rules:
+%% - Mutually Exclusive: No overlap between branches (A, B, C cover distinct categories)
+%% - Collectively Exhaustive: Together, branches cover 100% of the problem space
+%% - Each leaf node should be backed by data or a specific observation
+%% - Max depth: 4 levels (root -> branch -> sub-issue -> evidence)
+%% - Max branches at any level: 5 (cognitive load limit)
+%%
+%% Alternative: Use flowchart TD for more styling control:
+%% flowchart TD
+%%     Root["Problem"] --> A["Category 1"]
+%%     Root --> B["Category 2"]
+%%     A --> A1["Sub-issue"]
+%%     A --> A2["Sub-issue"]

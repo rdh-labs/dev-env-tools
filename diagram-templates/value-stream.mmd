@@ -1,0 +1,54 @@
+%% Value Stream Map Template
+%% Usage: Map the flow of value from trigger to customer outcome.
+%% Useful for: consulting engagements, process optimization, lean analysis.
+%% Rendered natively by GitHub in markdown code blocks: ```mermaid ... ```
+%% Adapted from: Gemini Q1 2026 Visual Retrospective — Workflow D
+
+flowchart LR
+    %% Trigger / Input
+    Trigger["<b>Trigger</b><br/>Customer request /<br/>market signal"]
+
+    %% Value-adding steps
+    subgraph value ["Value-Adding Steps"]
+        direction LR
+        Step1["<b>Step 1: Intake</b><br/>Lead time: 1d<br/>Process time: 2h"]
+        Step2["<b>Step 2: Analysis</b><br/>Lead time: 3d<br/>Process time: 4h"]
+        Step3["<b>Step 3: Design</b><br/>Lead time: 2d<br/>Process time: 6h"]
+        Step4["<b>Step 4: Build</b><br/>Lead time: 5d<br/>Process time: 16h"]
+        Step5["<b>Step 5: Deliver</b><br/>Lead time: 1d<br/>Process time: 2h"]
+    end
+
+    %% Wait / waste indicators (non-value-adding)
+    Wait1(["Wait: 1d<br/>Approval queue"])
+    Wait2(["Wait: 2d<br/>Resource allocation"])
+    Wait3(["Wait: 1d<br/>QA backlog"])
+
+    %% Output
+    Customer["<b>Customer</b><br/>Value delivered"]
+
+    %% Flow
+    Trigger --> Step1
+    Step1 --> Wait1
+    Wait1 --> Step2
+    Step2 --> Step3
+    Step3 --> Wait2
+    Wait2 --> Step4
+    Step4 --> Wait3
+    Wait3 --> Step5
+    Step5 --> Customer
+
+    %% Metrics summary (add as note)
+    Metrics["<b>Metrics</b><br/>Total lead: 15d<br/>Total process: 30h<br/>Efficiency: 25%"]
+
+    %% Styling
+    classDef trigger fill:#e74c3c,stroke:#c0392b,color:#fff
+    classDef value_step fill:#1168bd,stroke:#0b4884,color:#fff
+    classDef wait fill:#f39c12,stroke:#d68910,color:#fff
+    classDef customer fill:#2d8659,stroke:#1e5c3d,color:#fff
+    classDef metrics fill:#34495e,stroke:#2c3e50,color:#fff
+
+    class Trigger trigger
+    class Step1,Step2,Step3,Step4,Step5 value_step
+    class Wait1,Wait2,Wait3 wait
+    class Customer customer
+    class Metrics metrics
