@@ -178,12 +178,19 @@ parse_sql() {
             else if ($0 ~ /UNIQUE/) constraint = "UK"
 
             # Detect inline FK - buffer relationship for after entity block
-            if (match($0, /REFERENCES[[:space:]]+(["`]?[A-Za-z_][A-Za-z0-9_.]*["`]?)/, ref)) {
+            # Finding #5: capture everything up to ( to handle schema-qualified + all quoting styles
+            if (match($0, /REFERENCES[[:space:]]+([^(]+)\(/, ref)) {
                 fk_target = ref[1]
-                gsub(/["`\[\]]/, "", fk_target)
-                # Extract terminal name after schema prefix
+                # Strip trailing whitespace
+                gsub(/[[:space:]]+$/, "", fk_target)
+                # Strip all quoting chars: double-quote, backtick, brackets
+                gsub(/"/, "", fk_target); gsub(/`/, "", fk_target)
+                gsub(/\[/, "", fk_target); gsub(/\]/, "", fk_target)
+                # Extract terminal name after schema prefix (e.g. public.orders -> orders)
                 n2 = split(fk_target, fk_parts, ".")
                 fk_target = fk_parts[n2]
+                # Strip any remaining whitespace
+                gsub(/[[:space:]]/, "", fk_target)
                 sql_rel_count++
                 sql_rels[sql_rel_count] = sprintf("    %s }o--|| %s : \"references\"", table, fk_target)
                 constraint = "FK"
