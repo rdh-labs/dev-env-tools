@@ -1,0 +1,17 @@
+// enums-composites.prisma: Tests Phase 6 (enum blocks, composite type blocks)
+enum Status {
+  ACTIVE
+  INACTIVE
+  PENDING
+}
+
+type ContactInfo {
+  email String
+  phone String
+}
+
+model Account {
+  id     Int    @id
+  name   String
+  status Status
+}

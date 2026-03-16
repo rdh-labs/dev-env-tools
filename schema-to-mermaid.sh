@@ -103,7 +103,10 @@ parse_prisma() {
                 if ($0 ~ /@id/) constraint = "PK"
                 else if ($0 ~ /@unique/) constraint = "UK"
 
-                printf "        %s %s %s\n", mtype, fname, constraint
+                if (constraint != "")
+                    printf "        %s %s %s\n", mtype, fname, constraint
+                else
+                    printf "        %s %s\n", mtype, fname
             } else if (ftype ~ /^[A-Z]/ && $0 ~ /@relation/) {
                 # Buffer relationship for output after entity block
                 rel_count++
@@ -151,17 +154,20 @@ parse_sql() {
         # Remove comments
         sub(/--.*/, "")
         # Skip pure constraint lines
-        if ($1 ~ /^(CONSTRAINT|PRIMARY|FOREIGN|UNIQUE|CHECK|INDEX)$/i) next
+        if ($1 ~ /^(CONSTRAINT|PRIMARY|FOREIGN|UNIQUE|CHECK|INDEX)$/) next
         # Match column: name type ...
         if (NF >= 2 && $1 ~ /^[a-zA-Z_]/) {
             col = $1
             gsub(/["`\[\]]/, "", col)
             ctype = tolower($2)
-            gsub(/["`\[\](,]/, "", ctype)
+            gsub(/"/, "", ctype); gsub(/`/, "", ctype)
+            gsub(/\[/, "", ctype); gsub(/\]/, "", ctype)
+            gsub(/\(/, "", ctype); gsub(/\)/, "", ctype)
+            gsub(/,/, "", ctype)
 
             constraint = ""
-            if ($0 ~ /PRIMARY[[:space:]]+KEY/i) constraint = "PK"
-            else if ($0 ~ /UNIQUE/i) constraint = "UK"
+            if ($0 ~ /PRIMARY[[:space:]]+KEY/) constraint = "PK"
+            else if ($0 ~ /UNIQUE/) constraint = "UK"
 
             # Detect inline FK - buffer relationship for after entity block
             if (match($0, /REFERENCES[[:space:]]+(["`]?[A-Za-z_][A-Za-z0-9_.]*["`]?)/, ref)) {
@@ -175,7 +181,10 @@ parse_sql() {
                 constraint = "FK"
             }
 
-            printf "        %s %s %s\n", ctype, col, constraint
+            if (constraint != "")
+                printf "        %s %s %s\n", ctype, col, constraint
+            else
+                printf "        %s %s\n", ctype, col
         }
     }
     ' < "$file" >> "$OUTPUT"

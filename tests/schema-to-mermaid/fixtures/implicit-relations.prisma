@@ -1,0 +1,25 @@
+// implicit-relations.prisma: Tests Phase 5 (implicit relations, enum exclusion, deduplication)
+model User {
+  id       Int      @id
+  email    String   @unique
+  posts    Post[]
+  profile  Profile?
+  role     Role
+}
+
+model Post {
+  id       Int    @id
+  title    String
+  author   User
+}
+
+model Profile {
+  id     Int    @id
+  bio    String
+  user   User
+}
+
+enum Role {
+  USER
+  ADMIN
+}

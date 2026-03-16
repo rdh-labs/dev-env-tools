@@ -1,0 +1,22 @@
+erDiagram
+
+    %% Source: implicit-relations.prisma
+    User {
+        int id PK
+        string email UK
+    }
+    User }o--|| Post : "references"
+    User |o--|| Profile : "references"
+    Post {
+        int id PK
+        string title
+    }
+    Profile {
+        int id PK
+        string bio
+    }
+    Role {
+        string USER
+        string ADMIN
+    }
+

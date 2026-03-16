@@ -1,0 +1,15 @@
+erDiagram
+
+    %% Source: quoted-identifiers.sql
+    source_table {
+        integer id PK
+        integer double_quoted_ref FK
+        integer backtick_ref FK
+        integer bracket_ref FK
+        integer simple_ref FK
+    }
+    source_table }o--|| orders : "references"
+    source_table }o--|| products : "references"
+    source_table }o--|| users : "references"
+    source_table }o--|| invoices : "references"
+

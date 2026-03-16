@@ -1,0 +1,15 @@
+erDiagram
+
+    %% Source: mapped-names.prisma
+    users {
+        int id PK
+        string email UK
+        string name
+    }
+    posts {
+        int id PK
+        string title
+        int authorId
+    }
+    posts }o--|| User : "references"
+

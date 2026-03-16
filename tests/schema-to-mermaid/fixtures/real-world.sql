@@ -1,0 +1,1 @@
+/home/ichardart/dev/projects/true-valence-mapper/versions/claude/supabase-schema.sql

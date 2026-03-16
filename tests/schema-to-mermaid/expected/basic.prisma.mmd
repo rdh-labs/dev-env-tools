@@ -1,0 +1,16 @@
+erDiagram
+
+    %% Source: basic.prisma
+    User {
+        int id PK
+        string email UK
+        string name
+    }
+    User }o--|| Post : "references"
+    Post {
+        int id PK
+        string title
+        int authorId
+    }
+    Post }o--|| User : "references"
+

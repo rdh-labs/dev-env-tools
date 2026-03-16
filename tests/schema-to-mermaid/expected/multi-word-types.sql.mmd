@@ -1,0 +1,13 @@
+erDiagram
+
+    %% Source: multi-word-types.sql
+    events {
+        integer id PK
+        timestamp_with_time_zone start_time
+        timestamp_with_time_zone end_time
+        double_precision score
+        character_varying255 description
+        int count
+        varchar50 label
+    }
+

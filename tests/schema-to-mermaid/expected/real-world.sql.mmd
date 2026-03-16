@@ -1,0 +1,17 @@
+erDiagram
+
+    %% Source: real-world.sql
+    trust_maps {
+        uuid id PK
+        uuid device_id
+        varchar255 map_name
+        jsonb relationships
+        jsonb trust_scores
+        varchar12 share_code UK
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz accessed_at
+        varchar10 version
+        boolean is_demo
+    }
+

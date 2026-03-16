@@ -1,0 +1,21 @@
+erDiagram
+
+    %% Source: multi-table-fk.sql
+    customers {
+        integer id PK
+        varchar255 name
+    }
+    orders {
+        integer id PK
+        integer customer_id FK
+        decimal102 total
+    }
+    orders }o--|| customers : "references"
+    items {
+        integer id PK
+        integer order_id FK
+        varchar100 product
+        integer quantity
+    }
+    items }o--|| orders : "references"
+

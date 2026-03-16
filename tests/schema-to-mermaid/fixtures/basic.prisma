@@ -1,0 +1,14 @@
+// basic.prisma: Tests Phase 1 (Prisma parsing, explicit @relation, @id, @unique)
+model User {
+  id    Int     @id
+  email String  @unique
+  name  String?
+  posts Post[]  @relation("UserPosts")
+}
+
+model Post {
+  id       Int    @id
+  title    String
+  authorId Int
+  author   User   @relation("UserPosts", fields: [authorId], references: [id])
+}

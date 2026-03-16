@@ -1,0 +1,16 @@
+// mapped-names.prisma: Tests Phase 7 (@@map renames entity, @@index ignored)
+model User {
+  id    Int    @id
+  email String @unique
+  name  String
+  @@map("users")
+  @@index([email])
+}
+
+model Post {
+  id       Int    @id
+  title    String
+  authorId Int
+  author   User   @relation(fields: [authorId], references: [id])
+  @@map("posts")
+}
