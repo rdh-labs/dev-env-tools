@@ -73,7 +73,65 @@ fi
 # Parse Prisma models using awk (more robust than bash regex)
 parse_prisma() {
     local file="$1"
-    awk '
+    # Finding #8: First pass — collect enum and type block names for exclusion
+    # This prevents treating enum fields (e.g. role Role) as implicit relations
+    local enum_names
+    enum_names="$(awk '/^[[:space:]]*(enum|type)[[:space:]]+[A-Za-z]/{print $2}' < "$file" | tr '\n' '|' | sed 's/|$//')"
+    local enum_pat=""
+    if [[ -n "$enum_names" ]]; then
+        enum_pat="^($enum_names)$"
+    fi
+
+    awk -v enum_pat="$enum_pat" '
+    # Phase 6: enum blocks — render members as "string MEMBER_NAME"
+    !in_model && /^[[:space:]]*enum[[:space:]]+[A-Za-z]/ {
+        enum_block_name = $2
+        in_enum = 1
+        print "    " enum_block_name " {"
+        next
+    }
+    in_enum && /^[[:space:]]*\}/ {
+        print "    }"
+        in_enum = 0
+        next
+    }
+    in_enum {
+        sub(/\/\/.*/, "")
+        if (match($0, /^[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)/, arr)) {
+            print "        string " arr[1]
+        }
+        next
+    }
+    # Phase 6: type blocks — parse scalar fields, no relation detection
+    !in_model && /^[[:space:]]*type[[:space:]]+[A-Za-z]/ {
+        type_block_name = $2
+        in_type = 1
+        type_field_count = 0
+        next
+    }
+    in_type && /^[[:space:]]*\}/ {
+        print "    " type_block_name " {"
+        for (i = 1; i <= type_field_count; i++) { print type_fields[i] }
+        print "    }"
+        type_field_count = 0
+        in_type = 0
+        next
+    }
+    in_type {
+        sub(/\/\/.*/, "")
+        if (match($0, /^[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]+([A-Za-z]+)/, arr)) {
+            tfname = arr[1]; tftype = arr[2]
+            tmtype = "string"
+            if (tftype ~ /^(Int|BigInt)$/) tmtype = "int"
+            else if (tftype ~ /^(Float|Decimal)$/) tmtype = "float"
+            else if (tftype == "Boolean") tmtype = "boolean"
+            else if (tftype == "DateTime") tmtype = "timestamp"
+            else if (tftype == "Json") tmtype = "json"
+            type_field_count++
+            type_fields[type_field_count] = sprintf("        %s %s", tmtype, tfname)
+        }
+        next
+    }
     /^[[:space:]]*model[[:space:]]+/ {
         model = $2
         mapped_name = model
@@ -91,7 +149,6 @@ parse_prisma() {
         print "    }"
         # Relationships: apply mapped_name as source (Judge 2 amendment)
         for (i = 1; i <= rel_count; i++) {
-            # Replace original model name with mapped_name in relationship source
             gsub("^    " model " ", "    " mapped_name " ", rels[i])
             print rels[i]
         }
@@ -114,9 +171,8 @@ parse_prisma() {
         if (match($0, /^[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]+([A-Za-z]+)/, arr)) {
             fname = arr[1]
             ftype = arr[2]
-            # Skip relation fields (capitalized, not a built-in type)
             if (ftype ~ /^(String|Int|BigInt|Float|Decimal|Boolean|DateTime|Json|Bytes)$/) {
-                # Map to generic types
+                # Scalar type: map to generic and buffer as field
                 mtype = "string"
                 if (ftype ~ /^(Int|BigInt)$/) mtype = "int"
                 else if (ftype ~ /^(Float|Decimal)$/) mtype = "float"
@@ -133,102 +189,127 @@ parse_prisma() {
                     fields[field_count] = sprintf("        %s %s %s", mtype, fname, constraint)
                 else
                     fields[field_count] = sprintf("        %s %s", mtype, fname)
-            } else if (ftype ~ /^[A-Z]/ && $0 ~ /@relation/) {
-                # Buffer relationship for output after entity block
-                rel_count++
-                rels[rel_count] = sprintf("    %s }o--|| %s : \"references\"", model, ftype)
+            } else if (ftype ~ /^[A-Z]/) {
+                # Non-scalar capitalized type: potential relation
+                # Finding #8: exclude enum/type names from relation detection
+                if (enum_pat != "" && ftype ~ enum_pat) next
+
+                if ($0 ~ /@relation/) {
+                    # Explicit @relation: always emit with }o--|| (no dedup — owner side only)
+                    rel_count++
+                    rels[rel_count] = sprintf("    %s }o--|| %s : \"references\"", model, ftype)
+                } else {
+                    # Implicit relation: infer cardinality + deduplicate bidirectional pairs
+                    # Type[] -> many (}o--||), Type? -> optional (|o--||), Type -> one (||--||)
+                    cardinality = "||--||"
+                    if ($0 ~ ftype "\\[\\]") cardinality = "}o--||"
+                    else if ($0 ~ ftype "\\?")  cardinality = "|o--||"
+
+                    pair_key = model ":" ftype
+                    rev_key  = ftype ":" model
+                    if (!(pair_key in seen_pairs) && !(rev_key in seen_pairs)) {
+                        seen_pairs[pair_key] = 1
+                        rel_count++
+                        rels[rel_count] = sprintf("    %s %s %s : \"references\"", model, cardinality, ftype)
+                    }
+                }
             }
         }
     }
     ' < "$file" >> "$OUTPUT"
 }
 
-# Parse SQL CREATE TABLE using awk
+# Parse SQL CREATE TABLE using awk (Phase 8: multi-line column accumulation)
 parse_sql() {
     local file="$1"
     awk '
-    BEGIN { IGNORECASE = 1; sql_rel_count = 0 }
+    # emit_col: process one complete (possibly multi-line) column definition
+    function emit_col(ln,    af, nf, col, ctype, fi, w, constraint, refm, fk_target, np, fp) {
+        gsub(/,[[:space:]]*$/, "", ln)   # strip trailing comma
+        nf = split(ln, af)               # split by whitespace (strips leading/trailing)
+        if (nf < 2) return
+        if (af[1] !~ /^[a-zA-Z_]/) return
+        if (toupper(af[1]) ~ /^(CONSTRAINT|PRIMARY|FOREIGN|UNIQUE|CHECK|INDEX)$/) return
+        col = af[1]
+        gsub(/["`\[\]]/, "", col)
+        # Multi-word type: scan until constraint keyword (Finding #7)
+        ctype = af[2]
+        for (fi = 3; fi <= nf; fi++) {
+            w = toupper(af[fi])
+            gsub(/[^A-Z]/, "", w)
+            if (w ~ /^(NOT|NULL|DEFAULT|PRIMARY|UNIQUE|REFERENCES|CHECK|ON|COLLATE|COMMENT|CONSTRAINT)$/) break
+            ctype = ctype "_" af[fi]
+        }
+        ctype = tolower(ctype)
+        gsub(/"/, "", ctype); gsub(/`/, "", ctype)
+        gsub(/\[/, "", ctype); gsub(/\]/, "", ctype)
+        gsub(/\(/, "", ctype); gsub(/\)/, "", ctype)
+        gsub(/,/, "", ctype); gsub(/_+$/, "", ctype)
+        constraint = ""
+        if (ln ~ /PRIMARY[[:space:]]+KEY/) constraint = "PK"
+        else if (ln ~ /UNIQUE/) constraint = "UK"
+        # Finding #5: schema-qualified REFERENCES with all quoting styles
+        if (match(ln, /REFERENCES[[:space:]]+([^(]+)\(/, refm)) {
+            fk_target = refm[1]
+            gsub(/[[:space:]]+$/, "", fk_target)
+            gsub(/"/, "", fk_target); gsub(/`/, "", fk_target)
+            gsub(/\[/, "", fk_target); gsub(/\]/, "", fk_target)
+            np = split(fk_target, fp, ".")
+            fk_target = fp[np]
+            gsub(/[[:space:]]/, "", fk_target)
+            sql_rel_count++
+            sql_rels[sql_rel_count] = sprintf("    %s }o--|| %s : \"references\"", table, fk_target)
+            constraint = "FK"
+        }
+        if (constraint != "")
+            printf "        %s %s %s\n", ctype, col, constraint
+        else
+            printf "        %s %s\n", ctype, col
+    }
+    BEGIN { IGNORECASE = 1; sql_rel_count = 0; accum = ""; depth = 0; in_table = 0 }
     /CREATE[[:space:]]+TABLE/ {
-        # Extract table name - handle IF NOT EXISTS
+        # Extract table name - handle IF NOT EXISTS and inline (
         line = $0
         sub(/.*CREATE[[:space:]]+TABLE[[:space:]]+/, "", line)
         sub(/IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+/, "", line)
         sub(/[[:space:]]*\(.*/, "", line)
-        gsub(/["`\[\]]/, "", line)  # Remove quoting
-        # Remove schema prefix
+        gsub(/["`\[\]]/, "", line)
         n = split(line, parts, ".")
         table = parts[n]
         gsub(/[[:space:]]/, "", table)
         if (table != "") {
             print "    " table " {"
-            in_table = 1
-            sql_rel_count = 0
+            in_table = 1; sql_rel_count = 0; accum = ""; depth = 0
         }
         next
     }
-    in_table && /^[[:space:]]*\)/ {
+    # Opening paren on its own line after CREATE TABLE table_name
+    in_table && /^[[:space:]]*\([[:space:]]*$/ { next }
+    # Closing paren = end of CREATE TABLE body
+    in_table && /^[[:space:]]*\)/ && depth == 0 {
+        if (accum != "") { emit_col(accum); accum = "" }
         print "    }"
-        # Print buffered relationships after closing brace
-        for (i = 1; i <= sql_rel_count; i++) {
-            print sql_rels[i]
-        }
-        sql_rel_count = 0
-        in_table = 0
+        for (i = 1; i <= sql_rel_count; i++) { print sql_rels[i] }
+        sql_rel_count = 0; in_table = 0
         next
     }
     in_table {
-        # Remove comments
         sub(/--.*/, "")
-        # Skip pure constraint lines
-        if ($1 ~ /^(CONSTRAINT|PRIMARY|FOREIGN|UNIQUE|CHECK|INDEX)$/) next
-        # Match column: name type ...
-        if (NF >= 2 && $1 ~ /^[a-zA-Z_]/) {
-            col = $1
-            gsub(/["`\[\]]/, "", col)
-            # Finding #7: scan fields $3, $4... to capture multi-word types
-            # (e.g. TIMESTAMP WITH TIME ZONE, DOUBLE PRECISION)
-            # Stop at SQL constraint keywords
-            ctype = $2
-            for (fi = 3; fi <= NF; fi++) {
-                w = toupper($fi)
-                gsub(/[^A-Z]/, "", w)
-                if (w ~ /^(NOT|NULL|DEFAULT|PRIMARY|UNIQUE|REFERENCES|CHECK|ON|COLLATE|COMMENT|CONSTRAINT)$/) break
-                ctype = ctype "_" $fi
-            }
-            ctype = tolower(ctype)
-            gsub(/"/, "", ctype); gsub(/`/, "", ctype)
-            gsub(/\[/, "", ctype); gsub(/\]/, "", ctype)
-            gsub(/\(/, "", ctype); gsub(/\)/, "", ctype)
-            gsub(/,/, "", ctype); gsub(/_+$/, "", ctype)
-
-            constraint = ""
-            if ($0 ~ /PRIMARY[[:space:]]+KEY/) constraint = "PK"
-            else if ($0 ~ /UNIQUE/) constraint = "UK"
-
-            # Detect inline FK - buffer relationship for after entity block
-            # Finding #5: capture everything up to ( to handle schema-qualified + all quoting styles
-            if (match($0, /REFERENCES[[:space:]]+([^(]+)\(/, ref)) {
-                fk_target = ref[1]
-                # Strip trailing whitespace
-                gsub(/[[:space:]]+$/, "", fk_target)
-                # Strip all quoting chars: double-quote, backtick, brackets
-                gsub(/"/, "", fk_target); gsub(/`/, "", fk_target)
-                gsub(/\[/, "", fk_target); gsub(/\]/, "", fk_target)
-                # Extract terminal name after schema prefix (e.g. public.orders -> orders)
-                n2 = split(fk_target, fk_parts, ".")
-                fk_target = fk_parts[n2]
-                # Strip any remaining whitespace
-                gsub(/[[:space:]]/, "", fk_target)
-                sql_rel_count++
-                sql_rels[sql_rel_count] = sprintf("    %s }o--|| %s : \"references\"", table, fk_target)
-                constraint = "FK"
-            }
-
-            if (constraint != "")
-                printf "        %s %s %s\n", ctype, col, constraint
-            else
-                printf "        %s %s\n", ctype, col
+        if ($0 ~ /^[[:space:]]*$/) next
+        # Track paren depth for this line (Finding #8: multi-line col boundary detection)
+        tmp = $0; open_c = 0; close_c = 0
+        gsub(/[^(]/, "", tmp); open_c = length(tmp)
+        tmp = $0; gsub(/[^)]/, "", tmp); close_c = length(tmp)
+        depth += open_c - close_c
+        if (depth < 0) depth = 0
+        # Accumulate line
+        accum = (accum == "") ? $0 : (accum " " $0)
+        # Emit when trailing comma seen at depth 0 (column definition complete)
+        trimmed = accum; gsub(/[[:space:]]+$/, "", trimmed)
+        if (depth == 0 && substr(trimmed, length(trimmed), 1) == ",") {
+            emit_col(accum); accum = ""
         }
+        next
     }
     ' < "$file" >> "$OUTPUT"
 }
