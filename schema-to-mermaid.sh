@@ -20,8 +20,8 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --input)  INPUT="$2"; shift 2 ;;
-        --output) OUTPUT="$2"; shift 2 ;;
+        --input)  [[ $# -ge 2 ]] || usage; INPUT="$2"; shift 2 ;;
+        --output) [[ $# -ge 2 ]] || usage; OUTPUT="$2"; shift 2 ;;
         *)        usage ;;
     esac
 done
@@ -33,6 +33,10 @@ fi
 # Collect schema files
 SCHEMA_FILES=()
 if [[ -f "$INPUT" ]]; then
+    case "$INPUT" in
+        *.prisma|*.sql) ;;
+        *) echo "ERROR: Unsupported file type: $INPUT (expected .prisma or .sql)" >&2; exit 1 ;;
+    esac
     SCHEMA_FILES+=("$INPUT")
 elif [[ -d "$INPUT" ]]; then
     while IFS= read -r -d '' f; do
@@ -107,18 +111,19 @@ parse_prisma() {
             }
         }
     }
-    ' "$file" >> "$OUTPUT"
+    ' < "$file" >> "$OUTPUT"
 }
 
 # Parse SQL CREATE TABLE using awk
 parse_sql() {
     local file="$1"
     awk '
-    BEGIN { IGNORECASE = 1 }
+    BEGIN { IGNORECASE = 1; sql_rel_count = 0 }
     /CREATE[[:space:]]+TABLE/ {
-        # Extract table name
+        # Extract table name - handle IF NOT EXISTS
         line = $0
         sub(/.*CREATE[[:space:]]+TABLE[[:space:]]+/, "", line)
+        sub(/IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+/, "", line)
         sub(/[[:space:]]*\(.*/, "", line)
         gsub(/["`\[\]]/, "", line)  # Remove quoting
         # Remove schema prefix
@@ -128,11 +133,17 @@ parse_sql() {
         if (table != "") {
             print "    " table " {"
             in_table = 1
+            sql_rel_count = 0
         }
         next
     }
-    in_table && /^\)/ {
+    in_table && /^[[:space:]]*\)/ {
         print "    }"
+        # Print buffered relationships after closing brace
+        for (i = 1; i <= sql_rel_count; i++) {
+            print sql_rels[i]
+        }
+        sql_rel_count = 0
         in_table = 0
         next
     }
@@ -152,16 +163,22 @@ parse_sql() {
             if ($0 ~ /PRIMARY[[:space:]]+KEY/i) constraint = "PK"
             else if ($0 ~ /UNIQUE/i) constraint = "UK"
 
-            # Detect inline FK
-            if (match($0, /REFERENCES[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)/, ref)) {
-                printf "    %s }o--|| %s : \"references\"\n", table, ref[1]
+            # Detect inline FK - buffer relationship for after entity block
+            if (match($0, /REFERENCES[[:space:]]+(["`]?[A-Za-z_][A-Za-z0-9_.]*["`]?)/, ref)) {
+                fk_target = ref[1]
+                gsub(/["`\[\]]/, "", fk_target)
+                # Extract terminal name after schema prefix
+                n2 = split(fk_target, fk_parts, ".")
+                fk_target = fk_parts[n2]
+                sql_rel_count++
+                sql_rels[sql_rel_count] = sprintf("    %s }o--|| %s : \"references\"", table, fk_target)
                 constraint = "FK"
             }
 
             printf "        %s %s %s\n", ctype, col, constraint
         }
     }
-    ' "$file" >> "$OUTPUT"
+    ' < "$file" >> "$OUTPUT"
 }
 
 # Process each schema file
