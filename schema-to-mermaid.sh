@@ -167,11 +167,21 @@ parse_sql() {
         if (NF >= 2 && $1 ~ /^[a-zA-Z_]/) {
             col = $1
             gsub(/["`\[\]]/, "", col)
-            ctype = tolower($2)
+            # Finding #7: scan fields $3, $4... to capture multi-word types
+            # (e.g. TIMESTAMP WITH TIME ZONE, DOUBLE PRECISION)
+            # Stop at SQL constraint keywords
+            ctype = $2
+            for (fi = 3; fi <= NF; fi++) {
+                w = toupper($fi)
+                gsub(/[^A-Z]/, "", w)
+                if (w ~ /^(NOT|NULL|DEFAULT|PRIMARY|UNIQUE|REFERENCES|CHECK|ON|COLLATE|COMMENT|CONSTRAINT)$/) break
+                ctype = ctype "_" $fi
+            }
+            ctype = tolower(ctype)
             gsub(/"/, "", ctype); gsub(/`/, "", ctype)
             gsub(/\[/, "", ctype); gsub(/\]/, "", ctype)
             gsub(/\(/, "", ctype); gsub(/\)/, "", ctype)
-            gsub(/,/, "", ctype)
+            gsub(/,/, "", ctype); gsub(/_+$/, "", ctype)
 
             constraint = ""
             if ($0 ~ /PRIMARY[[:space:]]+KEY/) constraint = "PK"
