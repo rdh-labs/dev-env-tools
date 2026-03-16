@@ -30,6 +30,14 @@ if [[ -z "$INPUT" || -z "$OUTPUT" ]]; then
     usage
 fi
 
+# Finding #13: Guard against input path == output path (would clobber source)
+if INPUT_REAL="$(realpath -e "$INPUT" 2>/dev/null)" && OUTPUT_REAL="$(realpath -e "$OUTPUT" 2>/dev/null)"; then
+    if [[ "$INPUT_REAL" == "$OUTPUT_REAL" ]]; then
+        echo "ERROR: --input and --output resolve to the same path: $INPUT_REAL" >&2
+        exit 1
+    fi
+fi
+
 # Collect schema files
 SCHEMA_FILES=()
 if [[ -f "$INPUT" ]]; then
@@ -193,7 +201,9 @@ parse_sql() {
 # Process each schema file
 for schema_file in "${SCHEMA_FILES[@]}"; do
     echo "" >> "$OUTPUT"
-    echo "    %% Source: $(basename "$schema_file")" >> "$OUTPUT"
+    # Finding #14: sanitize filename in comment (strip non-printable control chars)
+    safe_name="$(basename "$schema_file" | tr -dc '[:print:]')"
+    echo "    %% Source: $safe_name" >> "$OUTPUT"
 
     case "$schema_file" in
         *.prisma) parse_prisma "$schema_file" ;;
