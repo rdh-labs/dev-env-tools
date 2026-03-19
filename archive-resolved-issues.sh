@@ -4,8 +4,14 @@
 # Archives RESOLVED and ISSUE-R entries from ISSUES-TRACKER.md to
 # archive/governance/ISSUES-TRACKER-archive.md, then commits + pushes.
 #
+# Archival criteria (DEC-246, 2026-03-18):
+#   ARCHIVE: RESOLVED + E2E evidence present (field: "**E2E evidence:**" or "E2E evidence:")
+#   HOLD:    RESOLVED without E2E evidence (flagged in report, not archived)
+#   RETAIN:  OPEN regardless of age
+#   ARCHIVE: ISSUE-R entries (already-resolved format, evidence assumed)
+#
 # Run monthly via cron to keep ISSUES-TRACKER.md under 470KB threshold.
-# See: ISSUE-2060, ISSUE-TRACKER archival 2026-03-09
+# See: ISSUE-2060, DEC-246, ISSUE-TRACKER archival 2026-03-09
 #
 # Usage:
 #   ./archive-resolved-issues.sh [--dry-run]
@@ -58,28 +64,65 @@ for i, m in enumerate(all_matches):
 
     is_resolved = bool(re.search(r'\|\s*(RESOLVED|Resolved|WONTFIX|CLOSED|DECOMMISSION)', heading))
     is_r_entry = bool(re.match(r'^### ISSUE-R', heading))
-    should_archive = is_resolved or is_r_entry
+    block_text = content[start:end]
+
+    # DEC-246: RESOLVED requires E2E evidence to archive. ISSUE-R entries are exempt
+    # (they're the already-archived format; evidence assumed from prior processing).
+    has_e2e_evidence = False
+    if is_resolved:
+        has_e2e_evidence = bool(re.search(
+            r'\*{0,2}E2E evidence\*{0,2}\s*:\s*(?!N/A|none|n/a|\s*$)',
+            block_text, re.IGNORECASE
+        ))
+
+    if is_r_entry:
+        should_archive = True
+        hold_reason = None
+    elif is_resolved and has_e2e_evidence:
+        should_archive = True
+        hold_reason = None
+    elif is_resolved and not has_e2e_evidence:
+        should_archive = False
+        hold_reason = "RESOLVED but no E2E evidence field (DEC-246: requires evidence before archiving)"
+    else:
+        should_archive = False
+        hold_reason = None  # OPEN issue — retain normally
 
     blocks.append({
         'heading': heading.strip(),
         'archive': should_archive,
-        'text': content[start:end]
+        'hold_reason': hold_reason,
+        'text': block_text,
     })
 
 keep_blocks = [b for b in blocks if not b['archive']]
 archive_blocks = [b for b in blocks if b['archive']]
+held_blocks = [b for b in blocks if b['hold_reason']]
+
+if not archive_blocks and not held_blocks:
+    print("No archivable RESOLVED or ISSUE-R entries found — nothing to archive.")
+    sys.exit(0)
+
+if held_blocks:
+    print(f"HELD (DEC-246 — no E2E evidence): {len(held_blocks)} entries")
+    for b in held_blocks:
+        print(f"  HOLD: {b['heading'][:80]}")
+        print(f"        Reason: {b['hold_reason']}")
+    print()
 
 if not archive_blocks:
-    print("No RESOLVED or ISSUE-R entries found — nothing to archive.")
+    print("No entries eligible for archiving (all resolved issues lack E2E evidence).")
+    if not dry_run:
+        print("No files modified — held entries require manual evidence review before archiving.")
     sys.exit(0)
 
 new_size = len(preamble.encode('utf-8')) + sum(len(b['text'].encode('utf-8')) for b in keep_blocks)
 
-print(f"Archiving {len(archive_blocks)} entries (keep {len(keep_blocks)}).")
+print(f"Archiving {len(archive_blocks)} entries (hold {len(held_blocks)}, keep {len(keep_blocks)}).")
 print(f"Projected size: {new_size} bytes (current: {len(content.encode('utf-8'))})")
 
 for b in archive_blocks:
-    print(f"  → {b['heading'][:80]}")
+    print(f"  ARCHIVE: {b['heading'][:80]}")
 
 if dry_run:
     print("[DRY RUN] No files modified.")
