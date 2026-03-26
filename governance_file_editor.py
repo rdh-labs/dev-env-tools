@@ -869,6 +869,108 @@ class GovernanceFileEditor:
         if summary_path.exists():
             self._update_lessons_summary(summary_path, lesson_id, title, today)
 
+    def allocate_and_insert_lesson(
+        self,
+        title: str,
+        context: str,
+        principle: str = "",
+        rule: str = "",
+        applies_to: str = "",
+        related: List[str] = None,
+        source: str = "User capture",
+    ) -> str:
+        """
+        Allocate next L-NNN and append it in a SINGLE flock transaction.
+
+        Fixes TOCTOU vulnerability (ISSUE-2388): the existing pattern of calling
+        get_next_id() (acquires + releases flock) then insert_lesson() (acquires +
+        releases flock) leaves a window where another concurrent session can
+        allocate the same ID. This method holds flock across the entire
+        read-allocate-append sequence.
+
+        Args:
+            title: Short lesson title
+            context: What happened / what was observed
+            principle: The core principle extracted (optional)
+            rule: The concrete rule to follow (optional)
+            applies_to: Where this lesson applies (optional)
+            related: List of related item IDs
+            source: How this was captured
+
+        Returns:
+            Allocated lesson_id string (e.g., "L-291")
+
+        Raises:
+            GovernanceFileError: On file operation failure
+            GovernanceFileNotFoundError: If LESSONS-LOG.md is missing
+        """
+        file_path = self.paths["LESSONS"]
+
+        if not file_path.exists():
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+
+        related_str = ", ".join(related) if related else "None"
+        today = date.today().strftime("%Y-%m-%d")
+
+        try:
+            with open(file_path, "r+", encoding="utf-8") as f:
+                # Acquire exclusive lock — held for entire read-allocate-append sequence
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+
+                    # ── Allocate ID (under lock — no TOCTOU window) ──────────
+                    # Also check archive if it exists
+                    matches = re.findall(r"L-(\d+)", content)
+                    archive_path = self._get_archive_path("LESSONS")
+                    if archive_path and archive_path.exists():
+                        try:
+                            matches.extend(
+                                re.findall(r"L-(\d+)", archive_path.read_text())
+                            )
+                        except (PermissionError, UnicodeDecodeError):
+                            pass
+
+                    if matches:
+                        highest = max(int(n) for n in matches)
+                        lesson_num = highest + 1
+                    else:
+                        lesson_num = 1
+                    lesson_id = f"L-{lesson_num:03d}"
+
+                    # ── Build entry ──────────────────────────────────────────
+                    lines = [f"\n### {lesson_id}: {title}\n", f"\n**Date:** {today}\n"]
+                    lines.append(f"**Context:** {context}\n")
+                    if principle:
+                        lines.append(f"\n**The Principle:** {principle}\n")
+                    if rule:
+                        lines.append(f"\n**The Rule:** {rule}\n")
+                    if applies_to:
+                        lines.append(f"\n**Applies to:** {applies_to}\n")
+                    lines.append(f"\n**Related:** {related_str}\n")
+                    lines.append(f"\n**Source:** {source}\n")
+                    lines.append("\n---\n")
+                    new_lesson = "".join(lines)
+
+                    # ── Append under the held lock ───────────────────────────
+                    f.seek(0, 2)  # Seek to end of file
+                    f.write(new_lesson)
+
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        except FileNotFoundError:
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+        except PermissionError as e:
+            raise GovernanceFileError(f"Permission denied: {e}")
+
+        # Update LESSONS-SUMMARY.yaml outside the lock (non-critical, non-blocking)
+        summary_path = file_path.parent / "LESSONS-SUMMARY.yaml"
+        if summary_path.exists():
+            self._update_lessons_summary(summary_path, lesson_id, title, today)
+
+        return lesson_id
+
     def _update_lessons_summary(
         self, summary_path: Path, lesson_id: str, title: str, date_str: str
     ) -> None:
