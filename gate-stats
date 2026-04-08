@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Evidence Gate v2 — Performance Analysis & Calibration Report.
+
+Reads ~/.claude/logs/evidence-gate.jsonl and outputs actionable metrics
+for monitoring, evaluation, and optimization decisions.
+
+Usage:
+    gate-stats              # Full report
+    gate-stats --json       # Machine-readable output
+    gate-stats --since 7d   # Last 7 days only (Nd or Nh)
+"""
+import json
+import sys
+from collections import Counter
+from datetime import datetime, timedelta
+from pathlib import Path
+
+LOG_FILE = Path.home() / ".claude" / "logs" / "evidence-gate.jsonl"
+
+
+def parse_since(arg: str) -> datetime | None:
+    """Parse '7d' or '24h' into a cutoff datetime."""
+    if not arg:
+        return None
+    try:
+        if arg.endswith("d"):
+            return datetime.now() - timedelta(days=int(arg[:-1]))
+        if arg.endswith("h"):
+            return datetime.now() - timedelta(hours=int(arg[:-1]))
+    except ValueError:
+        pass
+    return None
+
+
+def load_events(since: datetime | None = None) -> list[dict]:
+    if not LOG_FILE.exists():
+        return []
+    events = []
+    for line in LOG_FILE.read_text().splitlines():
+        try:
+            obj = json.loads(line.strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if "outcome" not in obj and "event" not in obj:
+            continue
+        if since:
+            ts = obj.get("timestamp", "")
+            try:
+                if datetime.fromisoformat(ts) < since:
+                    continue
+            except ValueError:
+                continue
+        events.append(obj)
+    return events
+
+
+def report(events: list[dict], as_json: bool = False) -> None:
+    if not events:
+        print("No evidence gate events found." if not as_json else json.dumps({"events": 0}))
+        return
+
+    # Separate dedup events from gate events
+    dedup_events = [e for e in events if e.get("event") == "dedup_skipped"]
+    gate_events = [e for e in events if "outcome" in e]
+
+    outcomes = Counter(e["outcome"] for e in gate_events)
+    total = len(gate_events)
+    passes = outcomes.get("pass", 0)
+    blocks = total - passes
+
+    # v2 calibration metrics
+    v2_events = [e for e in gate_events if "evidence_lines" in e]
+    v2_total = len(v2_events)
+
+    # Layer 4 metrics
+    l4_events = [e for e in v2_events if "transcript_support" in e and e["transcript_support"] is not None]
+    l4_supported = sum(1 for e in l4_events if e["transcript_support"])
+    l4_unsupported = len(l4_events) - l4_supported
+    l4_rate = (l4_supported / len(l4_events) * 100) if l4_events else 0
+
+    # Evidence line stats
+    ev_counts = [e.get("evidence_lines", 0) for e in v2_events if e.get("outcome") == "pass"]
+    avg_ev = sum(ev_counts) / len(ev_counts) if ev_counts else 0
+    spec_count = sum(1 for e in v2_events if e.get("has_specificity"))
+
+    # Risk line stats
+    risk_counts = [e.get("risk_lines", 0) for e in v2_events if e.get("outcome") == "pass"]
+    avg_risk = sum(risk_counts) / len(risk_counts) if risk_counts else 0
+
+    # Block reason distribution
+    block_events = [e for e in gate_events if e["outcome"] != "pass"]
+    block_reasons = Counter()
+    for e in block_events:
+        extra = e.get("extra", "")
+        if "verify_reason=" in extra:
+            reason = extra.split("verify_reason=")[1].split("|")[0].strip()
+            block_reasons[f"verify:{reason}"] += 1
+        if "risk_reason=" in extra:
+            reason = extra.split("risk_reason=")[1].split("|")[0].strip()
+            block_reasons[f"risk:{reason}"] += 1
+        if "write_fail" in e["outcome"]:
+            block_reasons["write_fail"] += 1
+
+    # Decision readiness
+    l4_ready = len(l4_events) >= 20
+    l4_fp_rate = (l4_unsupported / len(l4_events) * 100) if l4_events else 0
+    l4_promote = l4_ready and l4_fp_rate < 10
+
+    if as_json:
+        print(json.dumps({
+            "total_events": total, "passes": passes, "blocks": blocks,
+            "pass_rate": round(passes / total * 100, 1) if total else 0,
+            "dedup_skipped": len(dedup_events),
+            "v2_events": v2_total,
+            "outcomes": dict(outcomes),
+            "layer4": {
+                "events": len(l4_events), "supported": l4_supported,
+                "unsupported": l4_unsupported, "support_rate": round(l4_rate, 1),
+                "ready_for_promotion": l4_ready, "promote_to_hard_gate": l4_promote,
+            },
+            "evidence_lines_avg": round(avg_ev, 1),
+            "risk_lines_avg": round(avg_risk, 1),
+            "specificity_count": spec_count,
+            "block_reasons": dict(block_reasons),
+        }, indent=2))
+        return
+
+    # Human-readable report
+    print("=" * 60)
+    print("  Evidence Gate v2 — Performance Report")
+    print("=" * 60)
+    print(f"\n  Total gate events:  {total}")
+    print(f"  Passes:             {passes} ({passes/total*100:.0f}%)" if total else "")
+    print(f"  Blocks:             {blocks} ({blocks/total*100:.0f}%)" if total else "")
+    print(f"  Dedup skipped:      {len(dedup_events)}")
+    if v2_total:
+        print(f"  v2 events (w/ new fields): {v2_total}")
+
+    print(f"\n  Outcome distribution:")
+    for outcome, count in outcomes.most_common():
+        print(f"    {outcome:20s} {count:4d}  ({count/total*100:.0f}%)")
+
+    if block_reasons:
+        print(f"\n  Block reasons:")
+        for reason, count in block_reasons.most_common():
+            print(f"    {reason:30s} {count:4d}")
+
+    if v2_total:
+        print(f"\n  --- v2 Calibration Metrics ---")
+        print(f"  Avg evidence lines (passes):  {avg_ev:.1f}")
+        print(f"  Avg risk lines (passes):      {avg_risk:.1f}")
+        print(f"  Events with specificity:      {spec_count}/{v2_total}")
+
+    print(f"\n  --- Layer 4: Transcript Cross-Reference ---")
+    if l4_events:
+        print(f"  Events with L4 data:     {len(l4_events)}")
+        print(f"  Supported:               {l4_supported} ({l4_rate:.0f}%)")
+        print(f"  Unsupported (warnings):  {l4_unsupported} ({l4_fp_rate:.0f}%)")
+        print(f"  Ready for promotion:     {'YES' if l4_ready else f'NO (need {20 - len(l4_events)} more events)'}")
+        if l4_ready:
+            print(f"  Promote to hard gate:    {'YES (<10% FP)' if l4_promote else 'NO (FP rate too high)'}")
+    else:
+        print(f"  No Layer 4 data yet (events will populate after v2 deployment)")
+
+    print(f"\n  --- Decision Triggers ---")
+    if l4_ready and l4_promote:
+        print(f"  >> READY: Layer 4 can be promoted to hard gate")
+    if l4_ready and not l4_promote:
+        print(f"  >> ALERT: Layer 4 false-positive rate {l4_fp_rate:.0f}% > 10% — investigate before promoting")
+    if block_reasons and block_reasons.most_common(1)[0][1] > total * 0.3:
+        top_reason = block_reasons.most_common(1)[0]
+        print(f"  >> ALERT: '{top_reason[0]}' causes {top_reason[1]/total*100:.0f}% of events — review gate calibration")
+
+    print()
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    since_str = ""
+    for i, a in enumerate(args):
+        if a == "--since" and i + 1 < len(args):
+            since_str = args[i + 1]
+    since = parse_since(since_str)
+    events = load_events(since)
+    report(events, as_json)
+
+
+if __name__ == "__main__":
+    main()
