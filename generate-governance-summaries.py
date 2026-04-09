@@ -195,6 +195,34 @@ def parse_issues(filepath: Path) -> dict:
                 'status': 'OPEN'
             }
 
+    # Pattern 8: ### ISSUE-NNN | DATE | STATUS | Title (4-field: date, status, title, no severity)
+    # Fixes ISSUE-110, ISSUE-140 which use this format
+    pattern8 = r'^### (ISSUE-[\d]+[-\w]*) \| (\d{4}-\d{2}-\d{2}) \| (OPEN|RESOLVED|PARTIAL|PARTIALLY_RESOLVED|CLOSED|DEFERRED|WONT_FIX|IN PROGRESS) \| ([^\n|]+)$'
+    for match in re.finditer(pattern8, content, re.MULTILINE):
+        issue_id, date, status, title = match.groups()
+        if issue_id not in issues:
+            issues[issue_id] = {
+                'title': title.strip(),
+                'status': status.strip(),
+                'date': date
+            }
+
+    # Pattern 9: ### ISSUE-NNN | Title | STATUS | SEVERITY | DATE (title-first, date at end)
+    # Fixes ISSUE-2690, ISSUE-2691, ISSUE-2692, ISSUE-2695 which use this format
+    date_re = r'\d{4}-\d{2}-\d{2}'
+    pattern9 = (r'^### (ISSUE-[\d]+[-\w]*) \| ([^|]+) \| '
+                r'(OPEN|RESOLVED|PARTIAL|PARTIALLY_RESOLVED|CLOSED|DEFERRED|WONT_FIX|IN PROGRESS) \| '
+                r'([^\n|]+) \| (' + date_re + r')$')
+    for match in re.finditer(pattern9, content, re.MULTILINE):
+        issue_id, title, status, severity, date = match.groups()
+        if issue_id not in issues:
+            issues[issue_id] = {
+                'title': title.strip(),
+                'status': status.strip(),
+                'severity': severity.strip(),
+                'date': date
+            }
+
     # Also look for status markers in body text
     status_pattern = r'(ISSUE-[\d]+[-\w]*).*\*\*Status:\*\* (\w+)'
     for match in re.finditer(status_pattern, content):
@@ -244,6 +272,18 @@ def parse_ideas(filepath: Path) -> dict:
     # Use [^\n|]+ not [^|]+ — [^|] matches newlines, causing multi-line capture
     pattern4 = r'^### (IDEA-\d+) \| ([^\n|]+)$'
     for match in re.finditer(pattern4, content, re.MULTILINE):
+        idea_id, title = match.groups()
+        if idea_id not in ideas:
+            ideas[idea_id] = {
+                'title': title.strip(),
+                'status': 'Parking'
+            }
+
+    # Pattern 5: ### IDEA-NNN — Title (em dash format)
+    # Fixes IDEA-609, IDEA-612, IDEA-614, IDEA-619, IDEA-646, IDEA-665, IDEA-680,
+    # IDEA-700, IDEA-701, IDEA-1033 and any future entries using em dash separator
+    pattern5 = r'^### (IDEA-\d+) \u2014 (.+)$'
+    for match in re.finditer(pattern5, content, re.MULTILINE):
         idea_id, title = match.groups()
         if idea_id not in ideas:
             ideas[idea_id] = {
