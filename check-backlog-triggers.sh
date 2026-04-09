@@ -17,7 +17,7 @@ if [[ -f "$GATE_LOG" ]]; then
     SESSION_COUNT=$(jq -r 'select(.session_id != null and .session_id != "") | .session_id' "$GATE_LOG" 2>/dev/null | sort -u | wc -l)
     if (( GATE_COUNT >= 30 && SESSION_COUNT >= 3 )); then
         echo "TRIGGERED: Phase 2 QC evaluation - evidence gate has ${GATE_COUNT} events across ${SESSION_COUNT} sessions (thresholds: 30 events, 3 sessions)"
-        echo "  Dart: https://app.dartai.com/t/gk9wRrHqTVUg"
+        echo "  Dart: https://app.dartai.com/t/x5DzAGbfApMu"
         echo "  Action: Evaluate readiness for Architecture C+ dual-agent evaluator"
         echo "  NOTE: Strategic architecture decision — requires user session, not auto-dispatched."
         echo "  Prompt: Phase 2 QC evaluation: evidence gate has ${GATE_COUNT} events across ${SESSION_COUNT} sessions. Run gate-stats --json for calibration data. Read ~/dev/share/STRUCTURAL-QC-RESEARCH-2026-04-04.md for Architecture C+ design. Evaluate: (1) pass/block rate distribution, (2) false positive patterns, (3) whether single-agent gate (A+) is sufficient or dual-agent evaluator (C+) is needed. Write go/no-go recommendation to ~/dev/share/phase2-qc-evaluation-\$(date +%Y-%m-%d).md."
@@ -32,7 +32,7 @@ fi
 
 # 2. Satisficing pattern: 3+ detections in evidence gate
 if [[ -f "$GATE_LOG" ]]; then
-    SATISFICE_COUNT=$(grep -c 'satisfic' "$GATE_LOG" 2>/dev/null || echo "0")
+    SATISFICE_COUNT=$(grep -c 'satisfic' "$GATE_LOG" 2>/dev/null || true)
     if (( SATISFICE_COUNT >= 3 )); then
         echo "TRIGGERED: Pre-implementation review swarm - ${SATISFICE_COUNT} satisficing detections (threshold: 3)"
         echo "  Dart: https://app.dartai.com/t/80onex6wrOda"
@@ -60,7 +60,7 @@ fi
 # 4. Bash pipeline safety: L-467 pattern recurrence threshold
 PIPELINE_LOG="$HOME/.claude/logs/bash-pipeline-safety.jsonl"
 if [[ -f "$PIPELINE_LOG" ]]; then
-    DETECT_COUNT=$(grep -c '"pattern"' "$PIPELINE_LOG" 2>/dev/null || echo "0")
+    DETECT_COUNT=$(grep -c '"pattern"' "$PIPELINE_LOG" 2>/dev/null || true)
     if (( DETECT_COUNT >= 3 )); then
         echo "TRIGGERED: Bash pipeline safety recurrence - ${DETECT_COUNT} || echo pattern detections (threshold: 3)"
         echo "  Source: L-467 / ISSUE-3025 — misattributed failure from && ... || echo chains"
