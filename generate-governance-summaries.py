@@ -35,14 +35,17 @@ def parse_decisions(filepath: Path) -> dict:
     # Pattern 1: ### DEC-NNN | DATE | CATEGORY | STATUS | Title (standard 5-field)
     # Status can be multi-word ("PARTIALLY SUPERSEDED") or include → notation ("SUPERSEDED → DEC-122")
     # Fixes DEC-070 which uses "SUPERSEDED → DEC-122" as the status field
+    # FIX: category was \w+ which excluded categories with spaces/slashes (e.g.
+    # "Infrastructure / AI Memory") — changed to [^|]+? (any non-pipe chars).
+    # This fixed silent exclusion of DEC-210, DEC-233, DEC-241–DEC-259.
     # [^\n|] prevents cross-line matching
-    pattern1 = r'^### (DEC-\d+) \| (\d{4}-\d{2}-\d{2}) \| (\w+) \| ([^\n|]+?) \| (.+)$'
+    pattern1 = r'^### (DEC-\d+) \| (\d{4}-\d{2}-\d{2}) \| ([^|]+?) \| ([^\n|]+?) \| (.+)$'
     for match in re.finditer(pattern1, content, re.MULTILINE):
         dec_id, date, category, status, title = match.groups()
         decisions[dec_id] = {
             'date': date,
-            'category': category,
-            'status': status,
+            'category': category.strip(),
+            'status': status.strip(),
             'title': title.strip()
         }
 
@@ -70,6 +73,29 @@ def parse_decisions(filepath: Path) -> dict:
                 'status': 'UNKNOWN',
                 'title': title.strip()
             }
+
+    # Pattern 4: ### DEC-NNN: Title (colon format, no pipe fields)
+    # FIX: silently excluded DEC-196, 197, 201, 212, 213, 214 which use this format.
+    pattern4 = r'^### (DEC-\d+): (.+)$'
+    for match in re.finditer(pattern4, content, re.MULTILINE):
+        dec_id, title = match.groups()
+        if dec_id not in decisions:
+            decisions[dec_id] = {
+                'date': 'unknown',
+                'category': 'UNKNOWN',
+                'status': 'UNKNOWN',
+                'title': title.strip()
+            }
+
+    # Completeness validation: warn if parsed count differs significantly from
+    # raw header count. Silent exclusion is the root failure — make it loud.
+    raw_count = len(re.findall(r'^### DEC-\d+', content, re.MULTILINE))
+    if raw_count > 0 and len(decisions) < raw_count:
+        gap = raw_count - len(decisions)
+        pct = gap * 100 // raw_count
+        if pct > 5:
+            print(f"  [WARN] DECISIONS parser: {len(decisions)}/{raw_count} entries indexed "
+                  f"({gap} excluded, {pct}% gap) — check for unhandled header formats")
 
     return decisions
 
