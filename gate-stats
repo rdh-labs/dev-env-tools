@@ -5,9 +5,13 @@ Reads ~/.claude/logs/evidence-gate.jsonl and outputs actionable metrics
 for monitoring, evaluation, and optimization decisions.
 
 Usage:
-    gate-stats              # Full report
+    gate-stats              # Full report (includes note if test events detected)
+    gate-stats --real-only  # Filter out test-run clusters (events within 0.5s of each other)
     gate-stats --json       # Machine-readable output
     gate-stats --since 7d   # Last 7 days only (Nd or Nh)
+
+Note: Before 2026-04-10, test runs wrote to this log (EVIDENCE_GATE_NO_LOG not yet set).
+      50/60 historical events are test-run clusters. Use --real-only for accurate metrics.
 """
 import json
 import sys
@@ -52,6 +56,36 @@ def load_events(since: datetime | None = None) -> list[dict]:
                 continue
         events.append(obj)
     return events
+
+
+def filter_real_events(events: list[dict]) -> tuple[list[dict], int]:
+    """Remove events that fired within 0.5s of another event (test-run clusters).
+    Returns (real_events, filtered_count)."""
+    if not events:
+        return [], 0
+    parsed = []
+    for e in events:
+        try:
+            ts = datetime.fromisoformat(e.get("timestamp", ""))
+            parsed.append((ts, e))
+        except ValueError:
+            parsed.append((None, e))
+
+    # Mark events that are within 0.5s of the previous event
+    real = []
+    prev_ts = None
+    for ts, e in parsed:
+        if ts is None:
+            real.append(e)
+            prev_ts = None
+            continue
+        if prev_ts is not None and (ts - prev_ts).total_seconds() < 0.5:
+            pass  # skip — part of a rapid-fire cluster (test run)
+        else:
+            real.append(e)
+        prev_ts = ts
+
+    return real, len(events) - len(real)
 
 
 def report(events: list[dict], as_json: bool = False) -> None:
@@ -177,12 +211,27 @@ def report(events: list[dict], as_json: bool = False) -> None:
 def main() -> None:
     args = sys.argv[1:]
     as_json = "--json" in args
+    real_only = "--real-only" in args
     since_str = ""
     for i, a in enumerate(args):
         if a == "--since" and i + 1 < len(args):
             since_str = args[i + 1]
     since = parse_since(since_str)
     events = load_events(since)
+
+    if real_only:
+        events, filtered = filter_real_events(events)
+        if not as_json:
+            print(f"  [--real-only: filtered {filtered} test-run events, {len(events)} real events]")
+    else:
+        # Auto-detect contamination and warn
+        _, test_count = filter_real_events(events)
+        if test_count > 0 and not as_json:
+            pct = test_count / len(events) * 100 if events else 0
+            print(f"  ⚠  {test_count}/{len(events)} events appear to be test-run clusters ({pct:.0f}%).")
+            print(f"     Metrics below are skewed. Run 'gate-stats --real-only' for accurate data.")
+            print()
+
     report(events, as_json)
 
 
