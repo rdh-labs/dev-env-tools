@@ -141,6 +141,30 @@ if [[ -f "$GATE_LOG" ]]; then
     fi
 fi
 
+# 7. Phase 3 QC: evaluator gate reaches 30+ events spanning 3+ distinct sessions
+# Monitors the dual-agent evaluator (Architecture C) deployed 2026-04-10
+EVAL_LOG="$HOME/.claude/logs/evaluator-gate.jsonl"
+if [[ -f "$EVAL_LOG" ]]; then
+    EVAL_COUNT=$(wc -l < "$EVAL_LOG")
+    EVAL_SESSION_COUNT=$(jq -r 'select(.transcript_path != null and .transcript_path != "") | .transcript_path' "$EVAL_LOG" 2>/dev/null | sort -u | wc -l)
+    if (( EVAL_COUNT >= 30 && EVAL_SESSION_COUNT >= 3 )); then
+        EVAL_BLOCKS=$(jq -r 'select(.outcome == "block") | .outcome' "$EVAL_LOG" 2>/dev/null | wc -l)
+        EVAL_CATCH_RATE=$(( EVAL_BLOCKS * 100 / EVAL_COUNT ))
+        echo "TRIGGERED: Phase 3 QC evaluation — evaluator gate has ${EVAL_COUNT} events across ${EVAL_SESSION_COUNT} sessions"
+        echo "  Catch rate: ${EVAL_CATCH_RATE}% (threshold: >=20% catch, <=30% FP)"
+        echo "  Dart: https://app.dartai.com/t/ijvhNWUwvFT4"
+        echo "  Action: Evaluate evaluator gate calibration — decide Phase 3 (re-run loop)"
+        echo "  NOTE: Strategic architecture decision — requires user session."
+        echo "  Prompt: Phase 3 QC evaluation: evaluator gate has ${EVAL_COUNT} events across ${EVAL_SESSION_COUNT} sessions, ${EVAL_CATCH_RATE}% catch rate. Read ~/.claude/logs/evaluator-gate.jsonl. Analyze: (1) catch rate vs >=20% threshold, (2) FP rate vs <=30% threshold, (3) mandate distribution (which mandates fire most), (4) model reliability (gemini vs glm fallback frequency). Decide: proceed to Phase 3 (re-run loop) or continue calibrating. Write findings to ~/dev/share/phase3-qc-evaluation-\$(date +%Y-%m-%d).md."
+        echo ""
+        TRIGGERED=$((TRIGGERED + 1))
+    elif (( EVAL_COUNT >= 10 )); then
+        echo "WATCH: Evaluator gate — ${EVAL_COUNT} events across ${EVAL_SESSION_COUNT} session(s) (need 30+ events, 3+ sessions)"
+        echo "  Continue accumulating events across sessions before Phase 3 evaluation"
+        echo ""
+    fi
+fi
+
 if (( TRIGGERED == 0 )); then
     # Silent when nothing triggered - don't add noise
     exit 0
