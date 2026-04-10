@@ -106,7 +106,7 @@ if [[ -f "$GATE_LOG" ]]; then
     TOTAL_GATE=$(echo "$REAL_JSON" | jq -r '.total_events // 0' 2>/dev/null || echo 0)
     if (( TOTAL_GATE >= 20 )); then
         # Recompute block reasons from real events only using gate-stats JSON
-        TOP_BLOCK=$(echo "$REAL_JSON" | jq -r '.block_reasons | to_entries | sort_by(-.value) | .[0] | "\(.value) \(.key | split(":")[1])"' 2>/dev/null)
+        TOP_BLOCK=$(echo "$REAL_JSON" | jq -r '.block_reasons | to_entries | sort_by(-.value) | .[0] | select(. != null) | "\(.value) \(.key | split(":")[1])"' 2>/dev/null)
         if [[ -n "$TOP_BLOCK" ]]; then
             TOP_COUNT=$(echo "$TOP_BLOCK" | awk '{print $1}')
             TOP_REASON=$(echo "$TOP_BLOCK" | awk '{print $2}')
