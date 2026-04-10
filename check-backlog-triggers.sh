@@ -102,8 +102,14 @@ fi
 # that contaminate metrics. Fix deployed 2026-04-10: EVIDENCE_GATE_NO_LOG prevents
 # future test contamination; --real-only handles historical contamination.
 if [[ -f "$GATE_LOG" ]]; then
-    REAL_JSON=$(gate-stats --json --real-only 2>/dev/null)
-    TOTAL_GATE=$(echo "$REAL_JSON" | jq -r '.total_events // 0' 2>/dev/null || echo 0)
+    if ! command -v gate-stats >/dev/null 2>&1; then
+        echo "WARN: gate-stats not found in PATH — calibration trigger #6 skipped"
+        TOTAL_GATE=0
+        REAL_JSON=""
+    else
+        REAL_JSON=$(gate-stats --json --real-only 2>/dev/null)
+        TOTAL_GATE=$(echo "$REAL_JSON" | jq -r '.total_events // 0' 2>/dev/null || echo 0)
+    fi
     if (( TOTAL_GATE >= 20 )); then
         # Recompute block reasons from real events only using gate-stats JSON
         TOP_BLOCK=$(echo "$REAL_JSON" | jq -r '.block_reasons | to_entries | sort_by(-.value) | .[0] | select(. != null) | "\(.value) \(.key | split(":")[1])"' 2>/dev/null)
