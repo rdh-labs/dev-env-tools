@@ -58,11 +58,20 @@ if [[ -f "$ENGRAM_DB" ]]; then
 fi
 
 # 4. Bash pipeline safety: L-467 pattern recurrence threshold
+# Count only new detections since the last archive_metadata entry.
+# Prior detections have already been triaged and archived — re-counting them
+# causes spurious re-triggers (observed: 9 archived detections re-fired threshold 3).
+# Threshold 5 matches the hook's own RECURRENCE_THRESHOLD (raised 2026-04-11).
 PIPELINE_LOG="$HOME/.claude/logs/bash-pipeline-safety.jsonl"
 if [[ -f "$PIPELINE_LOG" ]]; then
-    DETECT_COUNT=$(grep -c '"pattern"' "$PIPELINE_LOG" 2>/dev/null || true)
-    if (( DETECT_COUNT >= 3 )); then
-        echo "TRIGGERED: Bash pipeline safety recurrence - ${DETECT_COUNT} || echo pattern detections (threshold: 3)"
+    LAST_ARCHIVE_LINE=$(grep -n '"event".*"archive_metadata"' "$PIPELINE_LOG" 2>/dev/null | tail -1 | cut -d: -f1)
+    if [[ -n "$LAST_ARCHIVE_LINE" ]]; then
+        DETECT_COUNT=$(tail -n "+$((LAST_ARCHIVE_LINE + 1))" "$PIPELINE_LOG" | grep -c '"pattern"' 2>/dev/null || true)
+    else
+        DETECT_COUNT=$(grep -c '"pattern"' "$PIPELINE_LOG" 2>/dev/null || true)
+    fi
+    if (( DETECT_COUNT >= 5 )); then
+        echo "TRIGGERED: Bash pipeline safety recurrence - ${DETECT_COUNT} new detections since last triage (threshold: 5)"
         echo "  Source: L-467 / ISSUE-3025 — misattributed failure from && ... || echo chains"
         echo "  Log: ~/.claude/logs/bash-pipeline-safety.jsonl"
         echo "  Action: Review detections, assess structural fix to command patterns"
