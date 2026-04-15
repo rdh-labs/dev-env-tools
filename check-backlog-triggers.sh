@@ -174,6 +174,40 @@ if [[ -f "$EVAL_LOG" ]]; then
     fi
 fi
 
+# 8. A14 calibration: response-tail-missing.jsonl has 10+ entries across 3+ distinct sessions
+# IDEA-1149/IDEA-1150/ISSUE-3179/L-519/L-520/IDEA-1155: advisory escalation threshold.
+# Once enough real-world A14 blocks accumulate, review TAIL_LINES and regex thresholds.
+A14_LOG="$HOME/.claude/logs/response-tail-missing.jsonl"
+if [[ -f "$A14_LOG" ]]; then
+    A14_COUNT=$(wc -l < "$A14_LOG")
+    A14_SESSION_COUNT=$(jq -r 'select(.session_id != null and .session_id != "") | .session_id' "$A14_LOG" 2>/dev/null | sort -u | wc -l)
+    if (( A14_COUNT >= 10 && A14_SESSION_COUNT >= 3 )); then
+        echo "TRIGGERED: A14 calibration ready — ${A14_COUNT} blocks across ${A14_SESSION_COUNT} sessions (thresholds: 10 events, 3 sessions)"
+        echo "  Log: ~/.claude/logs/response-tail-missing.jsonl"
+        echo "  Tuning dials: TAIL_LINES (currently 25) in evidence_gate.py; .{3,} content minimum in TAIL_DONE_RE/TAIL_OPEN_RE/TAIL_YOU_RE"
+        echo "  Action: Review FP rate — if >20%, tighten TAIL_LINES or relax regex; if blocks are all legitimate, no change needed"
+        echo ""
+
+        # Auto-dispatch calibration review (diagnostic, not a production change).
+        # Needs local ~/.claude/logs/ — cannot cloud-dispatch.
+        A14_CALIB_FLAG="$HOME/.claude/logs/.a14-calibration-review-dispatched"
+        if [[ ! -f "$A14_CALIB_FLAG" ]]; then
+            echo "  >> Auto-dispatching local A14 calibration review session..."
+            claude -p "A14 calibration ready: ${A14_COUNT} blocks across ${A14_SESSION_COUNT} sessions. Review ~/.claude/logs/response-tail-missing.jsonl — consider tuning TAIL_LINES or regex .{3,} content minimum in ~/dev/infrastructure/dev-env-config/claude/hooks/stop/evidence_gate.py if FP rate >20%. Steps: (1) read the log and categorize entries (legitimate block vs false positive), (2) compute FP rate, (3) if FP rate >20% recommend tuning TAIL_LINES or relaxing content minimum, (4) if FP rate <=20% confirm scanner is well-calibrated. Write findings to ~/dev/share/a14-calibration-review-\$(date +%Y-%m-%d).md." \
+                --output-format text \
+                > "$HOME/.claude/logs/a14-calibration-review-$(date +%Y%m%d).log" 2>&1 &
+            touch "$A14_CALIB_FLAG"
+            echo "  >> Dispatched (PID: $!) — results in ~/.claude/logs/a14-calibration-review-$(date +%Y%m%d).log"
+        fi
+        echo ""
+        TRIGGERED=$((TRIGGERED + 1))
+    elif (( A14_COUNT >= 1 )); then
+        echo "WATCH: A14 calibration — ${A14_COUNT} block(s) across ${A14_SESSION_COUNT} session(s) (need 10+ events, 3+ sessions)"
+        echo "  Continue accumulating A14 blocks before calibration review"
+        echo ""
+    fi
+fi
+
 if (( TRIGGERED == 0 )); then
     # Silent when nothing triggered - don't add noise
     exit 0
