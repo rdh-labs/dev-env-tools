@@ -208,6 +208,91 @@ if [[ -f "$A14_LOG" ]]; then
     fi
 fi
 
+# 8. Writing Studio: Suzanne review complete (form submission → process feedback)
+# Polls ntfy for messages tagged writing-studio-review-complete.
+# Dispatches process_suzanne_review.sh for each new article.
+STUDIO_DIR="$HOME/dev/projects/writing-studio"
+REVIEW_CONFIG="$STUDIO_DIR/collaboration/review-config.json"
+NTFY_LAST_SEEN_FILE="$STUDIO_DIR/collaboration/.ntfy-last-seen-suzanne"
+PROCESS_SCRIPT="$STUDIO_DIR/collaboration/process_suzanne_review.sh"
+
+if [[ -f "$REVIEW_CONFIG" ]] && [[ -f "$PROCESS_SCRIPT" ]]; then
+    NTFY_TOPIC=$(python3 -c "import json; c=json.load(open('$REVIEW_CONFIG')); print(c.get('ntfy_topic',''))" 2>/dev/null || true)
+    REVIEW_TAG=$(python3 -c "import json; c=json.load(open('$REVIEW_CONFIG')); print(c.get('review_complete_tag','writing-studio-review-complete'))" 2>/dev/null || echo "writing-studio-review-complete")
+
+    if [[ -n "$NTFY_TOPIC" ]]; then
+        # Get last-seen timestamp (or default to 1 hour ago)
+        if [[ -f "$NTFY_LAST_SEEN_FILE" ]]; then
+            SINCE=$(cat "$NTFY_LAST_SEEN_FILE" | tr -d '[:space:]')
+        else
+            SINCE=$(date -u -d '1 hour ago' +%s 2>/dev/null || date -u -v-1H +%s 2>/dev/null || echo "1")
+        fi
+
+        # Poll ntfy for new review-complete messages since last check
+        NTFY_RESPONSE=$(curl -sf --max-time 5 \
+            "https://ntfy.sh/${NTFY_TOPIC}/json?poll=1&since=${SINCE}" \
+            2>/dev/null || true)
+
+        if [[ -n "$NTFY_RESPONSE" ]]; then
+            # Extract article_ids from messages tagged writing-studio-review-complete
+            NEW_ARTICLES=$(echo "$NTFY_RESPONSE" | python3 -c "
+import sys, json
+articles = []
+latest_time = None
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+        tags = msg.get('tags', [])
+        # Check for review-complete tag
+        if any('writing-studio-review-complete' in t for t in tags):
+            # Extract article_id from tags (format: 'article_id:POPUP-2026-XX')
+            for tag in tags:
+                if tag.startswith('article_id:'):
+                    articles.append(tag.split(':', 1)[1])
+                    break
+            t = msg.get('time', 0)
+            if t and (latest_time is None or t > latest_time):
+                latest_time = t
+    except Exception:
+        pass
+if latest_time:
+    print('LATEST_TIME:' + str(latest_time + 1))
+for a in articles:
+    print('ARTICLE:' + a)
+" 2>/dev/null || true)
+
+            # Update last-seen timestamp
+            NEW_LATEST=$(echo "$NEW_ARTICLES" | grep "^LATEST_TIME:" | cut -d: -f2 || true)
+            if [[ -n "$NEW_LATEST" ]]; then
+                echo "$NEW_LATEST" > "$NTFY_LAST_SEEN_FILE"
+            fi
+
+            # Dispatch processing for each new article
+            while IFS= read -r line; do
+                if [[ "$line" == ARTICLE:* ]]; then
+                    ARTICLE_ID="${line#ARTICLE:}"
+                    echo "TRIGGERED: Writing Studio — Suzanne review complete for $ARTICLE_ID"
+                    echo "  Action: Processing Suzanne feedback (harvest comments → apply → Stage 3 → share)"
+                    echo "  Script: $PROCESS_SCRIPT $ARTICLE_ID"
+                    echo ""
+                    TRIGGERED=$((TRIGGERED + 1))
+
+                    # Auto-dispatch processing (local, needs MCP tools)
+                    if [[ -x "$PROCESS_SCRIPT" ]]; then
+                        echo "  >> Dispatching process_suzanne_review.sh for $ARTICLE_ID..."
+                        "$PROCESS_SCRIPT" "$ARTICLE_ID" \
+                            > "$STUDIO_DIR/logs/auto-process-$ARTICLE_ID-$(date +%Y%m%d-%H%M%S).log" 2>&1 &
+                        echo "  >> Processing started (PID: $!) — log: logs/auto-process-$ARTICLE_ID-*.log"
+                    fi
+                fi
+            done <<< "$NEW_ARTICLES"
+        fi
+    fi
+fi
+
 if (( TRIGGERED == 0 )); then
     # Silent when nothing triggered - don't add noise
     exit 0
