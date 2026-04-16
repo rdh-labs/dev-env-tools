@@ -208,6 +208,9 @@ if [[ -f "$A14_LOG" ]]; then
     fi
 fi
 
+# Writing Studio base dir (used by sections 8a and 8)
+STUDIO_DIR="$HOME/dev/projects/writing-studio"
+
 # 8a. Writing Studio: Suzanne reply detection via Gmail (runs first — event-driven)
 # Checks Gmail for "DONE" replies from Suzanne in studio submission/review threads.
 # Uses claude --print with Gmail MCP. Rate-limited to once per 20 min via state file.
@@ -225,7 +228,6 @@ fi
 # 8. Writing Studio: Suzanne review complete (ntfy form submission → process feedback)
 # Polls ntfy for messages tagged writing-studio-review-complete.
 # Dispatches process_suzanne_review.sh for each new article.
-STUDIO_DIR="$HOME/dev/projects/writing-studio"
 REVIEW_CONFIG="$STUDIO_DIR/collaboration/review-config.json"
 NTFY_LAST_SEEN_FILE="$STUDIO_DIR/collaboration/.ntfy-last-seen-suzanne"
 PROCESS_SCRIPT="$STUDIO_DIR/collaboration/process_suzanne_review.sh"
