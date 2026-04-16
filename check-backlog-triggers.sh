@@ -208,7 +208,21 @@ if [[ -f "$A14_LOG" ]]; then
     fi
 fi
 
-# 8. Writing Studio: Suzanne review complete (form submission → process feedback)
+# 8a. Writing Studio: Suzanne reply detection via Gmail (runs first — event-driven)
+# Checks Gmail for "DONE" replies from Suzanne in studio submission/review threads.
+# Uses claude --print with Gmail MCP. Rate-limited to once per 20 min via state file.
+# Also sends timeout alert if no reply after 3 days.
+SUZANNE_CHECK_SCRIPT="$STUDIO_DIR/collaboration/check_suzanne_replies.sh"
+if [[ -f "$SUZANNE_CHECK_SCRIPT" ]] && [[ -x "$SUZANNE_CHECK_SCRIPT" ]]; then
+    # Run check and capture any TRIGGERED lines as new trigger items
+    GMAIL_TRIGGERS=$("$SUZANNE_CHECK_SCRIPT" 2>/dev/null | grep "^TRIGGERED:" || true)
+    if [[ -n "$GMAIL_TRIGGERS" ]]; then
+        echo "$GMAIL_TRIGGERS"
+        TRIGGERED=$((TRIGGERED + $(echo "$GMAIL_TRIGGERS" | wc -l)))
+    fi
+fi
+
+# 8. Writing Studio: Suzanne review complete (ntfy form submission → process feedback)
 # Polls ntfy for messages tagged writing-studio-review-complete.
 # Dispatches process_suzanne_review.sh for each new article.
 STUDIO_DIR="$HOME/dev/projects/writing-studio"
