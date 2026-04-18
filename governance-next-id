@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# governance-next-id — concurrency-safe ID allocator for governance artifacts
+#
+# Implements ISSUE-134 Option A (optimistic/file-locking) via flock(1) against
+# sidecar counter files. Atomic fetch-and-increment under kernel-level mutex.
+# Preserves human-readable sequential IDs (IDEA-NNNN / ISSUE-NNNN / DEC-NNN / L-NNN)
+# while eliminating the stale-read collision that occurs when two agent sessions
+# both compute "next ID" by scanning the governance file before writing.
+#
+# Governance references: DEC-291, IDEA-1210, ISSUE-134, L-514, L-517
+#
+# Counter storage: ~/dev/infrastructure/dev-env-docs/.governance-counters/<TYPE>.counter
+# Lock file:      ~/dev/infrastructure/dev-env-docs/.governance-counters/<TYPE>.lock
+#
+# Operations:
+#   allocate <TYPE>        — atomic fetch-and-increment; prints allocated ID
+#   peek <TYPE>            — print next-available without incrementing
+#   bootstrap <TYPE> [N]   — initialize counter (N=explicit, else scan file max+1)
+#   verify <TYPE>          — compare counter to file max; exit 1 if drift
+#   status                 — print all counters and their file maxes
+#
+# Types: IDEA | ISSUE | DEC | L
+#
+# Exit codes: 0 success | 1 user error / verification drift | 2 lock timeout
+#
+# Version: 1.0.0
+
+set -euo pipefail
+
+DEV_DOCS="${DEV_DOCS:-$HOME/dev/infrastructure/dev-env-docs}"
+COUNTER_DIR="$DEV_DOCS/.governance-counters"
+LOCK_TIMEOUT="${GOVERNANCE_ID_LOCK_TIMEOUT:-10}"
+
+declare -A FILE_FOR
+FILE_FOR[IDEA]="$DEV_DOCS/IDEAS-BACKLOG.md"
+FILE_FOR[ISSUE]="$DEV_DOCS/ISSUES-TRACKER.md"
+FILE_FOR[DEC]="$DEV_DOCS/DECISIONS-LOG.md"
+FILE_FOR[L]="$DEV_DOCS/LESSONS-LOG.md"
+
+declare -A PATTERN_FOR
+PATTERN_FOR[IDEA]='^### IDEA-([0-9]+)'
+PATTERN_FOR[ISSUE]='^### ISSUE-([0-9]+)'
+PATTERN_FOR[DEC]='^### DEC-([0-9]+)'
+PATTERN_FOR[L]='^### L-([0-9]+)'
+
+declare -A FORMAT_FOR
+FORMAT_FOR[IDEA]='IDEA-%d'
+FORMAT_FOR[ISSUE]='ISSUE-%d'
+FORMAT_FOR[DEC]='DEC-%03d'
+FORMAT_FOR[L]='L-%d'
+
+die() { echo "governance-next-id: $*" >&2; exit 1; }
+usage() {
+  sed -n '2,30p' "$0"
+  exit 1
+}
+
+validate_type() {
+  local t="$1"
+  [[ -n "${FILE_FOR[$t]:-}" ]] || die "unknown type: $t (valid: IDEA, ISSUE, DEC, L)"
+}
+
+scan_max() {
+  # Read the governance file and return max numeric ID found (0 if none/missing).
+  local type="$1"
+  local file="${FILE_FOR[$type]}"
+  local pattern="${PATTERN_FOR[$type]}"
+  if [[ ! -f "$file" ]]; then echo 0; return 0; fi
+  local max
+  max=$(grep -oE "$pattern" "$file" | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+  echo "${max:-0}"
+}
+
+format_id() {
+  local type="$1" num="$2"
+  # shellcheck disable=SC2059
+  printf "${FORMAT_FOR[$type]}\n" "$num"
+}
+
+ensure_counter_dir() {
+  [[ -d "$COUNTER_DIR" ]] || mkdir -p "$COUNTER_DIR"
+}
+
+counter_path() { echo "$COUNTER_DIR/$1.counter"; }
+lock_path()    { echo "$COUNTER_DIR/$1.lock"; }
+
+# Acquire exclusive lock on the lock file for TYPE, call fn_body with exec on FD 9.
+with_lock() {
+  local type="$1" fn_body="$2"
+  ensure_counter_dir
+  local lock
+  lock=$(lock_path "$type")
+  touch "$lock"
+  (
+    flock -x -w "$LOCK_TIMEOUT" 9 || { echo "lock timeout after ${LOCK_TIMEOUT}s on $lock" >&2; exit 2; }
+    eval "$fn_body"
+  ) 9<"$lock"
+}
+
+cmd_allocate() {
+  local type="$1"
+  validate_type "$type"
+  with_lock "$type" '
+    counter=$(counter_path "'"$type"'")
+    if [[ ! -f "$counter" ]]; then
+      max=$(scan_max "'"$type"'")
+      next=$((max + 1))
+    else
+      next=$(cat "$counter")
+      [[ "$next" =~ ^[0-9]+$ ]] || { echo "corrupt counter: $counter" >&2; exit 1; }
+    fi
+    # Auto-reconcile against foreign writes: if the governance file has a
+    # higher ID than the counter expects, jump past it. Guards against agents
+    # that bypass the allocator and write an ID directly via Edit/Write.
+    file_max=$(scan_max "'"$type"'")
+    if (( file_max >= next )); then
+      next=$((file_max + 1))
+    fi
+    tmp=$(mktemp "$counter.XXXXXX")
+    echo $((next + 1)) > "$tmp"
+    mv -f "$tmp" "$counter"
+    format_id "'"$type"'" "$next"
+  '
+}
+
+cmd_peek() {
+  local type="$1"
+  validate_type "$type"
+  with_lock "$type" '
+    counter=$(counter_path "'"$type"'")
+    if [[ ! -f "$counter" ]]; then
+      max=$(scan_max "'"$type"'")
+      next=$((max + 1))
+    else
+      next=$(cat "$counter")
+    fi
+    format_id "'"$type"'" "$next"
+  '
+}
+
+cmd_bootstrap() {
+  local type="$1" explicit="${2:-}"
+  validate_type "$type"
+  with_lock "$type" '
+    counter=$(counter_path "'"$type"'")
+    if [[ -n "'"$explicit"'" ]]; then
+      [[ "'"$explicit"'" =~ ^[0-9]+$ ]] || { echo "bootstrap N must be numeric" >&2; exit 1; }
+      next="'"$explicit"'"
+    else
+      max=$(scan_max "'"$type"'")
+      next=$((max + 1))
+    fi
+    tmp=$(mktemp "$counter.XXXXXX")
+    echo "$next" > "$tmp"
+    mv -f "$tmp" "$counter"
+    echo "bootstrapped '"$type"' counter to $next (next allocation)"
+  '
+}
+
+cmd_verify() {
+  local type="$1"
+  validate_type "$type"
+  with_lock "$type" '
+    counter=$(counter_path "'"$type"'")
+    file_max=$(scan_max "'"$type"'")
+    if [[ ! -f "$counter" ]]; then
+      echo "'"$type"': counter not initialized (file max=$file_max)" >&2
+      exit 1
+    fi
+    counter_val=$(cat "$counter")
+    expected=$((file_max + 1))
+    if [[ "$counter_val" -lt "$expected" ]]; then
+      echo "'"$type"': DRIFT — counter=$counter_val but file_max=$file_max (expected counter>=$expected)" >&2
+      exit 1
+    fi
+    echo "'"$type"': OK (counter=$counter_val, file_max=$file_max)"
+  '
+}
+
+cmd_status() {
+  ensure_counter_dir
+  local t
+  for t in IDEA ISSUE DEC L; do
+    local counter file_max counter_val
+    counter=$(counter_path "$t")
+    file_max=$(scan_max "$t")
+    if [[ -f "$counter" ]]; then
+      counter_val=$(cat "$counter")
+      printf "%-5s  counter=%-6s  file_max=%-6s  drift=%s\n" \
+        "$t" "$counter_val" "$file_max" \
+        "$([ "$counter_val" -gt "$file_max" ] && echo "no" || echo "YES")"
+    else
+      printf "%-5s  counter=UNINIT  file_max=%-6s\n" "$t" "$file_max"
+    fi
+  done
+}
+
+main() {
+  [[ $# -ge 1 ]] || usage
+  local cmd="$1"; shift
+  case "$cmd" in
+    allocate)  [[ $# -eq 1 ]] || usage; cmd_allocate "$1" ;;
+    peek)      [[ $# -eq 1 ]] || usage; cmd_peek "$1" ;;
+    bootstrap) [[ $# -ge 1 ]] || usage; cmd_bootstrap "$1" "${2:-}" ;;
+    verify)    [[ $# -eq 1 ]] || usage; cmd_verify "$1" ;;
+    status)    cmd_status ;;
+    -h|--help) usage ;;
+    *)         die "unknown command: $cmd (run -h)" ;;
+  esac
+}
+
+main "$@"
