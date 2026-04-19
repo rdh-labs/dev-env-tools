@@ -2,8 +2,6 @@
 """
 Date-Based ISSUES-TRACKER.md Archival Script
 Archives OPEN issues from ISSUES-TRACKER.md older than a date cutoff.
-Context: ISSUE-3232, Dart task RZ3wfP7n1usu.
-
 Usage:
   python3 archive-issues-by-date.py [--dry-run] [--cutoff YYYY-MM-DD]
 
@@ -15,8 +13,8 @@ import importlib.util
 import os
 import re
 import shutil
-import sys
 import argparse
+import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime, date
@@ -59,7 +57,6 @@ def archive_issues_by_date(cutoff: date, dry_run: bool) -> dict:
     if dry_run:
         content = filepath.read_text(errors="replace")
         blocks = split_into_blocks(content, header_pat)
-        f = None
     else:
         f = open(filepath, "r+b")
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -107,12 +104,10 @@ def archive_issues_by_date(cutoff: date, dry_run: bool) -> dict:
         note = f"Archived {TODAY}: {len(to_archive)} entries before {cutoff} ({ids[0]} to {ids[-1]})"
         archive_header = f"\n\n<!-- {note} -->\n\n"
         archive_content = "\n\n---\n\n".join(b["content"] for b in to_archive)
-        if archive_path.exists():
-            existing = archive_path.read_text(errors="replace")
-            archive_path.write_text(existing + archive_header + archive_content, encoding="utf-8")
-        else:
-            preamble = "# ISSUES-TRACKER Archive\n\nArchived issues (date-based).\n\n"
-            archive_path.write_text(preamble + archive_header + archive_content, encoding="utf-8")
+        if not archive_path.exists():
+            archive_path.write_text("# ISSUES-TRACKER Archive\n\nArchived issues (date-based).\n\n", encoding="utf-8")
+        with archive_path.open("a", encoding="utf-8") as af:
+            af.write(archive_header + archive_content)
 
     parts = []
     for b in to_keep:
@@ -165,7 +160,6 @@ def main():
     if not args.dry_run and result["archived"] > 0:
         generator = Path.home() / "dev/infrastructure/tools/generate-governance-summaries.py"
         if generator.exists():
-            import subprocess
             r = subprocess.run(["python3", str(generator)], capture_output=True, text=True)
             if r.returncode == 0:
                 print("YAML indexes synced.")
