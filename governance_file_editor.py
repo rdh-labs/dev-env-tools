@@ -458,12 +458,10 @@ class GovernanceFileEditor:
                     content = f.read()
 
                     # Insert after "## Open Issues" header; fallback to before first ### ISSUE- entry
-                    if "## Open Issues" in content:
-                        content = content.replace(
-                            "## Open Issues\n",
-                            f"## Open Issues\n{new_issue}",
-                            1
-                        )
+                    # Use regex to match header with any suffix (e.g. entry counts) — fixes ISSUE-3248
+                    _hm = re.search(r'^(## Open Issues[^\n]*\n)', content, re.MULTILINE)
+                    if _hm:
+                        content = content[:_hm.end()] + new_issue + content[_hm.end():]
                     else:
                         # Fallback: ISSUES-TRACKER.md may lack the section header —
                         # insert before the first ### ISSUE-NNNN entry instead (IDEA-652)
@@ -582,12 +580,10 @@ class GovernanceFileEditor:
                     )
 
                     # ── Insert after "## Open Issues" header; fallback to before first ### ISSUE- entry ──
-                    if "## Open Issues" in content:
-                        content = content.replace(
-                            "## Open Issues\n",
-                            f"## Open Issues\n{new_issue}",
-                            1,
-                        )
+                    # Use regex to match header with any suffix (e.g. entry counts) — fixes ISSUE-3248
+                    _hm2 = re.search(r'^(## Open Issues[^\n]*\n)', content, re.MULTILINE)
+                    if _hm2:
+                        content = content[:_hm2.end()] + new_issue + content[_hm2.end():]
                     else:
                         # Fallback: ISSUES-TRACKER.md may lack the section header —
                         # insert before the first ### ISSUE-NNNN entry instead (IDEA-652)
