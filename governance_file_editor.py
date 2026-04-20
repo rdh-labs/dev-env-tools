@@ -360,17 +360,22 @@ class GovernanceFileEditor:
                 try:
                     content = f.read()
 
-                    # Insert after "## Active Ideas" header
-                    if "## Active Ideas" not in content:
+                    # Insert after "## Active Ideas" header — regex handles suffix variants (ISSUE-3248)
+                    _aim = re.search(r'^(## Active Ideas[^\n]*\n)', content, re.MULTILINE)
+                    if not _aim:
                         raise GovernanceFileError("Malformed file: '## Active Ideas' header not found")
 
-                    content = content.replace(
-                        "## Active Ideas\n",
-                        f"## Active Ideas\n{new_idea}"
-                    )
+                    content = content[:_aim.end()] + new_idea + content[_aim.end():]
 
                     # Update metadata
                     content = self._update_ideas_metadata(content, idea_id)
+
+                    # Post-write assertion: verify insertion actually occurred (IDEA-1245)
+                    if idea_id not in content:
+                        raise GovernanceFileError(
+                            f"Insertion failed — {idea_id} not found in modified content "
+                            "(section header mismatch or replacement no-op). File not written."
+                        )
 
                     # Write atomically (still using atomic write for crash safety)
                     # Note: lock is held during atomic write
@@ -475,6 +480,13 @@ class GovernanceFileEditor:
 
                     # Update metadata
                     content = self._update_issues_metadata(content)
+
+                    # Post-write assertion: verify insertion actually occurred (IDEA-1245)
+                    if issue_id not in content:
+                        raise GovernanceFileError(
+                            f"Insertion failed — {issue_id} not found in modified content "
+                            "(section header mismatch or replacement no-op). File not written."
+                        )
 
                     # Write atomically (still using atomic write for crash safety)
                     # Note: lock is held during atomic write
@@ -596,6 +608,13 @@ class GovernanceFileEditor:
                             )
 
                     content = self._update_issues_metadata(content)
+
+                    # Post-write assertion: verify insertion actually occurred (IDEA-1245)
+                    if issue_id not in content:
+                        raise GovernanceFileError(
+                            f"Insertion failed — {issue_id} not found in modified content "
+                            "(section header mismatch or replacement no-op). File not written."
+                        )
 
                     # ── Atomic write (crash-safe tempfile+os.replace) ─────────
                     # Lock is held during write so no other process reads mid-write
@@ -771,17 +790,22 @@ class GovernanceFileEditor:
                 try:
                     content = f.read()
 
-                    # Insert after "## Active Decisions" header
-                    if "## Active Decisions" not in content:
+                    # Insert after "## Active Decisions" header — regex handles suffix variants (ISSUE-3248)
+                    _adm = re.search(r'^(## Active Decisions[^\n]*\n)', content, re.MULTILINE)
+                    if not _adm:
                         raise GovernanceFileError("Malformed file: '## Active Decisions' header not found")
 
-                    content = content.replace(
-                        "## Active Decisions\n",
-                        f"## Active Decisions\n{new_decision}"
-                    )
+                    content = content[:_adm.end()] + new_decision + content[_adm.end():]
 
                     # Update metadata
                     content = self._update_decisions_metadata(content)
+
+                    # Post-write assertion: verify insertion actually occurred (IDEA-1245)
+                    if decision_id not in content:
+                        raise GovernanceFileError(
+                            f"Insertion failed — {decision_id} not found in modified content "
+                            "(section header mismatch or replacement no-op). File not written."
+                        )
 
                     # Write atomically (still using atomic write for crash safety)
                     # Note: lock is held during atomic write
