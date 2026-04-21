@@ -309,6 +309,17 @@ for a in articles:
     fi
 fi
 
+# 9. Anomaly telemetry: IDEA-1295 — behavioral classes with >=3 Engram obs, no enforcement gate
+ANOMALY_TELEMETRY="$HOME/bin/anomaly-telemetry.sh"
+if [[ -f "$ANOMALY_TELEMETRY" ]] && [[ -x "$ANOMALY_TELEMETRY" ]]; then
+    ANOMALY_OUTPUT=$("$ANOMALY_TELEMETRY" 2>/dev/null || true)
+    if [[ -n "$ANOMALY_OUTPUT" ]]; then
+        echo "$ANOMALY_OUTPUT"
+        ANOMALY_COUNT=$(echo "$ANOMALY_OUTPUT" | grep -c "^TRIGGERED:" 2>/dev/null || true)
+        TRIGGERED=$((TRIGGERED + ANOMALY_COUNT))
+    fi
+fi
+
 if (( TRIGGERED == 0 )); then
     # Silent when nothing triggered - don't add noise
     exit 0
