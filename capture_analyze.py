@@ -123,16 +123,12 @@ class CaptureAnalyzer:
         Raises:
             GovernanceFileError: On file operation failure
         """
-        # Get next available ID
-        idea_id = self.editor.get_next_id("IDEAS")
-
         # Use text as description if none provided
         if not description:
             description = text
 
-        # Insert
-        self.editor.insert_idea(
-            idea_id=idea_id,
+        # Allocate ID and insert in a single flock transaction (IDEA-1210 — eliminates TOCTOU race)
+        idea_id = self.editor.allocate_and_insert_idea(
             title=title,
             category=category,
             priority=priority,
@@ -173,9 +169,6 @@ class CaptureAnalyzer:
         Raises:
             GovernanceFileError: On file operation failure
         """
-        # Get next available ID
-        issue_id = self.editor.get_next_id("ISSUES")
-
         # Defaults
         if not description:
             description = text
@@ -186,9 +179,8 @@ class CaptureAnalyzer:
         if not resolution:
             resolution = ["Investigate and resolve"]
 
-        # Insert
-        self.editor.insert_issue(
-            issue_id=issue_id,
+        # Allocate ID and insert in a single flock transaction (IDEA-1210 — eliminates TOCTOU race)
+        issue_id = self.editor.allocate_and_insert_issue(
             title=title,
             severity=severity,
             category=category,
@@ -231,13 +223,11 @@ class CaptureAnalyzer:
         Raises:
             GovernanceFileError: On file operation failure
         """
-        lesson_id = self.editor.get_next_id("LESSONS")
-
         if not context:
             context = text
 
-        self.editor.insert_lesson(
-            lesson_id=lesson_id,
+        # Allocate ID and insert in a single flock transaction (IDEA-1210 — eliminates TOCTOU race)
+        lesson_id = self.editor.allocate_and_insert_lesson(
             title=title,
             context=context,
             principle=principle,

@@ -630,6 +630,132 @@ class GovernanceFileEditor:
 
         return issue_id
 
+    def allocate_and_insert_idea(
+        self,
+        title: str,
+        category: str,
+        priority: str,
+        description: str,
+        why_needed: str = "",
+        blocker: str = "None",
+        effort: str = "MEDIUM",
+        related: List[str] = None,
+        validation: List[str] = None,
+        source: str = "User capture",
+        revival_trigger: str = ""
+    ) -> str:
+        """
+        Allocate next IDEA-NNN and insert it in a SINGLE flock transaction.
+
+        Fixes TOCTOU vulnerability: the existing pattern of calling
+        get_next_id() (acquires + releases flock) then insert_idea() (acquires +
+        releases flock) leaves a window where another concurrent session can
+        allocate the same ID. This method holds flock across the entire
+        read-allocate-write sequence.
+
+        Returns:
+            Allocated idea_id string (e.g., "IDEA-1311")
+
+        Raises:
+            GovernanceFileError: On file operation failure
+            GovernanceFileNotFoundError: If IDEAS-BACKLOG.md is missing
+        """
+        file_path = self.paths["IDEAS"]
+
+        if not file_path.exists():
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+
+        related_str = ", ".join(related) if related else "None"
+        validation_str = "\n".join(
+            f"- [ ] {item}" for item in (validation or ["Implementation complete"])
+        )
+        revival_line = f"\n**Revival Trigger:** {revival_trigger}" if revival_trigger else ""
+        today = date.today().strftime("%Y-%m-%d")
+
+        try:
+            with open(file_path, "r+", encoding="utf-8") as f:
+                # Acquire exclusive lock — held for the ENTIRE read-allocate-write sequence
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+
+                    # ── Allocate ID (under lock — no TOCTOU window) ──────────
+                    # Also check archive to prevent collision with archived IDs (ISSUE-2168)
+                    matches = re.findall(r"IDEA-(\d+)", content)
+                    archive_path = self._get_archive_path("IDEAS")
+                    if archive_path and archive_path.exists():
+                        try:
+                            matches.extend(
+                                re.findall(r"IDEA-(\d+)", archive_path.read_text())
+                            )
+                        except (PermissionError, UnicodeDecodeError):
+                            pass
+
+                    if matches:
+                        highest = max(int(n) for n in matches)
+                        idea_num = highest + 1
+                    else:
+                        idea_num = 1
+                    idea_id = f"IDEA-{idea_num:03d}"
+
+                    # ── Build block ──────────────────────────────────────────
+                    new_idea = f"""
+### {idea_id}: {title}
+
+**Category:** {category}
+**Priority:** {priority}
+**Status:** Parking
+**Added:** {today}
+**Source:** {source}{revival_line}
+
+**Description:** {description}
+
+**Why Needed:** {why_needed or "See description"}
+
+**Blocker:** {blocker}
+
+**Effort:** {effort}
+
+**Related:** {related_str}
+
+**Validation:**
+{validation_str}
+
+---
+
+"""
+
+                    # ── Insert after "## Active Ideas" header ────────────────
+                    _aim = re.search(r'^(## Active Ideas[^\n]*\n)', content, re.MULTILINE)
+                    if not _aim:
+                        raise GovernanceFileError("Malformed file: '## Active Ideas' header not found")
+
+                    content = content[:_aim.end()] + new_idea + content[_aim.end():]
+
+                    # Update metadata
+                    content = self._update_ideas_metadata(content, idea_id)
+
+                    # Post-write assertion: verify insertion actually occurred (IDEA-1245)
+                    if idea_id not in content:
+                        raise GovernanceFileError(
+                            f"Insertion failed — {idea_id} not found in modified content "
+                            "(section header mismatch or replacement no-op). File not written."
+                        )
+
+                    # ── Atomic write (crash-safe tempfile+os.replace) ─────────
+                    # Lock is held during write so no other process reads mid-write
+                    atomic_write(file_path, content)
+
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        except FileNotFoundError:
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+        except PermissionError as e:
+            raise GovernanceFileError(f"Permission denied: {e}")
+
+        return idea_id
+
     def resolve_issue(
         self,
         issue_id: str,
@@ -817,6 +943,120 @@ class GovernanceFileEditor:
             raise GovernanceFileNotFoundError(f"File not found: {file_path}")
         except PermissionError as e:
             raise GovernanceFileError(f"Permission denied: {e}")
+
+    def allocate_and_insert_decision(
+        self,
+        title: str,
+        category: str,
+        status: str,
+        context: str,
+        decision: str,
+        rationale: str,
+        related: List[str] = None,
+        source: str = "User capture"
+    ) -> str:
+        """
+        Allocate next DEC-NNN and insert it in a SINGLE flock transaction.
+
+        Fixes TOCTOU vulnerability: the existing pattern of calling
+        get_next_id() (acquires + releases flock) then insert_decision() (acquires +
+        releases flock) leaves a window where another concurrent session can
+        allocate the same ID. This method holds flock across the entire
+        read-allocate-write sequence.
+
+        Returns:
+            Allocated decision_id string (e.g., "DEC-298")
+
+        Raises:
+            GovernanceFileError: On file operation failure
+            GovernanceFileNotFoundError: If DECISIONS-LOG.md is missing
+        """
+        file_path = self.paths["DECISIONS"]
+
+        if not file_path.exists():
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+
+        related_str = ", ".join(related) if related else "None"
+        today = date.today().strftime("%Y-%m-%d")
+
+        try:
+            with open(file_path, "r+", encoding="utf-8") as f:
+                # Acquire exclusive lock — held for the ENTIRE read-allocate-write sequence
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+
+                    # ── Allocate ID (under lock — no TOCTOU window) ──────────
+                    # Also check archive to prevent collision with archived IDs (ISSUE-2168)
+                    matches = re.findall(r"DEC-(\d+)", content)
+                    archive_path = self._get_archive_path("DECISIONS")
+                    if archive_path and archive_path.exists():
+                        try:
+                            matches.extend(
+                                re.findall(r"DEC-(\d+)", archive_path.read_text())
+                            )
+                        except (PermissionError, UnicodeDecodeError):
+                            pass
+
+                    if matches:
+                        highest = max(int(n) for n in matches)
+                        dec_num = highest + 1
+                    else:
+                        dec_num = 1
+                    decision_id = f"DEC-{dec_num:03d}"
+
+                    # ── Build block ──────────────────────────────────────────
+                    new_decision = f"""
+### {decision_id} | {today} | {category} | {status} | {title}
+
+**Context:** {context}
+
+**Decision:** {decision}
+
+**Rationale:** {rationale}
+
+**Status:** {status}
+
+**Category:** {category}
+
+**Related:** {related_str}
+
+**Source:** {source}
+
+---
+
+"""
+
+                    # ── Insert after "## Active Decisions" header ────────────
+                    _adm = re.search(r'^(## Active Decisions[^\n]*\n)', content, re.MULTILINE)
+                    if not _adm:
+                        raise GovernanceFileError("Malformed file: '## Active Decisions' header not found")
+
+                    content = content[:_adm.end()] + new_decision + content[_adm.end():]
+
+                    # Update metadata
+                    content = self._update_decisions_metadata(content)
+
+                    # Post-write assertion: verify insertion actually occurred (IDEA-1245)
+                    if decision_id not in content:
+                        raise GovernanceFileError(
+                            f"Insertion failed — {decision_id} not found in modified content "
+                            "(section header mismatch or replacement no-op). File not written."
+                        )
+
+                    # ── Atomic write (crash-safe tempfile+os.replace) ─────────
+                    # Lock is held during write so no other process reads mid-write
+                    atomic_write(file_path, content)
+
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        except FileNotFoundError:
+            raise GovernanceFileNotFoundError(f"File not found: {file_path}")
+        except PermissionError as e:
+            raise GovernanceFileError(f"Permission denied: {e}")
+
+        return decision_id
 
     def insert_lesson(
         self,
