@@ -208,6 +208,37 @@ if [[ -f "$A14_LOG" ]]; then
     fi
 fi
 
+# 9. Phase B observer: first real end_turn session logged since Phase B deployment (2026-04-23T02:33)
+# Phase B added early_exit logging to evidence_gate.py to diagnose 8-day silence.
+# This trigger fires once when a real working session's end_turn event appears in the log,
+# then self-disables. Determines Phase C target: H1 (silent early-return) vs H2 (crash).
+PHASE_B_FLAG="$HOME/.claude/logs/.phase-b-observed"
+if [[ -f "$GATE_LOG" ]] && [[ ! -f "$PHASE_B_FLAG" ]]; then
+    PHASE_B_ENTRY=$(jq -r 'select(
+        .timestamp >= "2026-04-23T02:33" and
+        .outcome != "early_exit" and
+        (.tool_refs_count // 0) >= 1
+    ) | "\(.timestamp) outcome=\(.outcome) tool_refs=\(.tool_refs_count)"' \
+        "$GATE_LOG" 2>/dev/null | head -1 || true)
+    if [[ -n "$PHASE_B_ENTRY" ]]; then
+        PHASE_B_OUTCOME=$(echo "$PHASE_B_ENTRY" | grep -oP 'outcome=\K[^ ]+')
+        echo "TRIGGERED: Phase B observation complete — first real end_turn session logged"
+        echo "  Entry: $PHASE_B_ENTRY"
+        if [[ "$PHASE_B_OUTCOME" == pass* ]]; then
+            echo "  Finding: Gate is working correctly for real sessions. Phase C = H2 cleanup only."
+            echo "  Phase C action: Add empty-stdin graceful handler in evidence_gate.py (return 0 with crash log entry, not bare exception). LOW risk."
+        else
+            echo "  Finding: Real session reached gate and was blocked ($PHASE_B_OUTCOME). Gate is evaluating. Phase C = confirm coverage + H2 cleanup."
+            echo "  Phase C action: (1) Verify block is legitimate. (2) Add empty-stdin graceful handler. LOW risk."
+        fi
+        PHASE_B_ENTRY_SAFE="${PHASE_B_ENTRY//\'/}"
+        echo "  Prompt for Phase C: Read ~/.claude/logs/evidence-gate.jsonl. Find entry: ${PHASE_B_ENTRY_SAFE}. Phase B confirmed end_turn sessions reach main evaluation. Phase C: add empty-stdin fallback to evidence_gate.py near line 4706 — on JSONDecodeError/empty stdin, log to evidence-gate-crashes.jsonl and return 0 (already partially done by Phase B; verify the handler covers blank-line input). Run /ship before committing. LOW risk, single-file."
+        echo ""
+        touch "$PHASE_B_FLAG"
+        TRIGGERED=$((TRIGGERED + 1))
+    fi
+fi
+
 # Writing Studio base dir (used by sections 8a and 8)
 STUDIO_DIR="$HOME/dev/projects/writing-studio"
 
@@ -309,7 +340,7 @@ for a in articles:
     fi
 fi
 
-# 9. Anomaly telemetry: IDEA-1295 — behavioral classes with >=3 Engram obs, no enforcement gate
+# 10. Anomaly telemetry: IDEA-1295 — behavioral classes with >=3 Engram obs, no enforcement gate
 ANOMALY_TELEMETRY="$HOME/bin/anomaly-telemetry.sh"
 if [[ -f "$ANOMALY_TELEMETRY" ]] && [[ -x "$ANOMALY_TELEMETRY" ]]; then
     ANOMALY_OUTPUT=$("$ANOMALY_TELEMETRY" 2>/dev/null || true)
