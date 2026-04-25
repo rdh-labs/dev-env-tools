@@ -43,6 +43,38 @@ if [[ -f "$GATE_LOG" ]]; then
     fi
 fi
 
+# 2.5: §8 trigger-vocabulary recurrence (IDEA-10022 / ISSUE-3321 / ISSUE-3322)
+# Threshold: > 5:1 trigger:ACK ratio over rolling 7-day window.
+# THRESHOLD STATUS: ASSUMPTION — not yet objectives-grounded. Calibration revisit
+# after 14 days of live data; if FP rate > 30%, re-derive against OBJECTIVES.md.
+ANOMALY_LOG="$HOME/.claude/logs/anomaly-detection.jsonl"
+if [[ -f "$ANOMALY_LOG" ]] && command -v jq >/dev/null 2>&1; then
+    # Cutoff format must match log timestamp format (no timezone).
+    # log_anomaly_event writes datetime.now().isoformat() = "2026-04-22T21:55:51.821144" (no TZ).
+    # Generating cutoff with TZ yields lexicographic mis-ordering ("+00:00" < "."). (codex-ask 2026-04-25)
+    WEEK_AGO=$(date -d '7 days ago' '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || date -v-7d '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo "")
+    if [[ -n "$WEEK_AGO" ]]; then
+        # Count unack'd triggers (the actual quantity of concern), not all triggers.
+        # Earlier "5:1 trigger:ACK ratio" was wrong because ack_present is a row-level
+        # field set TRUE for every trigger row in an ACKed response — clusters inflate
+        # ack count linearly with triggers. (codex-ask HIGH finding 2026-04-25)
+        UNACKD_TRIGGERS=$(jq -c --arg cutoff "$WEEK_AGO" \
+            'select(.pattern_matched=="anomaly_extended_trigger" and (.timestamp // "") >= $cutoff and .ack_present!=true)' \
+            "$ANOMALY_LOG" 2>/dev/null | wc -l)
+        TOTAL_TRIGGERS=$(jq -c --arg cutoff "$WEEK_AGO" \
+            'select(.pattern_matched=="anomaly_extended_trigger" and (.timestamp // "") >= $cutoff)' \
+            "$ANOMALY_LOG" 2>/dev/null | wc -l)
+        # Fire when there are >=5 unacknowledged triggers in the 7-day window.
+        if (( UNACKD_TRIGGERS >= 5 )); then
+            echo "TRIGGERED: §8 trigger-vocabulary unacknowledged — ${UNACKD_TRIGGERS} unack'd / ${TOTAL_TRIGGERS} total triggers over 7d (threshold: 5+ unack'd, ASSUMPTION-level)"
+            echo "  Source: IDEA-10022 telemetry (evidence_gate.py A5-Extended); ISSUE-3321 / ISSUE-3322 / ISSUE-3326"
+            echo "  Action: Review IDEA-10021 / IDEA-10028 priority — scanner build needed; telemetry has confirmed recurrence"
+            echo ""
+            TRIGGERED=$((TRIGGERED + 1))
+        fi
+    fi
+fi
+
 # 3. Engram observation count (requires engram MCP - fallback to file count)
 ENGRAM_DB="$HOME/.local/share/engram/engram.db"
 if [[ -f "$ENGRAM_DB" ]]; then
