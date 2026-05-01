@@ -383,6 +383,42 @@ if [[ -f "$ANOMALY_TELEMETRY" ]] && [[ -x "$ANOMALY_TELEMETRY" ]]; then
     fi
 fi
 
+# 11. Pending governance merge files: staged content waiting for next-session merge
+# Created when governance_claim_gate blocks direct filing during a session.
+# Frontmatter: pending_for (target file), insert_before (anchor), session, created.
+while IFS= read -r pf; do
+    # Pass $pf as argv[1] — not interpolated into Python source to avoid injection (codex HIGH finding)
+    FRONT=$(python3 -c "
+import re, sys
+fields = {'pending_for': 'unknown', 'insert_before': 'unknown', 'session': 'unknown', 'created': 'unknown'}
+in_front = False
+for line in open(sys.argv[1]):
+    s = line.strip()
+    if s == '---':
+        if in_front: break
+        in_front = True
+        continue
+    if in_front:
+        m = re.match(r'^([\w_]+):\s*(.+)', s)
+        if m: fields[m.group(1)] = m.group(2).strip('\"')
+for k in ['pending_for','insert_before','session','created']:
+    print(fields[k])
+" "$pf" 2>/dev/null || true)
+    if [[ -z "$FRONT" ]]; then continue; fi
+    PENDING_FOR=$(printf '%s\n' "$FRONT" | sed -n '1p'); PENDING_FOR="${PENDING_FOR:-unknown}"
+    INSERT_BEFORE=$(printf '%s\n' "$FRONT" | sed -n '2p'); INSERT_BEFORE="${INSERT_BEFORE:-unknown}"
+    SESSION_ID=$(printf '%s\n' "$FRONT" | sed -n '3p'); SESSION_ID="${SESSION_ID:-unknown}"
+    CREATED=$(printf '%s\n' "$FRONT" | sed -n '4p'); CREATED="${CREATED:-unknown}"
+    FNAME=$(basename "$pf")
+    echo "TRIGGERED: Pending governance merge — ${FNAME} (session ${SESSION_ID}, created ${CREATED})"
+    echo "  File: $pf"
+    echo "  Merge into: ${PENDING_FOR} before '${INSERT_BEFORE}'"
+    echo "  Action: Insert content after frontmatter block, commit + push dev-env-docs, delete staging file"
+    echo "  Prompt: Merge pending governance file: read ${pf} frontmatter for insert location, insert content (lines after closing '---') into ~/dev/infrastructure/dev-env-docs/${PENDING_FOR} immediately before '${INSERT_BEFORE}'. Run /ship, commit + push dev-env-docs, delete ${pf}."
+    echo ""
+    TRIGGERED=$((TRIGGERED + 1))
+done < <(find "$HOME/dev/share" -maxdepth 1 -type f -name "pending-*.md" 2>/dev/null)
+
 if (( TRIGGERED == 0 )); then
     # Silent when nothing triggered - don't add noise
     exit 0
