@@ -198,7 +198,7 @@ class GovernanceFileEditor:
 
         Raises GovernanceFileError if a foreign live claim blocks the write.
         """
-        if not _WORK_CLAIMS_AVAILABLE or _work_claims is None:
+        if not _WORK_CLAIMS_AVAILABLE:
             return None
         if _work_claims.bypass_active():
             return None
@@ -207,6 +207,7 @@ class GovernanceFileEditor:
             return None
 
         session_id = _get_session_id()
+        self._claim_session_id = session_id  # cached for _release_claim
         slug = self._claim_slug(file_path)
         ttl = _work_claims.claimed_file_ttl(abs_path)
 
@@ -236,10 +237,11 @@ class GovernanceFileEditor:
 
     def _release_claim(self, slug: Optional[str], file_path: Path) -> None:
         """Release a claim acquired by _ensure_claim. Non-blocking on failure."""
-        if slug is None or not _WORK_CLAIMS_AVAILABLE or _work_claims is None:
+        if slug is None or not _WORK_CLAIMS_AVAILABLE:
             return
+        session_id = getattr(self, "_claim_session_id", None) or _get_session_id()
         try:
-            _work_claims.release(slug, session_id=_get_session_id())
+            _work_claims.release(slug, session_id=session_id)
         except _work_claims.ClaimNotOwned as exc:
             # Session ID mismatch between acquire and release — log but don't raise.
             # Indicates _get_session_id() returned different values in the same session,
