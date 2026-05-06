@@ -430,6 +430,91 @@ for k in ['pending_for','insert_before','session','created']:
     TRIGGERED=$((TRIGGERED + 1))
 done < <(find "$HOME/dev/share" -maxdepth 1 -type f -name "pending-*.md" 2>/dev/null)
 
+# 12. User-prompted QC-gate accumulation (IDEA-10135 Tier 1(b) / L-654)
+# Each event = user asked "have you run all QC" after agent declared Done.
+# Advisory below threshold; TRIGGERED above (3+ events, 3+ sessions).
+UPQ_LOG="$HOME/.claude/.phase-qc/user-prompted-qc-gate.jsonl"
+if [[ -f "$UPQ_LOG" ]]; then
+    UPQ_COUNT=$(grep -c '.' "$UPQ_LOG" 2>/dev/null || echo 0)
+    UPQ_SESSIONS=$(jq -rc 'try .session_id' "$UPQ_LOG" 2>/dev/null | grep -v '^null$' | sort -u | wc -l)
+    if (( UPQ_COUNT >= 1 )); then
+        echo "WATCH: User-prompted QC-gate — ${UPQ_COUNT} event(s) across ${UPQ_SESSIONS} session(s) (IDEA-10135 / L-654)"
+        echo "  Each event = user asked 'are you satisfied / have you run all QC' after agent declared done"
+        echo "  Log: ${UPQ_LOG}"
+        if (( UPQ_COUNT >= 3 && UPQ_SESSIONS >= 3 )); then
+            echo "  THRESHOLD CROSSED: structural enforcement candidate — review L-522 promotion for related advisory scanners"
+            echo "  Action: Inspect log entries; evaluate blocking promotion per IDEA-10135 Tier 2(a)"
+            echo ""
+            TRIGGERED=$((TRIGGERED + 1))
+        else
+            echo ""
+        fi
+    fi
+fi
+
+# 13. Parking→Active auto-promotion (IDEA-10135 Tier 3(c))
+# Scan IDEAS-BACKLOG.md for Parking IDEAs whose linked ISSUE has >= 3 recurrences.
+BACKLOG="$HOME/dev/infrastructure/dev-env-docs/IDEAS-BACKLOG.md"
+ISSUES_TRACKER="$HOME/dev/infrastructure/dev-env-docs/ISSUES-TRACKER.md"
+if [[ -f "$BACKLOG" ]] && [[ -f "$ISSUES_TRACKER" ]]; then
+    PARKING_CANDIDATES=$(python3 - <<'PYEOF'
+import re, sys
+from pathlib import Path
+
+backlog = Path.home() / "dev/infrastructure/dev-env-docs/IDEAS-BACKLOG.md"
+issues = Path.home() / "dev/infrastructure/dev-env-docs/ISSUES-TRACKER.md"
+
+issues_text = issues.read_text(errors="replace")
+
+# Parse Parking IDEAs: find IDEA blocks with Status: Parking
+idea_re = re.compile(r"^### (IDEA-\d+):.*?(?=^### |\Z)", re.M | re.S)
+status_re = re.compile(r"^\*\*Status:\*\*\s*Parking\b", re.M)
+issue_ref_re = re.compile(r"\b(ISSUE-\d+)\b")
+
+# Count recurrences for an ISSUE in issues_text
+def recurrence_count(issue_id: str) -> int:
+    # Match "Recurrence #N" or "Recurrence —" patterns in the issue's section
+    issue_section_re = re.compile(
+        rf"^### {re.escape(issue_id)}\b.*?(?=^### |\Z)", re.M | re.S
+    )
+    m = issue_section_re.search(issues_text)
+    if not m:
+        return 0
+    section = m.group(0)
+    return len(re.findall(r"\*\*Recurrence\b", section))
+
+promoted = []
+promoted_ideas: set = set()  # deduplicate: one notification per IDEA regardless of linked-ISSUE count
+for m in idea_re.finditer(backlog.read_text(errors="replace")):
+    block = m.group(0)
+    if not status_re.search(block):
+        continue
+    idea_id = re.match(r"^### (IDEA-\d+)", block).group(1)
+    if idea_id in promoted_ideas:
+        continue
+    linked_issues = issue_ref_re.findall(block)
+    for issue_id in set(linked_issues):
+        rc = recurrence_count(issue_id)
+        if rc >= 3:
+            promoted.append(f"{idea_id} (linked {issue_id} has {rc} recurrences)")
+            promoted_ideas.add(idea_id)
+            break  # first qualifying ISSUE is enough; don't fire per-ISSUE
+
+for p in promoted:
+    print(p)
+PYEOF
+    )
+    if [[ -n "$PARKING_CANDIDATES" ]]; then
+        while IFS= read -r candidate; do
+            echo "TRIGGERED: Parking→Active auto-promotion candidate — ${candidate}"
+            echo "  Linked ISSUE recurrence count meets DEC-297 threshold (>=3)"
+            echo "  Action: Update Status: Parking → Active in IDEAS-BACKLOG.md for this IDEA"
+            echo ""
+            TRIGGERED=$((TRIGGERED + 1))
+        done <<< "$PARKING_CANDIDATES"
+    fi
+fi
+
 if (( TRIGGERED == 0 )); then
     # Silent when nothing triggered - don't add noise
     exit 0
