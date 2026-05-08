@@ -516,22 +516,23 @@ PYEOF
 fi
 
 # 7. A56 promotion-review readiness (IDEA-10176)
-# Threshold: ≥10 real production-session firings in ~/.claude/logs/anthropic-claim-scanner.jsonl
-# WATCH at ≥5 entries; TRIGGERED at ≥10.
+# Gate on SESSIONS (distinct session_ids), not line count — evidence_gate.py writes one
+# JSONL entry per claim per file (7518-7529), so wc -l overcounts vs session firings.
+# WATCH at >=5 sessions; TRIGGERED at >=10 sessions.
 A56_LOG="$HOME/.claude/logs/anthropic-claim-scanner.jsonl"
 if [[ -f "$A56_LOG" ]]; then
     A56_COUNT=$(wc -l < "$A56_LOG")
     A56_SESSIONS=$(jq -r 'select(.session_id != null and .session_id != "") | .session_id' "$A56_LOG" 2>/dev/null | sort -u | wc -l)
-    if (( A56_COUNT >= 10 )); then
-        echo "TRIGGERED: A56 promotion-review ready -- ${A56_COUNT} production firings across ${A56_SESSIONS} session(s) (threshold: >=10)"
+    if (( A56_SESSIONS >= 10 )); then
+        echo "TRIGGERED: A56 promotion-review ready -- ${A56_SESSIONS} distinct session(s) with firing (${A56_COUNT} total entries) (threshold: >=10 sessions)"
         echo "  Dart: https://app.dartai.com/t/7UboIBeXdOZH (test_cross_session_fp) | https://app.dartai.com/t/OFP5py5GO7iW (structural gap)"
         echo "  Action: Implement ~/bin/a56-promotion-review.py per IDEA-10176 spec"
-        echo "  Prompt: Implement IDEA-10176: build ~/bin/a56-promotion-review.py. Pre-flight passed (${A56_COUNT} entries). Read IDEA-10176 in ~/dev/infrastructure/dev-env-docs/IDEAS-BACKLOG.md. Log at ~/.claude/logs/anthropic-claim-scanner.jsonl (not .phase-qc -- spec bug fixed commit b2aff38)."
+        echo "  Prompt: Implement IDEA-10176: build ~/bin/a56-promotion-review.py. Pre-flight passed (${A56_SESSIONS} sessions). Read IDEA-10176 in ~/dev/infrastructure/dev-env-docs/IDEAS-BACKLOG.md. Log at ~/.claude/logs/anthropic-claim-scanner.jsonl (not .phase-qc -- spec bug fixed commit b2aff38)."
         echo ""
         TRIGGERED=$((TRIGGERED + 1))
-    elif (( A56_COUNT >= 5 )); then
-        echo "WATCH: A56 promotion-review -- ${A56_COUNT} production firings logged (need >=10 to implement IDEA-10176)"
-        echo "  Continue accumulating; trigger fires at >=10 entries in ~/.claude/logs/anthropic-claim-scanner.jsonl"
+    elif (( A56_SESSIONS >= 5 )); then
+        echo "WATCH: A56 promotion-review -- ${A56_SESSIONS} distinct session(s) with firing (need >=10 to implement IDEA-10176)"
+        echo "  Continue accumulating; trigger fires at >=10 distinct sessions in ~/.claude/logs/anthropic-claim-scanner.jsonl"
         echo ""
     fi
 fi
