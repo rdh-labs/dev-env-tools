@@ -93,6 +93,32 @@ class GovernanceFileNotFoundError(GovernanceFileError):
     pass
 
 
+_EDITS_LOG = Path.home() / ".claude" / ".session-edits" / "edits.jsonl"
+
+
+def _log_to_edits_jsonl(file_path: Path) -> None:
+    """Append a write entry to edits.jsonl so A62 can count GovernanceFileEditor writes.
+
+    Mirrors the format written by session_edit_log.py PostToolUse hook. Fail-open:
+    any error is silently ignored — never block the caller.
+    """
+    try:
+        import hashlib
+        sha = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "session_key": _get_session_id(),
+            "tool": "GovernanceFileEditor",
+            "file": str(file_path.resolve()),
+            "sha256": sha,
+        }
+        _EDITS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _EDITS_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # fail-open: never block the caller
+
+
 def atomic_write(file_path: Path, content: str) -> None:
     """
     Write file atomically to prevent corruption.
@@ -126,6 +152,9 @@ def atomic_write(file_path: Path, content: str) -> None:
         except:
             pass
         raise GovernanceFileError(f"Atomic write failed: {e}")
+
+    # Log to edits.jsonl so A62 Trigger 1 counts this write (fix for A62 Bug 1)
+    _log_to_edits_jsonl(file_path)
 
 
 class GovernanceFileEditor:
