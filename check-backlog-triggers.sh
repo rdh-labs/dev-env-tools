@@ -442,8 +442,8 @@ if [[ -f "$UPQ_LOG" ]]; then
         echo "  Each event = user asked 'are you satisfied / have you run all QC' after agent declared done"
         echo "  Log: ${UPQ_LOG}"
         if (( UPQ_COUNT >= 3 && UPQ_SESSIONS >= 3 )); then
-            echo "  THRESHOLD CROSSED: structural enforcement candidate — review L-522 promotion for related advisory scanners"
-            echo "  Action: Inspect log entries; evaluate blocking promotion per IDEA-10135 Tier 2(a)"
+            echo "  THRESHOLD CROSSED: structural enforcement candidate — review Tier 4 within-session threshold"
+            echo "  Action: Correlate UPQ cross-session count with within-session ledger (~/.claude/.phase-qc/within-session-l654-intercept.jsonl); evaluate IDEA-10173 falsifier criteria (next eval: 2026-06-14; decision log: IDEA-10135 Tier 4 note 2026-05-17)"
             echo ""
             TRIGGERED=$((TRIGGERED + 1))
         else
