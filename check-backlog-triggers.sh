@@ -537,6 +537,28 @@ if [[ -f "$A56_LOG" ]]; then
     fi
 fi
 
+# BACKLOG-DRIFT. High Dart queue burn-down signal (IDEA-10307 Tier 1)
+# Fires when >=8 of the top-10 cached open Dart tasks are HIGH priority.
+# Signals backlog drift — tasks accumulating faster than they close.
+# "no close >7d" filter deferred to Tier 2 (session_state_appender.py tracking).
+DART_CACHE="$HOME/.claude/.dart-queue-cache.json"
+if [[ -f "$DART_CACHE" ]]; then
+    HIGH_COUNT=$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads(Path.home().joinpath('.claude/.dart-queue-cache.json').read_text())
+print(sum(1 for t in data.get('top_tasks', [])[:10] if t.get('priority', '').lower() == 'high'))
+" 2>/dev/null || echo "0")
+    if (( HIGH_COUNT >= 8 )); then
+        echo "TRIGGERED: [BACKLOG-DRIFT] ${HIGH_COUNT}/10 top Dart tasks are HIGH priority (threshold: >=8) — close 2+ HIGH items before opening new work"
+        echo "  Dart: https://app.dartai.com/t/JO2DwufcIeKT"
+        echo "  Action: Close or defer 2 existing HIGH tasks before starting new work this session"
+        echo "  Prompt: Backlog drift signal: ${HIGH_COUNT} HIGH-priority tasks open (top 10). Run /queue then close or defer at least 2 HIGH items before opening new work. IDEA-10307."
+        echo ""
+        TRIGGERED=$((TRIGGERED + 1))
+    fi
+fi
+
 if (( TRIGGERED == 0 )); then
     # Silent when nothing triggered - don't add noise
     exit 0
