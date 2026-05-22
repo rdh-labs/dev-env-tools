@@ -96,15 +96,13 @@ class GovernanceFileNotFoundError(GovernanceFileError):
 _EDITS_LOG = Path.home() / ".claude" / ".session-edits" / "edits.jsonl"
 
 
-def _log_to_edits_jsonl(file_path: Path) -> None:
+def _log_to_edits_jsonl(file_path: Path, sha: str) -> None:
     """Append a write entry to edits.jsonl so A62 can count GovernanceFileEditor writes.
 
     Mirrors the format written by session_edit_log.py PostToolUse hook. Fail-open:
-    any error is silently ignored — never block the caller.
+    OSError/ValueError are silently ignored — never block the caller.
     """
     try:
-        import hashlib
-        sha = hashlib.sha256(file_path.read_bytes()).hexdigest()
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "session_key": _get_session_id(),
@@ -115,7 +113,7 @@ def _log_to_edits_jsonl(file_path: Path) -> None:
         _EDITS_LOG.parent.mkdir(parents=True, exist_ok=True)
         with _EDITS_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
-    except Exception:
+    except (OSError, ValueError):
         pass  # fail-open: never block the caller
 
 
@@ -133,6 +131,10 @@ def atomic_write(file_path: Path, content: str) -> None:
     Raises:
         GovernanceFileError: On write failure
     """
+    import hashlib
+    encoded = content.encode('utf-8')
+    sha = hashlib.sha256(encoded).hexdigest()
+
     dir_path = file_path.parent
 
     # Create temp file in same directory (required for atomic replace)
@@ -140,7 +142,7 @@ def atomic_write(file_path: Path, content: str) -> None:
 
     try:
         # Write to temp file
-        os.write(fd, content.encode('utf-8'))
+        os.write(fd, encoded)
         os.close(fd)
 
         # Atomic replace (POSIX guarantees atomicity)
@@ -154,7 +156,7 @@ def atomic_write(file_path: Path, content: str) -> None:
         raise GovernanceFileError(f"Atomic write failed: {e}")
 
     # Log to edits.jsonl so A62 Trigger 1 counts this write (fix for A62 Bug 1)
-    _log_to_edits_jsonl(file_path)
+    _log_to_edits_jsonl(file_path, sha)
 
 
 class GovernanceFileEditor:
