@@ -537,23 +537,16 @@ if [[ -f "$A56_LOG" ]]; then
     fi
 fi
 
-# BACKLOG-DRIFT. High Dart queue burn-down signal (IDEA-10307 Tier 1)
-# Fires when >=8 of the top-10 cached open Dart tasks are HIGH priority.
-# Signals backlog drift — tasks accumulating faster than they close.
-# "no close >7d" filter deferred to Tier 2 (session_state_appender.py tracking).
-DART_CACHE="$HOME/.claude/.dart-queue-cache.json"
-if [[ -f "$DART_CACHE" ]]; then
-    HIGH_COUNT=$(python3 -c "
-import json
-from pathlib import Path
-data = json.loads(Path.home().joinpath('.claude/.dart-queue-cache.json').read_text())
-print(sum(1 for t in data.get('top_tasks', [])[:10] if t.get('priority', '').lower() == 'high'))
-" 2>/dev/null || echo "0")
-    if (( HIGH_COUNT >= 8 )); then
-        echo "TRIGGERED: [BACKLOG-DRIFT] ${HIGH_COUNT}/10 top Dart tasks are HIGH priority (threshold: >=8) — close 2+ HIGH items before opening new work"
-        echo "  Dart: https://app.dartai.com/t/JO2DwufcIeKT"
-        echo "  Action: Close or defer 2 existing HIGH tasks before starting new work this session"
-        echo "  Prompt: Backlog drift signal: ${HIGH_COUNT} HIGH-priority tasks open (top 10). Run /queue then close or defer at least 2 HIGH items before opening new work. IDEA-10307."
+# BACKLOG-DRIFT. High Dart queue burn-down signal (IDEA-10307 Tier 1, FULL gate).
+# Full two-condition logic (HIGH>=8 AND no HIGH closed in >7d) lives in the tested,
+# pure-cache-read unit backlog-drift-check.sh (tests: tests/test-backlog-drift.sh).
+# last_high_closed_at is populated by dart_queue_surface.py's live query. Resolved by
+# absolute path (PATH-independent); `|| true` guarantees it can never abort this script.
+_BACKLOG_DRIFT_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/backlog-drift-check.sh"
+if [[ -x "$_BACKLOG_DRIFT_HELPER" ]]; then
+    DRIFT_OUT=$("$_BACKLOG_DRIFT_HELPER" 2>/dev/null || true)
+    if [[ -n "$DRIFT_OUT" ]]; then
+        echo "$DRIFT_OUT"
         echo ""
         TRIGGERED=$((TRIGGERED + 1))
     fi
@@ -570,6 +563,8 @@ echo "=== ${TRIGGERED} backlog trigger(s) ready for action ==="
 # Without this, triggers only appear in session startup text — relying on
 # human attention to notice them. Push ensures awareness even if session
 # output is long or skimmed.
-if command -v notify.sh &>/dev/null; then
+# BACKLOG_TRIGGERS_NO_NOTIFY=1 suppresses the push (used by integration tests so a
+# fixture run never sends a real notification).
+if [[ "${BACKLOG_TRIGGERS_NO_NOTIFY:-0}" != "1" ]] && command -v notify.sh &>/dev/null; then
     notify.sh "Backlog Triggers" "${TRIGGERED} trigger(s) ready for action — check session output" --priority default --channel auto 2>/dev/null || true
 fi
