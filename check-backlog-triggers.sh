@@ -586,6 +586,87 @@ if [[ -x "$_BACKLOG_DRIFT_HELPER" ]]; then
     fi
 fi
 
+# 14. Safety-aging guardrail (Phase-1 C1, IDEA-1170 / ISSUE-3264 anti-black-hole)
+# Surface aging OPEN safety-relevant ISSUES-TRACKER.md entries so a concurrency/
+# safety issue cannot sit unaddressed for weeks (ISSUE-3264 sat ~5 weeks). Emits a
+# TRIGGERED prompt line only; invokes NO skill (Link-4 surfacing, not a backlog task).
+# COMPONENT-scope is PRIMARY (per multi-check — catches dangerous false-negatives that
+# keyword-matching misses, e.g. "next-session skips available tasks" with no safety
+# keyword); the KEYWORD branch is gated on severity >= HIGH. Capped at the 5 oldest to
+# bound noise. Review-missed feedback loop: when a real safety bug surfaces that this
+# check missed, append it to ~/.claude/logs/safety-aging-check-misses.jsonl (mirror the
+# log-gap-miss pattern) so the component/keyword lists can evolve and recall is measurable.
+ISSUES_TRACKER_SA="${ISSUES_TRACKER_SA:-$HOME/dev/infrastructure/dev-env-docs/ISSUES-TRACKER.md}"
+if [[ -f "$ISSUES_TRACKER_SA" ]]; then
+    SAFETY_AGING=$(python3 - "$ISSUES_TRACKER_SA" <<'PYEOF' 2>/dev/null || true
+import re, sys
+from datetime import date, datetime
+
+text = open(sys.argv[1], errors="replace").read()
+# Header: "### ISSUE-NNNN | YYYY-MM-DD | STATUS | SEVERITY | title"
+hdr = re.compile(r"^### (ISSUE-\d+) \| (\d{4}-\d{2}-\d{2}) \| ([\w-]+) \| (\w+) \| (.+)$", re.M)
+# Claim INFRASTRUCTURE referenced in the TITLE (the issue is genuinely ABOUT the
+# feature, not an incidental body mention). Component-scope is PRIMARY.
+COMPONENT = re.compile(r"work_?claims|work-claims|\.work-claims|session_registry|claim-gate", re.I)
+# next-session issues that are concurrency-relevant (the ISSUE-3264 / R4 class) —
+# NOT prompt-placement/handoff PROCESS issues that merely touch the command name.
+NEXTSESSION = re.compile(r"next-session", re.I)
+CONCURRENCY = re.compile(r"concurren|simultaneo|parallel|in.?progress|race|two (agents|sessions)|peer session|duplicat", re.I)
+# Keyword safety-net: CRITICAL severity ONLY. Measured on the live tracker, the
+# broad safety vocabulary at severity>=HIGH matched ~48% of the OPEN backlog —
+# noise that would defeat the anti-black-hole goal (a 150-item "trigger" is wallpaper).
+# Tightened to CRITICAL; lists evolve via the miss-log feedback loop above.
+KEYWORD = re.compile(r"concurren|race|deadlock|TOCTOU|reentran|corrupt|data.?loss|zombie|ghost|atomic|isolation|\block\b", re.I)
+NOISE = re.compile(r"session cookie", re.I)
+AGE_DAYS = 14
+today = date.today()
+
+heads = list(hdr.finditer(text))
+out = []
+for i, m in enumerate(heads):
+    iid, datestr, status, severity, title = m.groups()
+    if status.upper() != "OPEN":
+        continue
+    end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+    section = title + "\n" + text[m.end():end]
+    try:
+        age = (today - datetime.strptime(datestr, "%Y-%m-%d").date()).days
+    except ValueError:
+        continue
+    if age <= AGE_DAYS:
+        continue
+    sev = severity.upper()
+    comp = COMPONENT.search(title) is not None
+    ns = NEXTSESSION.search(title) is not None and CONCURRENCY.search(section) is not None
+    kw = sev == "CRITICAL" and KEYWORD.search(section) is not None and NOISE.search(section) is None
+    if comp or ns or kw:
+        reason = "claim-infra" if comp else ("next-session/concur" if ns else "crit-safety")
+        out.append((age, iid, sev, reason, title.strip()[:70]))
+out.sort(reverse=True)  # oldest first
+for age, iid, sev, reason, title in out[:5]:
+    print("%d|%s|%s|%s|%s" % (age, iid, sev, reason, title))
+print("#COUNT#%d" % len(out))
+PYEOF
+)
+    SA_COUNT=$(printf '%s\n' "$SAFETY_AGING" | sed -n 's/^#COUNT#//p')
+    # Guard arithmetic under set -u: ensure SA_COUNT is purely numeric (codex LOW —
+    # a non-numeric token in (( )) can raise and abort this SessionStart script).
+    [[ "$SA_COUNT" =~ ^[0-9]+$ ]] || SA_COUNT=0
+    if (( SA_COUNT > 0 )); then
+        echo "TRIGGERED: Safety-aging guardrail — ${SA_COUNT} OPEN safety-relevant issue(s) aging >14d (C1, ISSUE-3264 anti-black-hole)"
+        echo "  Oldest (age|id|severity|reason|title):"
+        # `|| true`: grep -v returns 1 on no match and the loop's last [[ ]]&&echo can
+        # return 1 — under pipefail either would abort the parent script (codex LOW).
+        printf '%s\n' "$SAFETY_AGING" | grep -v '^#COUNT#' | while IFS='|' read -r age iid sev reason title; do
+            [[ -n "$iid" ]] && echo "    ${age}d  ${iid}  ${sev}  (${reason})  ${title}"
+        done || true
+        echo "  Action: triage the oldest safety-relevant OPEN issue, or annotate why it remains deferred."
+        echo "  Miss-log (append on missed safety bug): ~/.claude/logs/safety-aging-check-misses.jsonl"
+        echo ""
+        TRIGGERED=$((TRIGGERED + 1))
+    fi
+fi
+
 if (( TRIGGERED == 0 )); then
     # Silent when nothing triggered - don't add noise
     exit 0
