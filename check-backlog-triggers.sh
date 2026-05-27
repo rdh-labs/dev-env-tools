@@ -452,6 +452,40 @@ if [[ -f "$UPQ_LOG" ]]; then
     fi
 fi
 
+# 12b. Trust-spiral self-catch ratio (IDEA-10365 / IDEA-10135)
+# Autonomous catches = mechanism_feasibility_gate firings (the system caught an
+# infeasible/unverified mechanism WITHOUT a user L-654 prompt). Compared against
+# genuine user-prompted QC-gate events. Rising autonomous share = the system
+# increasingly catches its own errors before the user must (Tier-1 objective).
+# Note: user-prompted count is FP-filtered at read-time (excludes quoted-mechanism
+# references in pasted prompts) — the qc_gate_signal_detector suppression (IDEA-10365)
+# prevents NEW FPs; this filter also cleans PRE-FIX ledger entries non-destructively.
+MFC_LOG="$HOME/.claude/.phase-qc/mechanism-feasibility-catches.jsonl"
+if [[ -f "$MFC_LOG" ]] || [[ -f "$UPQ_LOG" ]]; then
+    AUTO_CATCHES=0
+    if [[ -f "$MFC_LOG" ]]; then
+        # grep -c prints "0" AND exits 1 on no match — use `|| true` (NOT `|| echo 0`,
+        # which would append a 2nd "0" → "0\n0" and break the arithmetic) (/simplify HIGH).
+        AUTO_CATCHES=$(grep -cE '"outcome": *"(block_|advisory_)' "$MFC_LOG" 2>/dev/null || true)
+        AUTO_CATCHES=${AUTO_CATCHES:-0}
+    fi
+    UPQ_GENUINE=0
+    if [[ -f "$UPQ_LOG" ]]; then
+        # -R 'fromjson?' tolerates malformed JSONL lines (a single bad line must not
+        # silently zero the metric — /ship HIGH); each surviving line is FP-filtered.
+        # `|| true` + default avoids the same grep -c "0\n0" arithmetic bug (/simplify HIGH).
+        UPQ_GENUINE=$(jq -rR 'fromjson? | select((.prompt_excerpt // "") | test("Working dir:|Model:[[:space:]]*(claude|gpt|gemini|opus|sonnet|glm)|Source report:|Next[0-9]?:"; "i") | not) | .session_id' "$UPQ_LOG" 2>/dev/null | grep -cv '^null$' || true)
+        UPQ_GENUINE=${UPQ_GENUINE:-0}
+    fi
+    TOTAL_CATCH=$(( AUTO_CATCHES + UPQ_GENUINE ))
+    if (( TOTAL_CATCH >= 1 )); then
+        PCT_AUTO=$(( AUTO_CATCHES * 100 / TOTAL_CATCH ))
+        echo "METRIC: Trust-spiral self-catch — ${AUTO_CATCHES} autonomous (mechanism_feasibility_gate) vs ${UPQ_GENUINE} user-prompted (genuine, FP-filtered) = ${PCT_AUTO}% autonomous (IDEA-10365/10135; higher = system catches more of its own errors)"
+        echo "  Logs: ${MFC_LOG}, ${UPQ_LOG}"
+        echo ""
+    fi
+fi
+
 # 13. Parking→Active auto-promotion (IDEA-10135 Tier 3(c))
 # Scan IDEAS-BACKLOG.md for Parking IDEAs whose linked ISSUE has >= 3 recurrences.
 BACKLOG="$HOME/dev/infrastructure/dev-env-docs/IDEAS-BACKLOG.md"
