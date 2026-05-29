@@ -586,6 +586,23 @@ if [[ -x "$_BACKLOG_DRIFT_HELPER" ]]; then
     fi
 fi
 
+# ARCH-REVIEW. Architecture re-evaluation tripwire (ISSUE-3405). Surfaces architectural
+# assumptions whose next_review date has arrived so the agent re-checks the FALSIFIER
+# against external developments (Anthropic changelog etc.) — the control loop the static
+# MCP-budget policy lacked. Logic + deterministic tests live in the pure-READ helper
+# architecture-review-check.sh (tests: tests/test-architecture-review.sh); it never runs
+# `claude mcp list` on this hot path. Resolved by absolute path; `|| true` guarantees it
+# can never abort this SessionStart script.
+_ARCH_REVIEW_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/architecture-review-check.sh"
+if [[ -x "$_ARCH_REVIEW_HELPER" ]]; then
+    ARCH_OUT=$("$_ARCH_REVIEW_HELPER" 2>/dev/null || true)
+    if [[ -n "$ARCH_OUT" ]]; then
+        echo "$ARCH_OUT"
+        echo ""
+        TRIGGERED=$((TRIGGERED + 1))
+    fi
+fi
+
 # 14. Safety-aging guardrail (Phase-1 C1, IDEA-1170 / ISSUE-3264 anti-black-hole)
 # Surface aging OPEN safety-relevant ISSUES-TRACKER.md entries so a concurrency/
 # safety issue cannot sit unaddressed for weeks (ISSUE-3264 sat ~5 weeks). Emits a
