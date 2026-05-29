@@ -1,0 +1,15 @@
+[Unit]
+Description=Run gem-ingest every 30 min + shortly after boot (catches up missed runs)
+
+[Timer]
+# Early run after boot so exports made while the laptop was off get picked up promptly.
+OnBootSec=2min
+# Wall-clock cadence; Persistent=true reruns any window missed while the laptop was off
+# (this is the property plain cron lacks — see ~/.claude memory on laptop offage).
+OnCalendar=*:0/30
+Persistent=true
+RandomizedDelaySec=60
+Unit=gem-ingest.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Gemini-Gems eval -> Engram ingestion wedge (idempotent, content-scanned)
+Documentation=file:///home/ichardart/dev/infrastructure/tools/gem-ingest/README.md
+
+[Service]
+Type=oneshot
+# Explicit PATH so read-docx (~/bin), pandoc (/usr/bin), engram (~/bin) resolve under systemd.
+Environment=PATH=/home/ichardart/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/ichardart/dev/infrastructure/tools/gem-ingest/gem_ingest.py --run
+Nice=10
+# Logs go to the journal: journalctl --user -u gem-ingest.service

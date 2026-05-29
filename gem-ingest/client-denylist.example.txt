@@ -1,0 +1,21 @@
+# gem-ingest client-name confidentiality denylist  (TEMPLATE — copy to ~/.config/gem-ingest/denylist.txt)
+#
+# One term per line. Lines starting with '#' are comments.
+#   - Plain lines      => case-insensitive substring match
+#   - Lines 're:<pat>' => Python regex (case-insensitive)
+# Any match QUARANTINES the item: it is NOT ingested into the KB, and is logged for manual review.
+#
+# CORRECTED PER QC: topic is not a safe proxy for confidentiality — a tech eval can still name a
+# client, incident, stack fingerprint, or contract. List anything that, if it appeared in a Gem
+# eval, would make that eval confidential:
+#   - client / organization names
+#   - individual names tied to engagements
+#   - incident identifiers, matter codes, contract numbers
+#   - project codenames
+#
+# Examples (illustrative — delete before use):
+# Acme Corporation
+# re:\bMATTER-\d{4,}\b
+#
+# SECURITY: the live denylist lives at ~/.config/gem-ingest/denylist.txt (chmod 600), OUTSIDE git.
+# Never commit real client names to this repo. This file is only the format template.
