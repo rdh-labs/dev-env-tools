@@ -47,11 +47,13 @@ SCHEMA_V = 1
 # Each entry maps a scanner_id to (predicate, pattern_sources, prefilter). ``predicate(text)``
 # returns True if the scanner would fire on an assistant response ``text``. ``pattern_sources``
 # is the list of raw regex pattern strings whose sha256 forms the fingerprint the gate binds to.
-# ``prefilter`` is a compiled necessary-condition regex (or None): files whose raw text the regex
-# does not match are skipped without JSON-parsing — a large speedup on the ~1096-file corpus (a
-# measurement that otherwise exceeds 180s on 6GB WSL2). It MUST use the SAME matching semantics as
-# the predicate's gating condition (case, flags), else it silently drops true fires (a substring
-# prefilter is WRONG when the predicate matches case-insensitively — it skips case/space variants).
+# ``prefilter`` is a LOWERCASED substring (or None) that is a NECESSARY condition of firing, checked
+# as ``prefilter in raw.lower()`` — files lacking it are skipped without JSON-parsing (a large speedup
+# on the ~1096-file corpus; the measurement otherwise exceeds 180s on 6GB WSL2). It MUST be lowercase
+# and a true necessary condition under the predicate's matching (A97's regex requires the literal,
+# case-insensitive, single-space "anomaly analysis", so that is the prefilter). A case-SENSITIVE
+# substring is WRONG when the predicate is case-insensitive; an anchored re.M regex prefilter is
+# correct but too slow at corpus scale (timed out >280s) — the lowercased substring is correct AND fast.
 #
 # EXTENSION POINT: when a new blocking scanner is added to evidence_gate's FP_GATE coverage,
 # add its predicate here (import its compiled regexes from evidence_gate, or reproduce them
@@ -102,12 +104,12 @@ def _a97_fires(text: str) -> bool:
     return True
 
 
-SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], re.Pattern | None]] = {
+SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], str | None]] = {
     "A97": (
         _a97_fires,
         # Every regex whose source+flags determine firing — sha256'd into the artifact fingerprint.
         [_A97_ANOMALY_RE, _A97_FENCE_RE, _A97_SELF_DETECT_RE, _A97_USER_ATTRIB_RE, _A97_DETECT_FAIL_RE],
-        _A97_ANOMALY_RE,   # prefilter = the predicate's necessary-condition regex (same case-insensitive semantics)
+        "anomaly analysis",   # lowercased necessary-condition substring (predicate requires case-insensitive "anomaly analysis")
     ),
 }
 
@@ -172,8 +174,8 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
                 raw = fh.read()
         except OSError:
             continue
-        if prefilter is not None and not prefilter.search(raw):
-            continue   # necessary-condition skip (same regex semantics as the predicate) — no JSON parse
+        if prefilter is not None and prefilter not in raw.lower():
+            continue   # necessary-condition skip (case-insensitive substring) — no JSON parse
         files_scanned += 1
         texts, failed = _assistant_texts_from_raw(raw)
         parse_failures += failed
