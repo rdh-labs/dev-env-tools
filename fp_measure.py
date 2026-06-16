@@ -47,10 +47,11 @@ SCHEMA_V = 1
 # Each entry maps a scanner_id to (predicate, pattern_sources, prefilter). ``predicate(text)``
 # returns True if the scanner would fire on an assistant response ``text``. ``pattern_sources``
 # is the list of raw regex pattern strings whose sha256 forms the fingerprint the gate binds to.
-# ``prefilter`` is a cheap REQUIRED substring (or None): files whose raw text lacks it are
-# skipped without JSON-parsing — a large speedup on the ~1096-file corpus (a measurement that
-# otherwise exceeds 180s on 6GB WSL2). The prefilter MUST be a necessary condition of firing
-# (the predicate can only match text containing it), else it would drop true fires.
+# ``prefilter`` is a compiled necessary-condition regex (or None): files whose raw text the regex
+# does not match are skipped without JSON-parsing — a large speedup on the ~1096-file corpus (a
+# measurement that otherwise exceeds 180s on 6GB WSL2). It MUST use the SAME matching semantics as
+# the predicate's gating condition (case, flags), else it silently drops true fires (a substring
+# prefilter is WRONG when the predicate matches case-insensitively — it skips case/space variants).
 #
 # EXTENSION POINT: when a new blocking scanner is added to evidence_gate's FP_GATE coverage,
 # add its predicate here (import its compiled regexes from evidence_gate, or reproduce them
@@ -101,56 +102,69 @@ def _a97_fires(text: str) -> bool:
     return True
 
 
-SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[str], str | None]] = {
+SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], re.Pattern | None]] = {
     "A97": (
         _a97_fires,
-        [_A97_ANOMALY_RE.pattern, _A97_SELF_DETECT_RE.pattern,
-         _A97_USER_ATTRIB_RE.pattern, _A97_DETECT_FAIL_RE.pattern],
-        "## Anomaly Analysis",   # prefilter: A97 can only fire inside an Anomaly Analysis section
+        # Every regex whose source+flags determine firing — sha256'd into the artifact fingerprint.
+        [_A97_ANOMALY_RE, _A97_FENCE_RE, _A97_SELF_DETECT_RE, _A97_USER_ATTRIB_RE, _A97_DETECT_FAIL_RE],
+        _A97_ANOMALY_RE,   # prefilter = the predicate's necessary-condition regex (same case-insensitive semantics)
     ),
 }
 
 
 # ── Corpus walk ──────────────────────────────────────────────────────────────
-def _assistant_texts_from_raw(raw: str):
-    """Yield each assistant-message text body from a pre-read JSONL string (one transcript file)."""
+def _assistant_texts_from_raw(raw: str) -> tuple[list[str], int]:
+    """Return (assistant-message text bodies, json-parse-failure count) from a transcript's raw JSONL.
+
+    Well-formed .jsonl is one object per line; a non-zero failure count signals embedded-newline /
+    pretty-printed records whose text would be silently missed — surfaced in the artifact so the
+    "complete fire set" claim is auditable rather than silently incomplete.
+    """
+    texts: list[str] = []
+    failures = 0
     for line in raw.splitlines():
+        if not line.strip():
+            continue
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
+            failures += 1
             continue
         msg = obj.get("message") or obj
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         content = msg.get("content")
         if isinstance(content, str):
-            yield content
+            texts.append(content)
         elif isinstance(content, list):
-            yield "".join(
+            texts.append("".join(
                 b.get("text", "") for b in content
                 if isinstance(b, dict) and b.get("type") == "text"
-            )
+            ))
+    return texts, failures
 
 
-def _fingerprint(pattern_sources: list[str]) -> str:
+def _fingerprint(patterns: list[re.Pattern]) -> str:
+    """sha256 over each regex's source AND flags — a flags-only change must also void the artifact."""
     h = hashlib.sha256()
-    for p in pattern_sources:
-        h.update(p.encode("utf-8"))
-        h.update(b"\x00")
+    for p in patterns:
+        h.update(p.pattern.encode("utf-8"))
+        h.update(f"|flags={p.flags}\x00".encode("utf-8"))
     return "sha256:" + h.hexdigest()
 
 
 def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
     """Replay scanner_id's predicate over the corpus; return the artifact dict (unlabeled)."""
     if scanner_id not in SCANNER_PREDICATES:
-        raise SystemExit(
+        raise ValueError(
             f"No predicate registered for {scanner_id}. Add it to SCANNER_PREDICATES "
             f"(import its regexes from evidence_gate). Registered: {sorted(SCANNER_PREDICATES)}"
         )
-    predicate, pattern_sources, prefilter = SCANNER_PREDICATES[scanner_id]
+    predicate, fingerprint_patterns, prefilter = SCANNER_PREDICATES[scanner_id]
     files = sorted(glob.glob(corpus_glob))
     total_scanned = 0
     files_scanned = 0
+    parse_failures = 0
     fires: list[dict] = []
     for fp in files:
         try:
@@ -158,10 +172,12 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
                 raw = fh.read()
         except OSError:
             continue
-        if prefilter and prefilter not in raw:
-            continue   # cheap necessary-condition skip — no JSON parse
+        if prefilter is not None and not prefilter.search(raw):
+            continue   # necessary-condition skip (same regex semantics as the predicate) — no JSON parse
         files_scanned += 1
-        for text in _assistant_texts_from_raw(raw):
+        texts, failed = _assistant_texts_from_raw(raw)
+        parse_failures += failed
+        for text in texts:
             if not text:
                 continue
             total_scanned += 1
@@ -177,10 +193,11 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
         "scanner_id": scanner_id,
         "schema_v": SCHEMA_V,
         "measured_at": datetime.now(timezone.utc).isoformat(),
-        "regex_fingerprint": _fingerprint(pattern_sources),
+        "regex_fingerprint": _fingerprint(fingerprint_patterns),
         "corpus_ref": "claude-projects-jsonl",
         "corpus_files_total": len(files),
-        "corpus_files_prefiltered": files_scanned,
+        "corpus_files_scanned": files_scanned,
+        "corpus_parse_failures": parse_failures,
         "corpus_size_responses": total_scanned,
         "fires_total": len(fires),
         "fires_labeled": 0,
@@ -217,7 +234,11 @@ def main() -> int:
     if not args.scanner_id:
         ap.error("scanner_id is required (or use --list)")
 
-    art = measure(args.scanner_id, args.corpus)
+    try:
+        art = measure(args.scanner_id, args.corpus)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if art["corpus_size_responses"] == 0:
         print(f"WARNING: corpus matched 0 assistant responses (glob={args.corpus!r}; "
               f"prefilter may have excluded every file) — measurement is not meaningful.",
