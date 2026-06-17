@@ -535,6 +535,10 @@ class SkillUpdateChecker:
             # Call OpenAI API
             import urllib.request
 
+            # IDEA-10394 audit (2026-06-17): "gpt-4o-mini" is a hard-coded pin, NOT routed through
+            # resolve-model — this calls api.openai.com directly and model-capabilities.yaml has no
+            # openai-direct provider (only codex-via-CLI). TODO(IDEA-10394 follow-up): add an
+            # openai-direct provider to the YAML, or migrate this summarizer to codex-ask, then resolve.
             request_data = {
                 "model": "gpt-4o-mini",
                 "messages": [
