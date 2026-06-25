@@ -221,6 +221,144 @@ def _summarize(art: dict) -> str:
     )
 
 
+# ── Finalize: re-derive fires_labeled + confirmed_fp from the inline fire labels ──────
+# fp_measure writes confirmed_fp=None + fires_labeled=0 at creation; a reviewer then sets
+# each fires[].label to TP/FP. NOTHING re-derived those two fields from the inline labels —
+# the "finalize step" that BOTH this module's docstring ("label each fire ... then re-derive
+# confirmed_fp") AND evidence_gate._fp_artifact_admits_promotion's docstring ("deferred until
+# ... the same finalize step that applies labels — documented limitation, not silent") name
+# as the missing link in the IDEA-10413 FP-substance promotion gate. This closes it: with the
+# finalizer wired to a trigger (cron/SessionStart), a labeled artifact's confirmed_fp is
+# derived automatically and the gate can admit — no manual re-derivation, no silent stall.
+# Idempotent. FAIL-LOUD: raises on a missing/unreadable/malformed artifact (a finalize that
+# cannot verify the labels must NOT write a count). 'unlabeled' and 'uncertain' both count as
+# NOT-resolved, so promotion stays held until every fire is a definite TP/FP.
+_RESOLVED_LABELS = frozenset({"TP", "FP"})
+_SCANNER_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _artifact_admits(art: dict) -> bool:
+    """Mirror of evidence_gate._fp_artifact_admits_promotion's admit conditions
+    (evidence_gate.py:682-695) — the promotion bar this finalizer feeds. Used to detect the
+    not-ready → ready TRANSITION so a cron --finalize-all notifies only on a genuine change."""
+    total, labeled, cfp = art.get("fires_total"), art.get("fires_labeled"), art.get("confirmed_fp")
+    return bool(isinstance(total, int) and isinstance(labeled, int) and total > 0
+                and labeled == total
+                and isinstance(cfp, int) and not isinstance(cfp, bool) and cfp == 0)
+
+
+def finalize(scanner_id: str) -> dict:
+    """Re-derive fires_labeled + confirmed_fp from the artifact's inline fire labels, write
+    them back, and update ``decision``. Returns a summary dict (``newly_ready`` is the
+    not-ready→ready TRANSITION, not the steady state). Raises (fail-loud) on an invalid id /
+    missing / unreadable / malformed artifact — never writes a count it could not verify."""
+    if not _SCANNER_ID_RE.fullmatch(scanner_id):
+        raise ValueError(
+            f"invalid scanner_id {scanner_id!r} (expected [A-Za-z0-9_-]+; refusing path traversal)")
+    path = ARTIFACT_DIR / f"{scanner_id}.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no FP artifact for {scanner_id} at {path} "
+            f"(run fp_measure.py {scanner_id} --write-artifact first)")
+    art = json.loads(path.read_text())  # JSONDecodeError propagates → fail-loud
+    fires = art.get("fires")
+    if not isinstance(fires, list):
+        raise ValueError(f"{path}: 'fires' is not a list — artifact malformed")
+    if any(not isinstance(f, dict) for f in fires):
+        raise ValueError(f"{path}: one or more fire entries are not objects — artifact malformed")
+    declared = art.get("fires_total")
+    if isinstance(declared, int) and declared != len(fires):
+        raise ValueError(
+            f"{path}: fires_total={declared} but len(fires)={len(fires)} — artifact malformed")
+    was_ready = _artifact_admits(art)  # prior state (before overwrite) for transition detection
+    # A label key absent OR non-string (e.g. JSON null) is "unlabeled", not an unknown label.
+    labels = [lab if isinstance((lab := f.get("label")), str) else "unlabeled" for f in fires]
+    total = len(fires)
+    resolved = sum(1 for lab in labels if lab in _RESOLVED_LABELS)
+    fp_count = sum(1 for lab in labels if lab == "FP")
+    unknown = sorted({lab for lab in labels
+                      if lab not in _RESOLVED_LABELS and lab not in ("unlabeled", "uncertain")})
+    complete = total > 0 and resolved == total
+    art["fires_total"] = total
+    art["fires_labeled"] = resolved
+    # confirmed_fp is an int ONLY when every fire is resolved; None otherwise keeps the gate
+    # held (evidence_gate requires confirmed_fp == int 0 AND fires_labeled == fires_total).
+    art["confirmed_fp"] = fp_count if complete else None
+    if complete and fp_count == 0:
+        art["decision"] = "ready-for-promotion (confirmed_fp==0, fully labeled)"
+    elif complete:
+        art["decision"] = f"hold: confirmed_fp={fp_count} (FP present in fire set)"
+    else:
+        art["decision"] = f"pending-labeling ({resolved}/{total} resolved)"
+    art["finalized_at"] = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps(art, indent=2))
+    return {
+        "scanner_id": scanner_id, "fires_total": total, "fires_labeled": resolved,
+        "confirmed_fp": art["confirmed_fp"], "decision": art["decision"],
+        "newly_ready": _artifact_admits(art) and not was_ready, "unknown_labels": unknown,
+    }
+
+
+def finalize_all() -> list[dict]:
+    """Finalize every artifact in ARTIFACT_DIR. A per-artifact error is CAUGHT and returned
+    as an ``error`` row (fail-loud per artifact: a broken one is reported, never silently
+    skipped, and does not abort the batch)."""
+    results: list[dict] = []
+    if not ARTIFACT_DIR.exists():
+        return results
+    for p in sorted(ARTIFACT_DIR.glob("*.json")):
+        try:
+            results.append(finalize(p.stem))
+        except Exception as e:  # noqa: BLE001 — report every failure, never silent
+            results.append({"scanner_id": p.stem, "error": f"{type(e).__name__}: {e}"})
+    return results
+
+
+def _notify_ready(ready_ids: list[str]) -> None:
+    """Best-effort push when scanner(s) become promotion-ready. Never raises (a notify
+    failure must not abort finalize); the failure is PRINTED (not silent)."""
+    if not ready_ids:
+        return
+    import subprocess
+    notify = Path.home() / "bin" / "notify.sh"
+    if not notify.exists():
+        print(f"[finalize] notify.sh absent — ready scanners NOT pushed: {ready_ids}", file=sys.stderr)
+        return
+    try:
+        result = subprocess.run(
+            [str(notify), "Scanner FP-gate",
+             f"Ready for blocking promotion: {', '.join(ready_ids)}",
+             "--priority", "high", "--channel", "auto"],
+            timeout=20, check=False)
+        if result.returncode != 0:
+            print(f"[finalize] notify.sh exited {result.returncode} — push NOT confirmed for "
+                  f"ready scanners: {ready_ids}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[finalize] notify failed ({e}) — ready scanners: {ready_ids}", file=sys.stderr)
+
+
+def _run_finalize_all() -> int:
+    """CLI entry for --finalize-all: finalize every artifact, print a summary, notify on
+    newly-ready, and exit NON-ZERO if any artifact errored (so a cron wrapper surfaces it —
+    no silent failure)."""
+    results = finalize_all()
+    if not results:
+        print(f"[finalize-all] no FP artifacts in {ARTIFACT_DIR}")
+        return 0
+    errors = [r for r in results if "error" in r]
+    ready = [r["scanner_id"] for r in results if r.get("newly_ready")]
+    for r in results:
+        if "error" in r:
+            print(f"  ERROR {r['scanner_id']}: {r['error']}", file=sys.stderr)
+        else:
+            extra = f"  [unknown labels: {r['unknown_labels']}]" if r["unknown_labels"] else ""
+            print(f"  {r['scanner_id']}: {r['fires_labeled']}/{r['fires_total']} resolved, "
+                  f"confirmed_fp={r['confirmed_fp']} — {r['decision']}{extra}")
+    _notify_ready(ready)
+    print(f"[finalize-all] {len(results)} artifact(s); {len(ready)} ready; {len(errors)} error(s)")
+    return 1 if errors else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Real-corpus FP measurement for evidence_gate scanners.")
     ap.add_argument("scanner_id", nargs="?", help="e.g. A97")
@@ -228,10 +366,34 @@ def main() -> int:
                     help=f"write {ARTIFACT_DIR}/<scanner_id>.json")
     ap.add_argument("--corpus", default=CORPUS_GLOB, help="corpus glob (default: session transcripts)")
     ap.add_argument("--list", action="store_true", help="list registered scanner predicates")
+    ap.add_argument("--finalize", action="store_true",
+                    help="re-derive fires_labeled + confirmed_fp from the artifact's inline "
+                         "labels for <scanner_id> and write them back (the FP-gate finalize step)")
+    ap.add_argument("--finalize-all", action="store_true",
+                    help="finalize every artifact in the fp-gate dir (cron/SessionStart entry); "
+                         "exits non-zero if any artifact errored")
     args = ap.parse_args()
 
     if args.list:
         print("Registered scanner predicates:", ", ".join(sorted(SCANNER_PREDICATES)) or "(none)")
+        return 0
+    if args.finalize_all:
+        return _run_finalize_all()
+    if args.finalize:
+        if not args.scanner_id:
+            ap.error("--finalize requires a scanner_id")
+        try:
+            summary = finalize(args.scanner_id)
+        except Exception as e:  # fail-loud: clear message + non-zero exit, never silent
+            print(f"finalize error ({args.scanner_id}): {type(e).__name__}: {e}", file=sys.stderr)
+            return 2
+        print(f"[finalize] {summary['scanner_id']}: "
+              f"{summary['fires_labeled']}/{summary['fires_total']} resolved, "
+              f"confirmed_fp={summary['confirmed_fp']} — {summary['decision']}")
+        if summary["unknown_labels"]:
+            print(f"  WARNING unknown labels present (treated as unresolved): "
+                  f"{summary['unknown_labels']}", file=sys.stderr)
+        _notify_ready([summary["scanner_id"]] if summary["newly_ready"] else [])
         return 0
     if not args.scanner_id:
         ap.error("scanner_id is required (or use --list)")
