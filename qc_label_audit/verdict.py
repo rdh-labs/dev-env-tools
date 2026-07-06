@@ -14,6 +14,16 @@ Pre-registered rules (locked in the approved plan BEFORE labeling):
        5–14 FP → INSUFFICIENT-EVIDENCE (honest band at this n). Wilson CI reported.
   b123 (ADVISORY, exploratory): report friction_rate + CI + per-concern breakdown; NO
        sunset verdict (precision-of-flag, upstream-confounded, recency-biased).
+
+  ⚠ DIRECTIONAL, NOT A MANDATE (DEC-320 / Dart qcL10RSMREjW, 2026-07-06): the A13 raw-count
+       rule is a SINGLE-SOURCE FP threshold, which is INADMISSIBLE as a standalone decision
+       basis. A printed "SUNSET-CANDIDATE" does NOT authorize action — a sunset/soften decision
+       additionally requires (i) admissible reliability (a rubric-based κ bar + a diagnosed
+       low-κ cause, not a bare Landis-Koch κ≥0.6 veto), (ii) a conservative (Wilson-lower) FP
+       over the trigger, and (iii) unconfounded friction. A13's 2026-07 verdict (FP=18 but
+       κ=0.275 and the corpus confounded with the already-fixed 2026-06-30 re-fire bug) was
+       DEFERRED, not actioned, on exactly these grounds. For a §8/safety enforcer, "soften"
+       means deepening the trigger — never an agent-settable bypass.
 """
 from __future__ import annotations
 
