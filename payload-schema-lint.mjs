@@ -187,4 +187,9 @@ try {
   process.exit(2)
 }
 
+// Machine-readable completion signal (stderr, so --json stdout stays clean). A fail-open
+// hook consumer blocks ONLY when it sees this line AND a nonzero count — a startup/parse
+// crash never reaches here, so the consumer fails open instead of misreading node's exit 1
+// as a finding (/reflexion:critique review 2026-07-11).
+console.error(`SCHEMA_FINDINGS=${allFindings.length}`)
 process.exit(args.strict && allFindings.length ? 1 : 0)
