@@ -18,6 +18,9 @@
  * payload.config.ts directly is NOT viable: it runs validateEnv() at import time.)
  *
  * ADVISORY / FAIL-OPEN: exit 0 always, unless --strict (then exit 1 on findings).
+ * Exit 2 on an UNEXPECTED internal error — exit 1 is reserved strictly for genuine
+ * findings so a commit-hook consumer can fail OPEN on a tool bug (treat >1 as skip),
+ * not falsely block (ISSUE-3466 /ship review, 2026-07-11).
  *
  * USAGE:
  *   node payload-schema-lint.mjs --project <projectDir> [files...] [--json] [--strict]
@@ -151,30 +154,37 @@ function lintFile(file) {
   return { findings, requiredTable }
 }
 
-const files = args.files.length ? args.files.map((f) => path.resolve(f)) : discoverFiles(args.project)
 let allFindings = []
 let allRequired = []
-for (const f of files) {
-  try {
-    const rel = path.relative(args.project, f)
-    const r = lintFile(f)
-    allFindings = allFindings.concat(r.findings.map((x) => ({ file: rel, ...x })))
-    allRequired = allRequired.concat(r.requiredTable.map((x) => ({ file: rel, ...x })))
-  } catch (e) {
-    console.error(`payload-schema-lint: failed to parse ${f}: ${e.message}`)
+try {
+  const files = args.files.length ? args.files.map((f) => path.resolve(f)) : discoverFiles(args.project)
+  for (const f of files) {
+    try {
+      const rel = path.relative(args.project, f)
+      const r = lintFile(f)
+      allFindings = allFindings.concat(r.findings.map((x) => ({ file: rel, ...x })))
+      allRequired = allRequired.concat(r.requiredTable.map((x) => ({ file: rel, ...x })))
+    } catch (e) {
+      console.error(`payload-schema-lint: failed to parse ${f}: ${e.message}`)
+    }
   }
-}
 
-if (args.json) {
-  console.log(JSON.stringify({ findings: allFindings, requiredFieldCount: allRequired.length, requiredFieldTable: allRequired }, null, 2))
-} else {
-  console.log(`payload-schema-lint: scanned ${files.length} file(s), ${allRequired.length} required field(s)`)
-  if (allFindings.length === 0) {
-    console.log('  ✓ no required-field-without-explanation findings')
+  if (args.json) {
+    console.log(JSON.stringify({ findings: allFindings, requiredFieldCount: allRequired.length, requiredFieldTable: allRequired }, null, 2))
   } else {
-    console.log(`  ✗ ${allFindings.length} finding(s):`)
-    for (const f of allFindings) console.log(`    ${f.file}:${f.line}  ${f.field} (${f.type}) — ${f.message}`)
+    console.log(`payload-schema-lint: scanned ${files.length} file(s), ${allRequired.length} required field(s)`)
+    if (allFindings.length === 0) {
+      console.log('  ✓ no required-field-without-explanation findings')
+    } else {
+      console.log(`  ✗ ${allFindings.length} finding(s):`)
+      for (const f of allFindings) console.log(`    ${f.file}:${f.line}  ${f.field} (${f.type}) — ${f.message}`)
+    }
   }
+} catch (e) {
+  // Unexpected error (file discovery, output). Reserve exit 1 for genuine findings so a
+  // commit-hook consumer fails OPEN on a tool bug (exit 2 → skip), not falsely block.
+  console.error(`payload-schema-lint: unexpected internal error — ${e && e.stack ? e.stack : e}`)
+  process.exit(2)
 }
 
 process.exit(args.strict && allFindings.length ? 1 : 0)
