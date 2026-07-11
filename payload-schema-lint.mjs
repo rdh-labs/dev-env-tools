@@ -21,10 +21,16 @@
  *
  * USAGE:
  *   node payload-schema-lint.mjs --project <projectDir> [files...] [--json] [--strict]
- *   (no files -> scans <projectDir>/src/collections and <projectDir>/src/globals)
+ *   (no files -> scans <projectDir>/src/{collections,globals,fields})
  *
  * Consumed by reflexion:critique when a diff touches Payload schema files. When a 2nd
  * Payload project appears, this stays project-agnostic via --project (no change needed).
+ *
+ * LIMITATIONS (false-negative surface — a "clean" result is NOT proof of no defects):
+ * static AST-of-source only. A field whose `name` is dynamic is reported as `<dynamic:...>`,
+ * but fields injected via SPREAD (`...sharedField`), returned from a FACTORY call, or IMPORTED
+ * from another module are not followed and can be missed. Scanning src/fields mitigates but does
+ * not close this. Advisory by design — do not treat a pass as exhaustive.
  */
 import { createRequire } from 'module'
 import fs from 'fs'
@@ -76,6 +82,11 @@ function propMap(objNode) {
   for (const p of objNode.properties) {
     if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteralLike(p.name))) {
       m[p.name.text] = p.initializer
+    } else if (ts.isShorthandPropertyAssignment(p)) {
+      // `{ name, type, required }` — value is a same-named identifier (dynamic). Record the
+      // identifier node so a shorthand `name` still registers the object as a field (else the
+      // field is silently skipped — a false negative, the worst failure mode for a defect check).
+      m[p.name.text] = p.name
     }
   }
   return m
@@ -104,27 +115,32 @@ function lintFile(file) {
       const m = propMap(node)
       const nameNode = m['name']
       const typeNode = m['type']
-      // A Payload field literal has BOTH a string `name` and a string `type`.
-      // (Excludes imageSizes entries {name,width,...} which lack `type`, admin blocks, etc.)
-      const isField = nameNode && typeNode && ts.isStringLiteralLike(nameNode) && ts.isStringLiteralLike(typeNode)
+      // A Payload field literal has a `name` (string or shorthand identifier) AND a string-literal
+      // `type`. Requiring a string-literal `type` excludes imageSizes {name,width,...} and admin blocks.
+      const isField =
+        nameNode &&
+        typeNode &&
+        ts.isStringLiteralLike(typeNode) &&
+        (ts.isStringLiteralLike(nameNode) || ts.isIdentifier(nameNode))
       if (isField && m['required'] && m['required'].kind === ts.SyntaxKind.TrueKeyword) {
+        const fieldName = ts.isStringLiteralLike(nameNode) ? nameNode.text : `<dynamic:${nameNode.text}>`
         const hasLabel = isMeaningful(m['label'])
         const adminObj = m['admin'] && ts.isObjectLiteralExpression(m['admin']) ? propMap(m['admin']) : null
         const hasAdminDesc = !!(adminObj && isMeaningful(adminObj['description']))
         const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1
         requiredTable.push({
-          field: nameNode.text,
+          field: fieldName,
           type: typeNode.text,
           line,
           explanation: hasLabel ? 'label' : hasAdminDesc ? 'admin.description' : null,
         })
         if (!hasLabel && !hasAdminDesc) {
           findings.push({
-            field: nameNode.text,
+            field: fieldName,
             type: typeNode.text,
             line,
             rule: 'required-field-needs-label-or-description',
-            message: `required field '${nameNode.text}' has no label and no admin.description — Payload shows only the auto-titleized name with no guidance`,
+            message: `required field '${fieldName}' has no label and no admin.description — Payload shows only the auto-titleized name with no guidance`,
           })
         }
       }
