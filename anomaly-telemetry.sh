@@ -89,15 +89,17 @@ PYEOF
 DISPATCH_DATE=$(date +%Y%m%d)
 DISPATCH_LOG="${LOG_DIR}/anomaly-telemetry-dispatch-${DISPATCH_DATE}.log"
 
-echo "  >> Dispatching Dart task creation for ${NEW_COUNT} anomaly class(es)..."
-claude -p - \
-    --permission-mode bypassPermissions \
-    --output-format text \
-    < "$PROMPT_FILE" \
-    >> "$DISPATCH_LOG" 2>&1 &
-echo "  >> Task creation dispatched (PID: $!) - log: ${DISPATCH_LOG}"
+# RETIRED Phase 1 (decouple-capability, Dart O7t4WAplaNNk): auto-Dart mint removed —
+# anomaly findings no longer auto-create mandatory tracked work the user must supervise.
+# The dispatch prompt is still built above (harmless; the trap at the top of this script
+# removes $PROMPT_FILE on exit) but is NOT dispatched. Clusters are surfaced via the
+# TRIGGERED: lines printed earlier. anomaly_telemetry.py clustering is left untouched,
+# reserved for Phase 2 (which will also wire clusters into tools/findings_ledger.py).
+echo "  >> auto-Dart dispatch RETIRED (decouple Phase 1) — ${NEW_COUNT} class(es) surfaced (TRIGGERED lines above), NOT minted, no Dart task created."
 
-# Update state: mark clusters as dispatched
+# Update state: mark clusters as SEEN (dedup key). NOTE: the "dispatched" JSON key is
+# retained for backward-compat with existing state files; post-Phase-1 it means "surfaced/
+# seen", NOT dispatched — the auto-Dart dispatch above is retired (decouple Phase 1).
 python3 - <<PYEOF 2>/dev/null
 import json, time, os
 
