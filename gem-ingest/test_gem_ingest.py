@@ -52,6 +52,10 @@ def _has_cred_scanner() -> bool:
 
 
 HAS_CRED_SCANNER = _has_cred_scanner()
+requires_scanner = pytest.mark.skipif(
+    not HAS_CRED_SCANNER,
+    reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE",
+)
 
 
 def _args(**kw):
@@ -117,20 +121,20 @@ def test_convert_json(tmp_path):
 
 # ----------------------------------------------------------------- unit: confidentiality gate
 
-@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
+@requires_scanner
 def test_assess_clean():
     a = conf.assess("a normal tech eval about SQL Server and Claude Code MCP", denylist=[])
     assert a.verdict == conf.CLEAR and a.scanner_ok
 
 
-@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
+@requires_scanner
 def test_assess_credential_quarantine():
     a = conf.assess(CRED_SAMPLE, denylist=[])
     assert a.verdict == conf.QUARANTINE
     assert any("aws" in r.lower() or "credential" in r.lower() for r in a.hard_reasons)
 
 
-@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
+@requires_scanner
 def test_assess_denylist_quarantine():
     terms = [("literal", "acme corp")]
     a = conf.assess("This eval mentions Acme Corp internal incident.", denylist=terms)
@@ -138,7 +142,7 @@ def test_assess_denylist_quarantine():
     assert any("denylist" in r for r in a.hard_reasons)
 
 
-@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
+@requires_scanner
 def test_assess_ssn_soft_quarantine():
     a = conf.assess("contact record 123-45-6789 in the doc", denylist=[])
     assert a.verdict == conf.QUARANTINE
@@ -152,7 +156,7 @@ def test_assess_fail_closed(monkeypatch):
     assert a.verdict == conf.QUARANTINE and a.scanner_ok is False
 
 
-@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
+@requires_scanner
 def test_assess_own_email_not_flagged():
     a = conf.assess("reach me at rhart@proactive-resolutions.com about the eval", denylist=[])
     assert a.verdict == conf.CLEAR

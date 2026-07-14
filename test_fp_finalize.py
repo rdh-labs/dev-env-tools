@@ -147,9 +147,8 @@ def test_run_all() -> None:
     """Expose run_all() to pytest collection.
 
     Without this, pytest imports this module, finds no `test_*` item, and
-    reports success having run none of the 12 checks — the file is tracked,
-    named test_*.py, and silently unexecuted in CI. run_all() asserts, so a
-    real failure propagates.
+    reports success having run none of the checks — tracked, named test_*.py,
+    and silently unexecuted. run_all() asserts, so a real failure propagates.
     """
     run_all()
 

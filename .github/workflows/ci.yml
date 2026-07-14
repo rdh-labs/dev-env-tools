@@ -1,11 +1,5 @@
 name: CI
 
-# Closes anomaly-register A7: this repo holds the workspace's QC tooling
-# (declare_fail, the governance generators) and had zero CI — so its own tests
-# had no runner. That is the "what runs != what exists" defect the tooling here
-# exists to catch, applied to the tooling itself. Root cause of the shipped
-# testmatch-lint --project bug: tests would have had nothing to run them.
-
 on:
   push:
     branches: [main]
@@ -33,21 +27,16 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Every test module imports only stdlib + repo-local modules (verified
-      # 2026-07-14), so pytest is the sole dependency. Keep it that way: a new
-      # third-party import needs a requirements file and a change here.
+      # Every test module imports only stdlib + repo-local modules, so pytest is
+      # the sole dependency. A new third-party import needs a requirements file
+      # and a change here.
       - name: Install pytest
         run: python3 -m pip install --disable-pip-version-check pytest
 
-      # Bare `pytest` — discovery is the source of truth, so a test file is
-      # never named in an arg list and cannot be orphaned by omission.
-      #
-      # Discovery is necessary but NOT sufficient: a tracked test_*.py that
-      # defines no `test_*` item is imported, contributes zero tests, and
-      # passes silently. test_fp_finalize.py was in exactly that state (found
-      # by /ship review, 2026-07-14) — fixed by giving it a `test_run_all`
-      # entry point rather than a bespoke CI step. conftest.py declares the one
-      # documented exclusion, which the next step runs explicitly.
+      # Bare `pytest` — discovery is the source of truth, so a test file is never
+      # named in an arg list and cannot be orphaned by omission. Necessary but not
+      # sufficient: a test_*.py defining no `test_*` item is imported, contributes
+      # zero tests, and passes silently.
       - name: Run pytest
         run: python3 -m pytest -q
 
