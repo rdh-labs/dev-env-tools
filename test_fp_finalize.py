@@ -47,8 +47,20 @@ def _run(tmp: Path, scanner_id: str, art: dict) -> dict:
 
 def run_all() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="fp-finalize-test-"))
-    fp_measure.ARTIFACT_DIR = tmp  # monkeypatch the module global
+    _saved_artifact_dir = fp_measure.ARTIFACT_DIR
+    fp_measure.ARTIFACT_DIR = tmp  # module global; restored in the finally below
     checks = 0
+    try:
+        _run_checks(tmp, checks)
+    finally:
+        # Under pytest this module shares a process with siblings: leaving
+        # ARTIFACT_DIR pointing at a deleted tmp dir would poison any later
+        # `import fp_measure`. A failing assert must not skip the restore.
+        fp_measure.ARTIFACT_DIR = _saved_artifact_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run_checks(tmp: Path, checks: int) -> None:
 
     # 1. Fully-labeled, zero FP → confirmed_fp==0, fully labeled, ready, GATE ADMITS.
     art = _artifact(["TP", "TP", "TP"])
@@ -139,7 +151,6 @@ def run_all() -> None:
         print(f"   [info] real A97.json: {s['fires_labeled']}/{s['fires_total']} resolved, "
               f"confirmed_fp={s['confirmed_fp']}")
 
-    shutil.rmtree(tmp, ignore_errors=True)
     print(f"PASS — {checks} checks (gate-admit transition, fail-loud, idempotency, real schema)")
 
 

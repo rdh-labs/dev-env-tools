@@ -134,8 +134,11 @@ def test_assess_credential_quarantine():
     assert any("aws" in r.lower() or "credential" in r.lower() for r in a.hard_reasons)
 
 
-@requires_scanner
 def test_assess_denylist_quarantine():
+    # Deliberately NOT gated on HAS_CRED_SCANNER: assess() runs _check_denylist
+    # unconditionally, so the denylist reason appears with or without the scanner.
+    # The verdict assertion alone would be vacuous under fail-closed; the
+    # hard_reasons assertion is what makes this test load-bearing either way.
     terms = [("literal", "acme corp")]
     a = conf.assess("This eval mentions Acme Corp internal incident.", denylist=terms)
     assert a.verdict == conf.QUARANTINE
