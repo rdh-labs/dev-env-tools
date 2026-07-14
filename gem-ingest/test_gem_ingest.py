@@ -32,6 +32,28 @@ HAS_ENGRAM = Path(ENGRAM).exists()
 HAS_PANDOC = shutil.which("pandoc") is not None
 
 
+def _has_cred_scanner() -> bool:
+    """Probe the real loader rather than guessing a path.
+
+    confidentiality.assess() imports credential_scanner from ~/.claude/hooks,
+    which lives in dev-env-config — absent on a CI runner. Without it assess()
+    fail-closes to QUARANTINE (correct behaviour). Tests that assert on real
+    scanner verdicts therefore cannot run here, in either direction:
+    CLEAR-expecting tests fail, and QUARANTINE-expecting tests pass VACUOUSLY
+    (fail-closed returns QUARANTINE regardless of what the scanner would say —
+    a green that survives the scanner being entirely broken). Skipping is
+    honest; a vacuous pass on a credential test is not.
+    """
+    try:
+        conf._load_credential_scanner()
+        return True
+    except Exception:
+        return False
+
+
+HAS_CRED_SCANNER = _has_cred_scanner()
+
+
 def _args(**kw):
     base = dict(audit=False, dry_run=False, backlog=False, run=True,
                 rebuild_index=False, status=False)
@@ -95,17 +117,20 @@ def test_convert_json(tmp_path):
 
 # ----------------------------------------------------------------- unit: confidentiality gate
 
+@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
 def test_assess_clean():
     a = conf.assess("a normal tech eval about SQL Server and Claude Code MCP", denylist=[])
     assert a.verdict == conf.CLEAR and a.scanner_ok
 
 
+@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
 def test_assess_credential_quarantine():
     a = conf.assess(CRED_SAMPLE, denylist=[])
     assert a.verdict == conf.QUARANTINE
     assert any("aws" in r.lower() or "credential" in r.lower() for r in a.hard_reasons)
 
 
+@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
 def test_assess_denylist_quarantine():
     terms = [("literal", "acme corp")]
     a = conf.assess("This eval mentions Acme Corp internal incident.", denylist=terms)
@@ -113,6 +138,7 @@ def test_assess_denylist_quarantine():
     assert any("denylist" in r for r in a.hard_reasons)
 
 
+@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
 def test_assess_ssn_soft_quarantine():
     a = conf.assess("contact record 123-45-6789 in the doc", denylist=[])
     assert a.verdict == conf.QUARANTINE
@@ -126,6 +152,7 @@ def test_assess_fail_closed(monkeypatch):
     assert a.verdict == conf.QUARANTINE and a.scanner_ok is False
 
 
+@pytest.mark.skipif(not HAS_CRED_SCANNER, reason="credential_scanner unavailable (lives in dev-env-config); assess() fail-closes to QUARANTINE")
 def test_assess_own_email_not_flagged():
     a = conf.assess("reach me at rhart@proactive-resolutions.com about the eval", denylist=[])
     assert a.verdict == conf.CLEAR
@@ -133,7 +160,7 @@ def test_assess_own_email_not_flagged():
 
 # ----------------------------------------------------------------- E2E (real engram)
 
-@pytest.mark.skipif(not HAS_ENGRAM, reason="engram binary not found")
+@pytest.mark.skipif(not (HAS_ENGRAM and HAS_CRED_SCANNER), reason="engram binary or credential_scanner missing")
 def test_e2e_ingest_md(sandbox):
     (sandbox["src"] / "eval_one.md").write_text(
         "# Eval of Tool Foo\n\nVerdict: ADOPT. Foo is a fast CLI for bar with unique-tok-aa11.\n"
@@ -150,7 +177,7 @@ def test_e2e_ingest_md(sandbox):
     assert "eval_one.md" in sandbox["index"].read_text()
 
 
-@pytest.mark.skipif(not HAS_ENGRAM, reason="engram binary not found")
+@pytest.mark.skipif(not (HAS_ENGRAM and HAS_CRED_SCANNER), reason="engram binary or credential_scanner missing")
 def test_idempotent_replay(sandbox):
     (sandbox["src"] / "eval_two.md").write_text("# Eval Two\n\nADOPT widget-zz22.\n")
     first = gi.process(_args())
@@ -163,7 +190,7 @@ def test_idempotent_replay(sandbox):
     assert out.count("widget-zz22") == 1
 
 
-@pytest.mark.skipif(not HAS_ENGRAM, reason="engram binary not found")
+@pytest.mark.skipif(not (HAS_ENGRAM and HAS_CRED_SCANNER), reason="engram binary or credential_scanner missing")
 def test_quarantine_blocks_ingest(sandbox):
     (sandbox["src"] / "bad.md").write_text(
         f"# Eval With Secret\n\nleak: {FAKE_AWS_KEY} and token quarantined-tok-bb33\n"
@@ -180,7 +207,7 @@ def test_quarantine_blocks_ingest(sandbox):
     assert "bad.md" in qlog
 
 
-@pytest.mark.skipif(not (HAS_ENGRAM and HAS_PANDOC), reason="engram or pandoc missing")
+@pytest.mark.skipif(not (HAS_ENGRAM and HAS_PANDOC and HAS_CRED_SCANNER), reason="engram, pandoc or credential_scanner missing")
 def test_e2e_ingest_docx(sandbox, tmp_path):
     md = tmp_path / "seed.md"
     md.write_text("# Docx Eval\n\nVerdict ADOPT. token docx-tok-cc44 present.\n")
