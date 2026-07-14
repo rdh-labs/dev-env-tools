@@ -143,5 +143,16 @@ def run_all() -> None:
     print(f"PASS — {checks} checks (gate-admit transition, fail-loud, idempotency, real schema)")
 
 
+def test_run_all() -> None:
+    """Expose run_all() to pytest collection.
+
+    Without this, pytest imports this module, finds no `test_*` item, and
+    reports success having run none of the 12 checks — the file is tracked,
+    named test_*.py, and silently unexecuted in CI. run_all() asserts, so a
+    real failure propagates.
+    """
+    run_all()
+
+
 if __name__ == "__main__":
     run_all()
