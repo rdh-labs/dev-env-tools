@@ -1,0 +1,9 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://rdh-labs/dev-env-tools/schemas/mapping.schema.json",
+  "title": "declare-fail mapping input",
+  "description": "An expected OR actual mapping for declare-fail --mode mapping. Keys are the reconciliation identity (e.g. a test-file path); values are compared for equality (e.g. a content hash, or a constant like true).",
+  "type": "object",
+  "additionalProperties": true,
+  "propertyNames": { "type": "string" }
+}

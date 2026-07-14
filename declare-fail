@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""declare-fail — CLI entry point for the shared reconciliation core.
+
+Thin shim so adapters (and CI/pre-commit) can call `declare-fail ...` directly.
+All logic lives in lib/declare_fail.py (the importable library).
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+
+from declare_fail import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://rdh-labs/dev-env-tools/schemas/violations.schema.json",
+  "title": "declare-fail violations input",
+  "description": "A list of violations for declare-fail --mode violations. A non-empty list is a failure (exit 1). Each item needs a stable 'id' and a human 'message'; adapters may attach any extra fields (e.g. file, matchedConfigs).",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["id", "message"],
+    "properties": {
+      "id": { "type": "string", "description": "stable violation-type slug, e.g. 'test-globbed-by-multiple-configs'" },
+      "message": { "type": "string", "description": "human-readable description of this specific violation" }
+    },
+    "additionalProperties": true
+  }
+}
