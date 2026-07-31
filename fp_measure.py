@@ -43,6 +43,15 @@ CORPUS_GLOB = str(Path.home() / ".claude/projects/-home-ichardart-dev/*.jsonl")
 ARTIFACT_DIR = Path.home() / ".claude/logs/fp-gate"
 SCHEMA_V = 1
 
+# For A101: import the real evidence_gate compiled regexes/function rather than hand-
+# reproducing them (avoids the exact kind of drift risk the A101 implementation itself
+# flagged for its own AUTH_REQUIRED_RE mirror). EVIDENCE_GATE_NO_LOG is set before the
+# import so any accidental module-level side effect can't write to production scanner
+# logs (defensive; evidence_gate.py's own logging is call-time, not import-time).
+os.environ.setdefault("EVIDENCE_GATE_NO_LOG", "1")
+sys.path.insert(0, str(Path.home() / "dev/infrastructure/dev-env-config/claude/hooks/stop"))
+import evidence_gate  # noqa: E402
+
 # ── Scanner fire-predicates ──────────────────────────────────────────────────
 # Each entry maps a scanner_id to (predicate, pattern_sources, prefilter). ``predicate(text)``
 # returns True if the scanner would fire on an assistant response ``text``. ``pattern_sources``
@@ -104,12 +113,38 @@ def _a97_fires(text: str) -> bool:
     return True
 
 
+def _a101_fires(text: str) -> bool:
+    """Predicate for A101 (check_you_generic_deferred_action) — calls the REAL evidence_gate
+    function directly rather than reproducing its logic, so this measurement is exactly
+    faithful to what the live scanner does (2026-07-30, Dart R1rtzzHY30zb)."""
+    return bool(evidence_gate.check_you_generic_deferred_action(text))
+
+
 SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], str | None]] = {
     "A97": (
         _a97_fires,
         # Every regex whose source+flags determine firing — sha256'd into the artifact fingerprint.
         [_A97_ANOMALY_RE, _A97_FENCE_RE, _A97_SELF_DETECT_RE, _A97_USER_ATTRIB_RE, _A97_DETECT_FAIL_RE],
         "anomaly analysis",   # lowercased necessary-condition substring (predicate requires case-insensitive "anomaly analysis")
+    ),
+    # NOTE: registered lowercase "a101" (not "A101") — evidence_gate.py's _fp_streams dict
+    # (and _fp_artifact_path, which the runtime FP-substance gate calls with that exact key)
+    # uses lowercase scanner ids, so the artifact filename this tool writes MUST match. The
+    # A97 entry's uppercase key was never exercised against a live _fp_streams lookup (A97
+    # was measured, found ~0% precision, and deliberately never wired into the blocking
+    # stream) — so this case mismatch risk was latent, not previously hit. Flagging as a
+    # separate finding, not fixing A97's casing here (out of scope, A97 is inert by design).
+    "a101": (
+        _a101_fires,
+        [
+            evidence_gate.YOU_FIELD_VALUE_RE,
+            evidence_gate._A101_SAY_THE_WORD_RE,
+            evidence_gate._A70_S11_CITE_RE,
+            evidence_gate.A11_STATUS_MARKER_RE,
+            evidence_gate._A101_CHOICE_OFFER_RE,
+            evidence_gate._A101_AUTH_REQUIRED_RE,
+        ],
+        None,  # no single necessary substring covers all 3 trigger phrases; full scan
     ),
 }
 
