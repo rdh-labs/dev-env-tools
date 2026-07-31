@@ -143,6 +143,16 @@ SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], str
             evidence_gate.A11_STATUS_MARKER_RE,
             evidence_gate._A101_CHOICE_OFFER_RE,
             evidence_gate._A101_AUTH_REQUIRED_RE,
+            # Added 2026-07-31 with the exclusions they implement. EVERY regex the
+            # predicate consults must be listed here or the fingerprint cannot
+            # detect that a stored artifact has gone stale: the first revision of
+            # these exclusions changed the fire count 131 -> 95 while the
+            # fingerprint stayed byte-identical, which is exactly the silent-stale
+            # case the fingerprint exists to prevent.
+            evidence_gate._A101_RECOMMENDATION_RE,
+            evidence_gate._A101_EXTRA_AUTH_RE,
+            evidence_gate._A101_PUSH_RE,
+            evidence_gate._A101_CLAUSE_SPLIT_RE,
         ],
         None,  # no single necessary substring covers all 3 trigger phrases; full scan
     ),
