@@ -501,7 +501,7 @@ issues = Path.home() / "dev/infrastructure/dev-env-docs/ISSUES-TRACKER.md"
 issues_text = issues.read_text(errors="replace")
 
 # Parse Parking IDEAs: find IDEA blocks with Status: Parking
-idea_re = re.compile(r"^### (IDEA-\d+):.*?(?=^### |\Z)", re.M | re.S)
+idea_re = re.compile(r"^### (IDEA-\d+)\s*[:|].*?(?=^### |\Z)", re.M | re.S)
 status_re = re.compile(r"^\*\*Status:\*\*\s*Parking\b", re.M)
 issue_ref_re = re.compile(r"\b(ISSUE-\d+)\b")
 
@@ -519,7 +519,15 @@ def recurrence_count(issue_id: str) -> int:
 
 promoted = []
 promoted_ideas: set = set()  # deduplicate: one notification per IDEA regardless of linked-ISSUE count
-for m in idea_re.finditer(backlog.read_text(errors="replace")):
+backlog_text = backlog.read_text(errors="replace")
+_parsed_count = len(idea_re.findall(backlog_text))
+_heading_count = len(re.findall(r"^### IDEA-\d+", backlog_text, re.M))
+if _parsed_count < _heading_count:
+    print(f"WARNING: idea_re parsed {_parsed_count}/{_heading_count} IDEA headings — "
+          f"{_heading_count - _parsed_count} block(s) use an unrecognized heading format "
+          f"and are invisible to Parking->Active promotion (coverage self-check, IDEA-10486 recurrence-4).",
+          file=sys.stderr)
+for m in idea_re.finditer(backlog_text):
     block = m.group(0)
     if not status_re.search(block):
         continue
