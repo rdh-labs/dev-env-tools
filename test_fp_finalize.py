@@ -43,8 +43,8 @@ def _artifact(fires_labels: list[str]) -> dict:
 def _run(tmp: Path, scanner_id: str, art: dict) -> dict:
     # Keep the artifact self-identifying: finalize() requires scanner_id == stem, so a
     # fixture written under a different stem than _artifact()'s hardcoded "A99001" must
-    # carry the matching id. (Caught 2026-08-04 when the identity check was added: the
-    # A99003 fixture was silently a copy of A99001 — the exact renamed-artifact hazard.)
+    # carry the matching id — an accidental copy of another fixture's content under a
+    # different stem is exactly the renamed-artifact hazard finalize() now rejects.
     art = {**art, "scanner_id": scanner_id}
     (tmp / f"{scanner_id}.json").write_text(json.dumps(art))
     return fp_measure.finalize(scanner_id)
@@ -131,12 +131,11 @@ def _run_checks(tmp: Path, checks: int) -> None:
     assert by_id.get("A99001", {}).get("confirmed_fp") == 1, "good artifact still finalized in batch"
     checks += 1
 
-    # 9a-i. REGRESSION (the shipped bug, 2026-08-04): qc_label_audit writes companion sidecars
-    # into ARTIFACT_DIR. finalize_all() globbed *.json and fed their DOTTED stems to
-    # finalize(), which rejected each as an invalid scanner_id — 6 phantom error rows per run,
-    # a non-zero exit every day, and 48 identical cron alerts over 24 days. Selection must skip
-    # them silently. Schemas are the real ones: .verdict has no `fires`, .raters/.anchor have
-    # `rows`, and none carries a `scanner_id`.
+    # 9a-i. REGRESSION: qc_label_audit writes companion sidecars into ARTIFACT_DIR.
+    # finalize_all() globbed *.json and fed their DOTTED stems to finalize(), which rejected
+    # each as an invalid scanner_id, producing phantom error rows and a non-zero exit on every
+    # run. Selection must skip them silently. Schemas are the real ones: .verdict has no
+    # `fires`, .raters/.anchor have `rows`, and none carries a `scanner_id`.
     (tmp / "A99001.verdict.json").write_text(json.dumps(
         {"gate": "A99001", "n": 2, "tp": 1, "fp": 1, "cohen_kappa": 0.5}))
     (tmp / "A99001.raters.json").write_text(json.dumps(
@@ -147,7 +146,7 @@ def _run_checks(tmp: Path, checks: int) -> None:
     ids = {r["scanner_id"] for r in results}
     assert not any("." in i for i in ids), f"companion sidecars must never be finalized: {ids}"
     assert not any("error" in r and r["scanner_id"].startswith("A99001.") for r in results), \
-        "companions must be SKIPPED, not reported as errors (that is the 48-alert bug)"
+        "companions must be SKIPPED, not reported as errors"
     checks += 1
 
     # 9a-ii. LAYER 2, independent of the stem filter: a DOT-FREE sidecar passes _SCANNER_ID_RE,
@@ -169,9 +168,9 @@ def _run_checks(tmp: Path, checks: int) -> None:
     (tmp / "A99001(1).json").write_text(json.dumps(_artifact(["TP"])))
     results = fp_measure.finalize_all()
     by_id = {r["scanner_id"]: r for r in results}
-    assert "skipped" in by_id.get("A99001(1)", {}), \
+    assert "reason" in by_id.get("A99001(1)", {}), \
         f"unrecognised stem must be reported, not silently dropped: {sorted(by_id)}"
-    assert "skipped" not in by_id.get("A99001", {}), "real artifact must still finalize"
+    assert by_id.get("A99001", {}).get("status") == "ok", "real artifact must still finalize"
     # ...and the known companions from 9a-i remain silent (no row at all).
     assert not any(i.endswith((".verdict", ".raters", ".anchor")) for i in by_id), \
         "known companions must stay silent — they are expected, not anomalous"
