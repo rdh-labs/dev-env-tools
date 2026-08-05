@@ -41,6 +41,11 @@ def _artifact(fires_labels: list[str]) -> dict:
 
 
 def _run(tmp: Path, scanner_id: str, art: dict) -> dict:
+    # Keep the artifact self-identifying: finalize() requires scanner_id == stem, so a
+    # fixture written under a different stem than _artifact()'s hardcoded "A99001" must
+    # carry the matching id. (Caught 2026-08-04 when the identity check was added: the
+    # A99003 fixture was silently a copy of A99001 — the exact renamed-artifact hazard.)
+    art = {**art, "scanner_id": scanner_id}
     (tmp / f"{scanner_id}.json").write_text(json.dumps(art))
     return fp_measure.finalize(scanner_id)
 
@@ -124,6 +129,52 @@ def _run_checks(tmp: Path, checks: int) -> None:
     by_id = {r["scanner_id"]: r for r in results}
     assert "error" in by_id.get("A99002", {}), "malformed artifact must surface as an error row"
     assert by_id.get("A99001", {}).get("confirmed_fp") == 1, "good artifact still finalized in batch"
+    checks += 1
+
+    # 9a-i. REGRESSION (the shipped bug, 2026-08-04): qc_label_audit writes companion sidecars
+    # into ARTIFACT_DIR. finalize_all() globbed *.json and fed their DOTTED stems to
+    # finalize(), which rejected each as an invalid scanner_id — 6 phantom error rows per run,
+    # a non-zero exit every day, and 48 identical cron alerts over 24 days. Selection must skip
+    # them silently. Schemas are the real ones: .verdict has no `fires`, .raters/.anchor have
+    # `rows`, and none carries a `scanner_id`.
+    (tmp / "A99001.verdict.json").write_text(json.dumps(
+        {"gate": "A99001", "n": 2, "tp": 1, "fp": 1, "cohen_kappa": 0.5}))
+    (tmp / "A99001.raters.json").write_text(json.dumps(
+        {"gate": "A99001", "n": 2, "rows": [{"source": "x", "codex": "TP", "deepseek": "FP"}]}))
+    (tmp / "A99001.anchor.json").write_text(json.dumps(
+        {"gate": "A99001", "n": 2, "label_counts": {"NA": 2}, "rows": []}))
+    results = fp_measure.finalize_all()
+    ids = {r["scanner_id"] for r in results}
+    assert not any("." in i for i in ids), f"companion sidecars must never be finalized: {ids}"
+    assert not any("error" in r and r["scanner_id"].startswith("A99001.") for r in results), \
+        "companions must be SKIPPED, not reported as errors (that is the 48-alert bug)"
+    checks += 1
+
+    # 9a-ii. LAYER 2, independent of the stem filter: a DOT-FREE sidecar passes _SCANNER_ID_RE,
+    # so selection alone cannot stop it. If it carries a `fires` list it would be silently
+    # rewritten. The scanner_id==stem check must reject it. (Without this assertion the 9a-i
+    # test above would still pass with layer 2 deleted — it only exercises the stem filter.)
+    (tmp / "A99001-raters.json").write_text(json.dumps(
+        {"scanner_id": "A99001", "fires": [{"excerpt": "e", "source": "x", "label": "FP"}]}))
+    try:
+        fp_measure.finalize("A99001-raters")
+        raise AssertionError("dot-free sidecar whose scanner_id != stem must raise")
+    except ValueError as e:
+        assert "does not match stem" in str(e), f"wrong error for identity mismatch: {e}"
+    checks += 1
+
+    # 9a-iii. Silence is reserved for KNOWN companions only. An unrecognised stem — a typo'd,
+    # renamed, or copied artifact — must surface as a `skipped` row, never vanish. Skipping it
+    # silently would invert the original bug rather than fix it: noise -> blindness.
+    (tmp / "A99001(1).json").write_text(json.dumps(_artifact(["TP"])))
+    results = fp_measure.finalize_all()
+    by_id = {r["scanner_id"]: r for r in results}
+    assert "skipped" in by_id.get("A99001(1)", {}), \
+        f"unrecognised stem must be reported, not silently dropped: {sorted(by_id)}"
+    assert "skipped" not in by_id.get("A99001", {}), "real artifact must still finalize"
+    # ...and the known companions from 9a-i remain silent (no row at all).
+    assert not any(i.endswith((".verdict", ".raters", ".anchor")) for i in by_id), \
+        "known companions must stay silent — they are expected, not anomalous"
     checks += 1
 
     # 9b. newly_ready is a TRANSITION, not steady state (cron must not re-notify a ready artifact).

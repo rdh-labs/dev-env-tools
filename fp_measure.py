@@ -281,6 +281,20 @@ def _summarize(art: dict) -> str:
 _RESOLVED_LABELS = frozenset({"TP", "FP"})
 _SCANNER_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
+# Sidecars qc_label_audit/ writes alongside the artifacts, keyed by the FINAL dot-segment of
+# the stem: "<gate>.verdict.json" (verdict.py), ".raters.json" (rater_driver.py),
+# ".anchor.json" (deterministic_anchor.py). Listed EXPLICITLY rather than inferred from
+# "has a dot", so that only these are silently skipped by finalize_all() and every other
+# non-artifact stem is surfaced. Extend when a new companion type is added — a missing entry
+# produces a visible `skipped` row, never silence.
+_COMPANION_SUFFIXES = frozenset({"verdict", "raters", "anchor"})
+
+
+def _is_known_companion(stem: str) -> bool:
+    """True if ``stem`` is a recognised qc_label_audit sidecar (``<valid-id>.<suffix>``)."""
+    base, _, suffix = stem.rpartition(".")
+    return bool(base) and suffix in _COMPANION_SUFFIXES and bool(_SCANNER_ID_RE.fullmatch(base))
+
 
 def _artifact_admits(art: dict) -> bool:
     """Mirror of evidence_gate._fp_artifact_admits_promotion's admit conditions
@@ -306,6 +320,16 @@ def finalize(scanner_id: str) -> dict:
             f"no FP artifact for {scanner_id} at {path} "
             f"(run fp_measure.py {scanner_id} --write-artifact first)")
     art = json.loads(path.read_text())  # JSONDecodeError propagates → fail-loud
+    # Positive identification, independent of the caller's file selection. finalize_all()'s
+    # _SCANNER_ID_RE filter rejects DOTTED companion stems, but a dot-free sidecar
+    # (e.g. "A13-raters.json") would pass it, and if it happened to carry a `fires` list it
+    # would be silently rewritten. Every real artifact self-identifies (verified 2026-08-04:
+    # A13/A97/a101/b123 all carry scanner_id == stem; all 6 companions carry no scanner_id).
+    if art.get("scanner_id") != scanner_id:
+        raise ValueError(
+            f"{path}: scanner_id={art.get('scanner_id')!r} does not match stem "
+            f"{scanner_id!r} — not this scanner's artifact (companion sidecar, backup, or "
+            f"a copied/renamed file); refusing to derive labels into it")
     fires = art.get("fires")
     if not isinstance(fires, list):
         raise ValueError(f"{path}: 'fires' is not a list — artifact malformed")
@@ -347,11 +371,37 @@ def finalize(scanner_id: str) -> dict:
 def finalize_all() -> list[dict]:
     """Finalize every artifact in ARTIFACT_DIR. A per-artifact error is CAUGHT and returned
     as an ``error`` row (fail-loud per artifact: a broken one is reported, never silently
-    skipped, and does not abort the batch)."""
+    skipped, and does not abort the batch).
+
+    Companion sidecars written by qc_label_audit (``<gate>.verdict.json`` /
+    ``.raters.json`` / ``.anchor.json``) and timestamped backups share this directory. They
+    are NOT artifacts. Selection reuses ``_SCANNER_ID_RE`` — the SAME predicate ``finalize()``
+    enforces — rather than a suffix denylist, so the filter can never drift out of sync with
+    the validator and needs no edit when a fourth companion type appears (a denylist fails
+    OPEN on every future addition, and the companion writers in qc_label_audit/ have no
+    reason to know this module exists).
+
+    Before this filter the glob ingested all 6 companions, each raising 'invalid scanner_id'
+    — 6 of 10 rows per run were phantoms, the batch exited non-zero every day, and the
+    cron's ``|| notify.sh`` fired 48 times over 24 days with one identical body. No companion
+    was ever corrupted (the id check precedes the path computation), so this is alarm
+    hygiene, not data integrity. (2026-08-04)"""
     results: list[dict] = []
     if not ARTIFACT_DIR.exists():
         return results
     for p in sorted(ARTIFACT_DIR.glob("*.json")):
+        if not _SCANNER_ID_RE.fullmatch(p.stem):
+            if _is_known_companion(p.stem):
+                continue  # expected sidecar — silent by design, the ONLY silent case
+            # Unknown non-artifact stem: a typo'd/renamed/copied artifact ("A13 .json",
+            # "A13(1).json") must NOT vanish. Skipping it silently would restore the very
+            # failure this filter exists to remove, inverted: noise -> blindness. Reported
+            # as a distinct `skipped` row (not `error`) so a caller can exit 0 on expected
+            # sidecars while still surfacing an unrecognised file. (Sonnet /ship, 2026-08-04)
+            results.append({"scanner_id": p.stem,
+                            "skipped": "stem is not a valid scanner id and not a known "
+                                       "companion suffix — renamed, copied, or typo'd?"})
+            continue
         try:
             results.append(finalize(p.stem))
         except Exception as e:  # noqa: BLE001 — report every failure, never silent
@@ -391,16 +441,32 @@ def _run_finalize_all() -> int:
         print(f"[finalize-all] no FP artifacts in {ARTIFACT_DIR}")
         return 0
     errors = [r for r in results if "error" in r]
+    skipped = [r for r in results if "skipped" in r]
+    finalized = [r for r in results if "error" not in r and "skipped" not in r]
     ready = [r["scanner_id"] for r in results if r.get("newly_ready")]
     for r in results:
         if "error" in r:
             print(f"  ERROR {r['scanner_id']}: {r['error']}", file=sys.stderr)
+        elif "skipped" in r:
+            print(f"  SKIPPED {r['scanner_id']}: {r['skipped']}", file=sys.stderr)
         else:
             extra = f"  [unknown labels: {r['unknown_labels']}]" if r["unknown_labels"] else ""
             print(f"  {r['scanner_id']}: {r['fires_labeled']}/{r['fires_total']} resolved, "
                   f"confirmed_fp={r['confirmed_fp']} — {r['decision']}{extra}")
     _notify_ready(ready)
-    print(f"[finalize-all] {len(results)} artifact(s); {len(ready)} ready; {len(errors)} error(s)")
+    # Machine-readable, single line, every run — counts by category so a zero exit still
+    # carries the numbers and silence is never the success signal. Distinct prefix (not
+    # `tail -1`) because stderr is unbuffered while stdout is block-buffered, so ERROR/SKIPPED
+    # lines can physically precede this one in the cron log. flush=True so a SIGTERM'd run
+    # still emits it (buffered-stdout-lost-on-SIGTERM was measured this session).
+    print(f"[finalize-all] SUMMARY finalized={len(finalized)} ready={len(ready)} "
+          f"errors={len(errors)} skipped={len(skipped)} "
+          f"at={datetime.now(timezone.utc).isoformat()}", flush=True)
+    # Exit code means "the tool failed" — the sole meaning a cron `|| notify.sh` wrapper can
+    # carry, and what this job's hardcoded alert message already asserts. An unrecognised
+    # stem is a real signal but NOT a tool failure, so it rides the summary line, not the
+    # exit code: routing it here would make the constant-title cron alert fire daily and
+    # forever, rebuilding the 48-alert failure this change removes.
     return 1 if errors else 0
 
 
