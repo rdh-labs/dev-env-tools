@@ -74,7 +74,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 HOME = Path.home()
 MANIFEST = HOME / "dev/infrastructure/tools/public-endpoints.json"
@@ -128,6 +128,13 @@ class Result:
         return SEV_NAME[max(SEV[f.severity] for f in self.findings)]
 
     def add(self, severity: str, code: str, detail: str) -> None:
+        # A manifest typo like "ERROR" must not crash verdict computation — and
+        # must not silently downgrade either. Unknown severity escalates to FAIL.
+        if severity not in SEV:
+            self.findings.append(Finding(
+                "FAIL", "bad_severity",
+                f"unknown severity {severity!r} for {code} — treating as FAIL"))
+            severity = "FAIL"
         self.findings.append(Finding(severity, code, detail))
 
     def to_dict(self) -> dict:
@@ -162,7 +169,7 @@ def fetch(url: str) -> tuple[int | None, bytes, str, int]:
             return r.status, body, "", int((time.monotonic() - t0) * 1000)
     except urllib.error.HTTPError as e:
         try:
-            body = e.read()
+            body = e.read(MAX_BODY_BYTES)   # same cap as the success path
         except Exception:
             body = b""
         return e.code, body, "", int((time.monotonic() - t0) * 1000)
@@ -535,10 +542,14 @@ def vercel_domains() -> dict[str, list[str]]:
     for p in projects:
         name = p.get("name")
         try:
-            doms = api(f"/v9/projects/{name}/domains?{tq}limit=50").get("domains", [])
+            doms = api(f"/v9/projects/{quote(str(name), safe='')}"
+                       f"/domains?{tq}limit=50").get("domains", [])
             out[name] = [d["name"] for d in doms]
-        except Exception:
-            out[name] = []
+        except Exception as e:
+            # Do NOT record this as "no domains" — an auth/rate-limit failure
+            # would then be indistinguishable from a project that genuinely has
+            # none, and discovery would quietly under-report.
+            out[name] = [f"ERROR: {type(e).__name__}: {e}"]
     return out
 
 
@@ -569,9 +580,17 @@ def main() -> int:
         return 0
 
     if args.discover:
-        for name, doms in sorted(vercel_domains().items()):
+        found = vercel_domains()
+        if not found:
+            print("[DISCOVERY FAILED] could not list projects — this is not the "
+                  "same as 'there are no projects'", file=sys.stderr)
+            return 2
+        errs_seen = False
+        for name, doms in sorted(found.items()):
+            if any(d.startswith("ERROR:") for d in doms):
+                errs_seen = True
             print(f"{name}: {', '.join(doms) if doms else '(no domains)'}")
-        return 0
+        return 2 if errs_seen else 0
 
     if args.uptime:
         print(uptime_report())
@@ -637,21 +656,41 @@ def main() -> int:
         tmp.replace(REPORT)
         save_state(state)
 
-        if stale:
-            notify("Endpoint monitor STOPPED", stale, "urgent")
+        undelivered: list[str] = []
+
+        if stale and not notify("Endpoint monitor STOPPED", stale, "urgent"):
+            undelivered.append("monitor-stopped")
         for r in events["new_failures"]:
-            notify(f"DOWN: {r.label}",
-                   f"{r.url}\n{r.findings[0].detail if r.findings else ''}\n"
-                   f"Objective: {r.objective or 'unstated'}", "high")
+            ok = notify(f"DOWN: {r.label}",
+                        f"{r.url}\n{r.findings[0].detail if r.findings else ''}\n"
+                        f"Objective: {r.objective or 'unstated'}", "high")
+            if not ok:
+                # The state write above already recorded last_verdict=FAIL, so on
+                # the next run this endpoint reads as "still failing" and would
+                # NOT re-emit a new-failure alert. Roll its verdict back so the
+                # alert is retried. An alert that failed to send must not be
+                # consumed by the state machine.
+                undelivered.append(r.label)
+                state["endpoints"][r.label]["last_verdict"] = None
         for r in events["escalations"]:
-            notify(f"STILL DOWN ({ESCALATE_AFTER}x): {r.label}",
-                   f"{r.url} has failed {ESCALATE_AFTER} consecutive checks "
-                   f"and has not been fixed.", "urgent")
+            if not notify(f"STILL DOWN ({ESCALATE_AFTER}x): {r.label}",
+                          f"{r.url} has failed {ESCALATE_AFTER} consecutive checks "
+                          f"and has not been fixed.", "urgent"):
+                undelivered.append(r.label)
         for r in events["recoveries"]:
             notify(f"RECOVERED: {r.label}", r.url, "default")
         for r in events["flapping"]:
             notify(f"FLAPPING: {r.label}",
                    f"{r.url} is unstable across runs even though it is green now.", "high")
+
+        if undelivered:
+            # The alerting channel failing is itself a monitoring failure. Saying
+            # nothing here would be the purest form of the silent failure this
+            # whole tool exists to prevent.
+            print(f"[ALERTING DEGRADED] could not deliver alerts for: "
+                  f"{', '.join(undelivered)}", file=sys.stderr)
+            save_state(state)     # persist the rollback so retries actually happen
+            return 2
 
     if any(r.verdict == "FAIL" for r in results) or stale:
         return 2
