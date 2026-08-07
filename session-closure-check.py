@@ -167,22 +167,50 @@ def check_handoff_currency(rep: Report) -> None:
         return
     text = hits[-1].read_text(errors="replace")
 
+    # Only THIS session's commits count toward ITS handoff's currency. Including a
+    # concurrent session's commits produced a false positive on first run: a peer's
+    # registry commit was reported as "missing from your handoff" when it was never
+    # this session's to record. Filter by the Co-Authored-By trailer this agent
+    # writes; absent that, fall back to all recent commits and say so.
     recent: list[str] = []
     for repo in REPOS:
         if not (repo / ".git").exists():
             continue
         try:
-            r = subprocess.run(["git", "log", "-3", "--format=%h", "--since=8 hours ago"],
-                               cwd=repo, capture_output=True, text=True, timeout=30)
+            # --grep searches the full message including the trailer, so multi-line
+            # bodies are handled by git rather than by fragile field-splitting. An
+            # earlier version tab-split %h%x09%b, which silently produced an EMPTY
+            # list on multi-line bodies — and an empty list emitted no finding at
+            # all, i.e. a silent pass. That is the fail-open shape this tool exists
+            # to catch, so it is guarded explicitly below.
+            r = subprocess.run(
+                ["git", "log", "-5", "--since=8 hours ago", "--format=%h",
+                 "--grep=Co-Authored-By: Claude"],
+                cwd=repo, capture_output=True, text=True, timeout=30)
             recent += [s for s in r.stdout.split() if s]
         except Exception:
             continue
 
+    if not recent:
+        rep.add("WARN", "currency_unknown",
+                "found no agent-authored commits in the last 8h — handoff currency is "
+                "UNVERIFIED, not confirmed. Expected only if this session wrote no code.")
+        return
+
     missing = [s for s in recent if s not in text]
     if missing:
+        # KNOWN LIMIT, stated rather than papered over: git records no session
+        # identity, so the Co-Authored-By filter catches ANY agent's commits, not
+        # only this session's. In a multi-session workspace a concurrent agent's
+        # commit will appear here. Verified live: two flagged SHAs turned out to be
+        # a peer's. Treat this as a CANDIDATE list to check, never a defect list —
+        # a checker that overstates its reach trains the dismissal it exists to
+        # prevent (Dart DhphrrLBB5h8).
         rep.add("WARN", "handoff_stale",
                 f"{hits[-1].name} does not mention {len(missing)} of {len(recent)} recent "
-                f"commits: {' '.join(missing[:6])} — presence is not currency")
+                f"agent-authored commits: {' '.join(missing[:6])} — presence is not "
+                f"currency. NOTE: may include a CONCURRENT session's commits; confirm "
+                f"authorship before treating any as yours to record")
     elif recent:
         rep.add("PASS", "handoff_current", f"handoff names all {len(recent)} recent commits")
 
