@@ -293,6 +293,57 @@ def check_detectors_prove_themselves(rep: Report) -> None:
             f"via --self-check")
 
 
+def check_prompt_decay(rep: Report) -> None:
+    """Limb 5: are next-session prompts STALER than the work they should account for?
+
+    A prompt optimised at time T decays as work lands after T. In session 231ba059 two
+    of five prompts went stale within hours — S1's execution MODE became wrong once its
+    scope grew to include a settings.json edit, and S5 still said "build this" about a
+    probe limb that had since been built. Both were found only because the USER asked
+    "is S1 still optimal?"; nothing checked, including me.
+
+    Mechanical proxy: a prompt file older than commits it plausibly needed to account
+    for. Deliberately a WARN and a CANDIDATE list — most commits do not invalidate a
+    prompt, and a limb that cried wolf on every commit would train the dismissal this
+    file exists to prevent.
+    """
+    # LIVE prompts only. The first version globbed every next-session*.md in
+    # dev/share and flagged 19 historical files from April onward — archives, not
+    # handoffs. That is the cry-wolf failure this limb's own docstring warns about,
+    # shipped by the same edit that wrote the warning. Scope to the last 7 days.
+    import time
+    cutoff = time.time() - 7 * 86400
+    prompts = sorted(f for f in (HOME / "dev/share").glob("next-session*.md")
+                     if f.stat().st_mtime >= cutoff)
+    if not prompts:
+        rep.add("PASS", "no_live_prompts", "no next-session prompt files from the last 7d")
+        return
+    for pf in prompts:
+        p_mtime = pf.stat().st_mtime
+        newer = 0
+        for repo in REPOS:
+            if not (repo / ".git").exists():
+                continue
+            try:
+                r = subprocess.run(
+                    ["git", "log", "-20", "--since=24 hours ago", "--format=%h %ct"],
+                    cwd=repo, capture_output=True, text=True, timeout=30)
+                for line in r.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) == 2 and float(parts[1]) > p_mtime:
+                        newer += 1
+            except Exception:
+                continue
+        if newer:
+            rep.add("WARN", "prompt_may_be_stale",
+                    f"{pf.name} predates {newer} commit(s) from the last 24h — re-read it "
+                    f"against them before handing it over. Scope, MODE (a new HIGH_RISK "
+                    f"step flips acceptEdits->plan) and already-done work all decay. "
+                    f"CANDIDATE signal: most commits do not invalidate a prompt")
+        else:
+            rep.add("PASS", "prompt_current", f"{pf.name} is newer than all recent commits")
+
+
 def self_check() -> list[str]:
     errs = []
     if Report().verdict != "PASS":
@@ -335,6 +386,7 @@ def main() -> int:
     check_repos(rep)
     check_handoff_currency(rep)
     check_detectors_prove_themselves(rep)
+    check_prompt_decay(rep)
 
     if args.json:
         print(json.dumps({"verdict": rep.verdict,
