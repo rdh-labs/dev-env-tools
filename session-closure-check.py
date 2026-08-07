@@ -313,12 +313,15 @@ def check_prompt_decay(rep: Report) -> None:
     # shipped by the same edit that wrote the warning. Scope to the last 7 days.
     import time
     cutoff = time.time() - 7 * 86400
+    # age-only: mtime is used purely to scope 'recently touched', never to decide
+    # which session or file is MINE. No identity is derived from it.
     prompts = sorted(f for f in (HOME / "dev/share").glob("next-session*.md")
                      if f.stat().st_mtime >= cutoff)
     if not prompts:
         rep.add("PASS", "no_live_prompts", "no next-session prompt files from the last 7d")
         return
     for pf in prompts:
+        # age-only: ordering a file against commit timestamps; not an identity claim.
         p_mtime = pf.stat().st_mtime
         newer = 0
         for repo in REPOS:
