@@ -1,0 +1,74 @@
+{
+  "_comment": "Public web endpoints an external stakeholder must be able to open with NO credentials. Checked by public-endpoint-health.py. Every entry declares the objective it serves — an endpoint nobody can name an objective for is a candidate for retirement, not for monitoring.",
+  "_owner": "Richard Hart",
+  "_created": "2026-08-06",
+  "_criteria": {
+    "expect_status": "HTTP status that means healthy (default 200)",
+    "require_text": "string that MUST be present; its absence means the page silently regressed to a placeholder",
+    "max_latency_ms": "budget above which a WARN is raised (default 8000)",
+    "min_size_bytes": "below this the response is treated as a stub (default 400)",
+    "forbid_draft_markers": "WARN if DRAFT|TODO|FIXME|PLACEHOLDER appears (default true)",
+    "follow_links": "verify every same-origin link resolves — set true for hub/index pages"
+  },
+  "endpoints": [
+    {
+      "url": "https://shv-review.vercel.app/",
+      "label": "SHV client review hub",
+      "objective": "Sage Hayward Vineyards can open every engagement deliverable unaided (SHV-001 client acceptance)",
+      "audience": "client",
+      "follow_links": true,
+      "require_text": "Sage Hayward Vineyards",
+      "max_latency_ms": 5000
+    },
+    {
+      "url": "https://mouraquayle.ca/",
+      "label": "Moura Quayle site (client custom domain)",
+      "objective": "the client's own public web presence is reachable by her audience",
+      "audience": "public / client",
+      "max_latency_ms": 8000
+    },
+    {
+      "url": "https://mq-studio-dev.vercel.app/",
+      "label": "MQ Studio dev deployment",
+      "objective": "internal review of MQ Studio before it fronts mouraquayle.ca",
+      "audience": "internal review",
+      "forbid_draft_markers": false
+    },
+    {
+      "url": "https://true-valence-mapper-claude.vercel.app/",
+      "label": "True Valence Mapper",
+      "objective": "TVM-001 demo is openable when shown to anyone",
+      "audience": "internal / demo",
+      "forbid_draft_markers": false
+    },
+    {
+      "url": "https://v1-topaz-five.vercel.app/",
+      "label": "TVM v1",
+      "objective": "TVM-001 v1 reference build stays reachable for comparison",
+      "audience": "internal / demo",
+      "forbid_draft_markers": false
+    },
+    {
+      "url": "https://shv-phase1.vercel.app/",
+      "label": "SHV Phase 1 (legacy Lighthouse audit)",
+      "objective": "RETIREMENT CANDIDATE — no current objective; monitored only so its removal is a decision rather than a surprise",
+      "audience": "legacy",
+      "forbid_draft_markers": false
+    },
+    {
+      "url": "https://shv-audit.vercel.app/",
+      "label": "SHV audit (legacy Lighthouse audit)",
+      "objective": "RETIREMENT CANDIDATE — no current objective; monitored only so its removal is a decision rather than a surprise",
+      "audience": "legacy",
+      "forbid_draft_markers": false
+    },
+    {
+      "url": "https://www.proactive-resolutions.com/",
+      "label": "ProActive ReSolutions site",
+      "objective": "the business's primary public presence is reachable by prospects",
+      "audience": "public",
+      "forbid_draft_markers": false,
+      "max_latency_ms": 12000
+    }
+  ]
+}
