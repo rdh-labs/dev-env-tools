@@ -173,7 +173,7 @@ def check_handoff_currency(rep: Report) -> None:
     # this session's to record. Filter by the Co-Authored-By trailer this agent
     # writes; absent that, fall back to all recent commits and say so.
     recent: list[str] = []
-    exact = False
+    fell_back = False   # True if ANY repo used the approximate path
     for repo in REPOS:
         if not (repo / ".git").exists():
             continue
@@ -200,13 +200,19 @@ def check_handoff_currency(rep: Report) -> None:
                 found = [s for s in r.stdout.split() if s]
                 if found:
                     recent += found
-                    exact = True
                     continue
             r = subprocess.run(
                 ["git", "log", "-5", "--since=8 hours ago", "--format=%h",
                  "--grep=Co-Authored-By: Claude"],
                 cwd=repo, capture_output=True, text=True, timeout=30)
-            recent += [s for s in r.stdout.split() if s]
+            got = [s for s in r.stdout.split() if s]
+            if got:
+                # Per-repo exactness must not be reported globally. An earlier
+                # version set one `exact` flag, so a single repo with a Session-Id
+                # trailer suppressed the caveat for every repo that fell back —
+                # partial coverage presented as complete.
+                fell_back = True
+            recent += got
         except Exception:
             continue
 
@@ -228,7 +234,7 @@ def check_handoff_currency(rep: Report) -> None:
         rep.add("WARN", "handoff_stale",
                 f"{hits[-1].name} does not mention {len(missing)} of {len(recent)} recent "
                 f"agent-authored commits: {' '.join(missing[:6])} — presence is not "
-                f"currency." + ("" if exact else
+                f"currency." + ("" if not fell_back else
                 " NOTE: APPROXIMATE attribution — no Session-Id trailer found, so this"
                 " falls back to Co-Authored-By and may include a CONCURRENT session's"
                 " commits. Add 'Session-Id: <uuid>' to commit messages for exact"
