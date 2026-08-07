@@ -70,6 +70,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
@@ -95,6 +96,9 @@ ESCALATE_AFTER = 3         # consecutive failed runs before the alert escalates
 DEADMAN_HOURS = 36         # silence longer than this means the monitor itself died
 MAX_BODY_BYTES = 8 << 20   # cap a single response so one huge page cannot hang a run
 MAX_LINKS_PER_PAGE = 200   # cap link-following; truncation is REPORTED, never silent
+ENDPOINT_WORKERS = 4       # endpoints are independent; serial runs risk scheduler timeout
+LINK_WORKERS = 8           # links within one page, likewise
+HISTORY_MAX_LINES = 20_000 # bound the append-only history so --uptime stays cheap
 
 
 def now() -> datetime:
@@ -144,15 +148,23 @@ class Result:
 
 
 class LinkGrabber(HTMLParser):
-    def __init__(self) -> None:
+    """Collects hrefs, bounded. Stops storing past the cap so an 8MiB page
+    cannot accumulate an unbounded list before the request cap is applied."""
+
+    def __init__(self, limit: int = MAX_LINKS_PER_PAGE) -> None:
         super().__init__()
         self.links: list[str] = []
+        self.limit = limit
+        self.truncated = False
 
     def handle_starttag(self, tag, attrs):
         if tag != "a":
             return
         for k, v in attrs:
             if k == "href" and v and not v.startswith(("#", "mailto:", "tel:", "javascript:")):
+                if len(self.links) >= self.limit:
+                    self.truncated = True
+                    return
                 self.links.append(v)
 
 
@@ -240,22 +252,26 @@ def check(ep: dict) -> Result:
                     f"could not parse links ({type(e).__name__}) — link coverage "
                     f"is unknown, so this page is NOT verified")
         origin = urlparse(url)
-        seen: set[str] = set()
+        targets: dict[str, str] = {}      # absolute url -> original href, deduped
         for href in g.links:
             target = urljoin(url, href)
-            if urlparse(target).netloc != origin.netloc or target in seen:
-                continue
-            if len(seen) >= MAX_LINKS_PER_PAGE:
-                # No silent caps: truncation is itself a finding.
-                res.add("WARN", "links_truncated",
-                        f"stopped after {MAX_LINKS_PER_PAGE} links — the rest of "
-                        f"this page's links are UNCHECKED, not known-good")
-                break
-            seen.add(target)
-            st, _, e2, _ = fetch(target)
-            res.links_checked += 1
-            if e2 or st is None or st >= 400:
-                res.links_broken.append(f"{href} -> {st or e2}")
+            if urlparse(target).netloc == origin.netloc and target not in targets:
+                targets[target] = href
+        if g.truncated:
+            # No silent caps: truncation is itself a finding.
+            res.add("WARN", "links_truncated",
+                    f"stopped collecting after {MAX_LINKS_PER_PAGE} links — the rest "
+                    f"of this page's links are UNCHECKED, not known-good")
+
+        # Links are independent; serially they dominate runtime and can push a
+        # run past the scheduler's patience, which would surface as a dead-man
+        # trip rather than as the endpoint problem it is not.
+        with ThreadPoolExecutor(max_workers=LINK_WORKERS) as pool:
+            for (target, href), (st, _, e2, _) in zip(
+                    targets.items(), pool.map(fetch, targets)):
+                res.links_checked += 1
+                if e2 or st is None or st >= 400:
+                    res.links_broken.append(f"{href} -> {st or e2}")
         if res.links_broken:
             res.add("FAIL", "broken_links",
                     f"{len(res.links_broken)} broken link(s) — a hub whose links do "
@@ -326,6 +342,20 @@ def self_check() -> list[str]:
     return errs
 
 
+def write_json_atomic(path: Path, payload: dict) -> None:
+    """Temp-file + replace, so a crash mid-write cannot leave truncated state
+    that the dead-man's switch would then read as 'unparseable, monitor down'.
+
+    Deliberately local: tools/governance_file_editor.py has an atomic_write, but
+    it raises GovernanceFileError and takes an fcntl lock — coupling a monitor to
+    the governance editor to save three lines is the worse trade.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
+
+
 def load_state() -> dict:
     if STATE.exists():
         try:
@@ -336,10 +366,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE.parent / (STATE.name + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(STATE)
+    write_json_atomic(STATE, state)
 
 
 def append_history(results: list[Result]) -> None:
@@ -352,6 +379,17 @@ def append_history(results: list[Result]) -> None:
                 "status": r.status, "latency_ms": r.latency_ms,
                 "codes": [x.code for x in r.findings],
             }) + "\n")
+    # Bound the append-only log. Unbounded growth would eventually make --uptime
+    # slow and the disk footprint unexplained; trimming is announced, not silent.
+    try:
+        lines = HISTORY.read_text().splitlines()
+        if len(lines) > HISTORY_MAX_LINES:
+            keep = lines[-HISTORY_MAX_LINES:]
+            HISTORY.write_text("\n".join(keep) + "\n")
+            print(f"[history] trimmed {len(lines) - len(keep)} oldest entries "
+                  f"(cap {HISTORY_MAX_LINES})", file=sys.stderr)
+    except OSError:
+        pass
 
 
 def notify(title: str, message: str, priority: str = "high") -> bool:
@@ -472,17 +510,20 @@ def remediate(results: list[Result], apply: bool) -> list[str]:
 
 def uptime_report() -> str:
     """Automated evaluation — what the history says, not what today says."""
-    if not HISTORY.exists():
-        return "no history yet"
     agg: dict[str, dict] = {}
-    for line in HISTORY.read_text().splitlines():
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-        a = agg.setdefault(d["label"], {"runs": 0, "fails": 0})
-        a["runs"] += 1
-        a["fails"] += 1 if d["verdict"] == "FAIL" else 0
+    try:
+        fh = HISTORY.open()
+    except OSError:
+        return "no history yet"
+    with fh:
+        for line in fh:                       # stream; never load the whole file
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            a = agg.setdefault(d["label"], {"runs": 0, "fails": 0})
+            a["runs"] += 1
+            a["fails"] += 1 if d["verdict"] == "FAIL" else 0
     out = []
     for label, a in sorted(agg.items()):
         pct = 100.0 * (a["runs"] - a["fails"]) / a["runs"] if a["runs"] else 0.0
@@ -600,7 +641,11 @@ def main() -> int:
         results = [check({"url": args.url, "follow_links": args.links})]
     else:
         try:
-            results = [check(e) for e in load_manifest()]
+            eps = load_manifest()
+            # Endpoints are independent. Serially, 8 endpoints x TIMEOUT is a
+            # multi-minute worst case; pool.map preserves manifest order.
+            with ThreadPoolExecutor(max_workers=ENDPOINT_WORKERS) as pool:
+                results = list(pool.map(check, eps))
         except ManifestError as e:
             print(f"[MANIFEST FAILURE] {e}", file=sys.stderr)
             notify("Endpoint monitor CANNOT RUN", str(e), "urgent")
@@ -642,9 +687,7 @@ def main() -> int:
 
     if args.log:
         append_history(results)
-        REPORT.parent.mkdir(parents=True, exist_ok=True)
-        tmp = REPORT.parent / (REPORT.name + ".tmp")
-        tmp.write_text(json.dumps({
+        write_json_atomic(REPORT, {
             "ts": now().isoformat(),
             "checked": len(results),
             "failed": [r.label for r in results if r.verdict == "FAIL"],
@@ -652,8 +695,7 @@ def main() -> int:
             "events": {k: [r.label for r in v] for k, v in events.items()},
             "deadman": stale,
             "results": [r.to_dict() for r in results],
-        }, indent=2))
-        tmp.replace(REPORT)
+        })
         save_state(state)
 
         undelivered: list[str] = []
