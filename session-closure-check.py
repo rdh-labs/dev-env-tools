@@ -173,16 +173,35 @@ def check_handoff_currency(rep: Report) -> None:
     # this session's to record. Filter by the Co-Authored-By trailer this agent
     # writes; absent that, fall back to all recent commits and say so.
     recent: list[str] = []
+    exact = False
     for repo in REPOS:
         if not (repo / ".git").exists():
             continue
+        # EXACT attribution when the commit carries a Session-Id trailer; the
+        # Co-Authored-By fallback is approximate and says so.
+        #
+        # An earlier version of this comment claimed "git records no session
+        # identity" as though that were intrinsic. It is not — it is a consequence
+        # of what gets written into commit messages. CLAUDE_CODE_SESSION_ID is
+        # available to every agent in this workspace. Declaring the limit and
+        # calling that honesty was accepting a constraint I had never tried to
+        # remove.
+        #
+        # --grep searches the full message including trailers, so multi-line bodies
+        # are handled by git rather than by fragile field-splitting. An earlier
+        # version tab-split %h%x09%b and silently produced an EMPTY list on
+        # multi-line bodies — emitting no finding at all, i.e. a silent pass.
         try:
-            # --grep searches the full message including the trailer, so multi-line
-            # bodies are handled by git rather than by fragile field-splitting. An
-            # earlier version tab-split %h%x09%b, which silently produced an EMPTY
-            # list on multi-line bodies — and an empty list emitted no finding at
-            # all, i.e. a silent pass. That is the fail-open shape this tool exists
-            # to catch, so it is guarded explicitly below.
+            if sid:
+                r = subprocess.run(
+                    ["git", "log", "-20", "--since=8 hours ago", "--format=%h",
+                     f"--grep=Session-Id: {sid}"],
+                    cwd=repo, capture_output=True, text=True, timeout=30)
+                found = [s for s in r.stdout.split() if s]
+                if found:
+                    recent += found
+                    exact = True
+                    continue
             r = subprocess.run(
                 ["git", "log", "-5", "--since=8 hours ago", "--format=%h",
                  "--grep=Co-Authored-By: Claude"],
@@ -209,8 +228,11 @@ def check_handoff_currency(rep: Report) -> None:
         rep.add("WARN", "handoff_stale",
                 f"{hits[-1].name} does not mention {len(missing)} of {len(recent)} recent "
                 f"agent-authored commits: {' '.join(missing[:6])} — presence is not "
-                f"currency. NOTE: may include a CONCURRENT session's commits; confirm "
-                f"authorship before treating any as yours to record")
+                f"currency." + ("" if exact else
+                " NOTE: APPROXIMATE attribution — no Session-Id trailer found, so this"
+                " falls back to Co-Authored-By and may include a CONCURRENT session's"
+                " commits. Add 'Session-Id: <uuid>' to commit messages for exact"
+                " filtering; this tool reads it when present."))
     elif recent:
         rep.add("PASS", "handoff_current", f"handoff names all {len(recent)} recent commits")
 
