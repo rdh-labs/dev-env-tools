@@ -243,6 +243,56 @@ def check_handoff_currency(rep: Report) -> None:
         rep.add("PASS", "handoff_current", f"handoff names all {len(recent)} recent commits")
 
 
+def check_detectors_prove_themselves(rep: Report) -> None:
+    """Limb 4: does every checker in tools/ PROVE its own detector works?
+
+    This operationalises the session's central finding — *a check validates the
+    SHAPE of a claim, never the STATE the claim asserts* — applied to the checkers
+    themselves. A tool that reports PASS is asserting a state; a `--self-check` that
+    exercises its own evaluation logic is the only thing that makes that assertion
+    falsifiable. Every defect found in this very file (five so far) surfaced by
+    RUNNING it, none by reading it.
+
+    Fail-closed: a checker whose self-check errors is worse than one with none,
+    because it reports confidently over broken logic.
+    """
+    tools = sorted(p for p in (HOME / "dev/infrastructure/tools").glob("*.py")
+                   if p.name.endswith(("-check.py", "-health.py")))
+    proven = 0
+    if not tools:
+        rep.add("WARN", "no_checkers_found",
+                "no *-check.py / *-health.py in tools/ — limb 4 verified nothing")
+        return
+    for t in tools:
+        src = t.read_text(errors="replace")
+        if "--self-check" not in src:
+            rep.add("WARN", "detector_unproven",
+                    f"{t.name} has no --self-check: it can report PASS over broken "
+                    f"evaluation logic and nothing would show")
+            continue
+        try:
+            r = subprocess.run([sys.executable, str(t), "--self-check"],
+                               capture_output=True, text=True, timeout=90)
+        except Exception as e:
+            rep.add("FAIL", "self_check_unrunnable",
+                    f"{t.name} --self-check could not run ({e}) — its verdicts are "
+                    f"UNTRUSTWORTHY, not merely unverified")
+            continue
+        if r.returncode != 0:
+            rep.add("FAIL", "self_check_failing",
+                    f"{t.name} --self-check exits {r.returncode}: "
+                    f"{(r.stderr or r.stdout).strip()[:160]}")
+            continue
+        proven += 1
+
+    # A limb that emits NOTHING is indistinguishable from a limb that never ran.
+    # This exact defect was introduced FOUR times while building this file — each
+    # time by a fix to it. Silence is not a pass; say what was verified.
+    rep.add("PASS", "detectors_proven",
+            f"{proven}/{len(tools)} checker(s) proved their own evaluation logic "
+            f"via --self-check")
+
+
 def self_check() -> list[str]:
     errs = []
     if Report().verdict != "PASS":
@@ -284,6 +334,7 @@ def main() -> int:
     check_started_not_stopped(rep)
     check_repos(rep)
     check_handoff_currency(rep)
+    check_detectors_prove_themselves(rep)
 
     if args.json:
         print(json.dumps({"verdict": rep.verdict,
