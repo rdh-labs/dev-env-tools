@@ -429,7 +429,17 @@ def evaluate_loop(results: list[Result], state: dict) -> dict:
                 st["first_failed_at"] = now().isoformat()
                 st["transitions"] += 1
                 events["new_failures"].append(r)
-            elif st["consecutive_failures"] == ESCALATE_AFTER:
+            elif (st["consecutive_failures"] >= ESCALATE_AFTER
+                  and st["consecutive_failures"] % ESCALATE_AFTER == 0):
+                # RE-escalate, not escalate-once. `== ESCALATE_AFTER` fired a single
+                # alert at run 3 and then went permanently silent — so an endpoint
+                # down forever produced zero alerts from run 4 onward, which is the
+                # exact failure this tool exists to prevent. Found live 2026-08-08:
+                # three client-facing endpoints sat at consecutive_failures=5 with
+                # escalations=[] for 39 hours. Testing equality against a threshold
+                # checks the SHAPE of a transition; a persistent outage is a STATE.
+                # The cadence reuses ESCALATE_AFTER (3, 6, 9, …) rather than
+                # introducing a second, invented interval constant.
                 events["escalations"].append(r)
         else:
             if prev == "FAIL":
@@ -715,8 +725,9 @@ def main() -> int:
                 undelivered.append(r.label)
                 state["endpoints"][r.label]["last_verdict"] = None
         for r in events["escalations"]:
-            if not notify(f"STILL DOWN ({ESCALATE_AFTER}x): {r.label}",
-                          f"{r.url} has failed {ESCALATE_AFTER} consecutive checks "
+            n = state["endpoints"][r.label]["consecutive_failures"]
+            if not notify(f"STILL DOWN ({n}x): {r.label}",
+                          f"{r.url} has failed {n} consecutive checks "
                           f"and has not been fixed.", "urgent"):
                 undelivered.append(r.label)
         for r in events["recoveries"]:
