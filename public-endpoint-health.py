@@ -450,8 +450,18 @@ def evaluate_loop(results: list[Result], state: dict) -> dict:
 
         # An endpoint that keeps flipping is unstable even while green right
         # now — invisible to any single run, which is why it is tracked here.
+        # EDGE, not level. `transitions` never decays, so the bare level test
+        # `transitions >= 4` fired a FLAPPING alert on EVERY subsequent run for
+        # the life of the endpoint — measured: 12 consecutive alerts after 8
+        # clean PASS runs. That trains dismissal of the same channel escalations
+        # are delivered on, so it actively degrades the fix above it.
+        # Re-notify only after ESCALATE_AFTER further transitions (no second
+        # invented constant), and stay silent while the endpoint is stable.
         if st["total_runs"] >= 6 and st["transitions"] >= 4:
-            events["flapping"].append(r)
+            last_at = st.get("flapping_notified_at_transitions")
+            if last_at is None or st["transitions"] - last_at >= ESCALATE_AFTER:
+                events["flapping"].append(r)
+                st["flapping_notified_at_transitions"] = st["transitions"]
 
         st["last_verdict"] = r.verdict
 
@@ -725,16 +735,30 @@ def main() -> int:
                 undelivered.append(r.label)
                 state["endpoints"][r.label]["last_verdict"] = None
         for r in events["escalations"]:
-            n = state["endpoints"][r.label]["consecutive_failures"]
+            stx = state["endpoints"][r.label]
+            n = stx["consecutive_failures"]
             if not notify(f"STILL DOWN ({n}x): {r.label}",
                           f"{r.url} has failed {n} consecutive checks "
                           f"and has not been fixed.", "urgent"):
                 undelivered.append(r.label)
+                # Same principle the new-failure branch above states explicitly:
+                # an alert that failed to send must not be consumed by the state
+                # machine. Without this, a dropped escalation at cf=3 had its
+                # next opportunity at cf=6 — three runs, ~24h of silence on a
+                # live outage. Step the counter back so the cadence retries on
+                # the very next run instead of skipping a whole interval.
+                stx["consecutive_failures"] -= 1
         for r in events["recoveries"]:
-            notify(f"RECOVERED: {r.label}", r.url, "default")
+            if not notify(f"RECOVERED: {r.label}", r.url, "default"):
+                undelivered.append(r.label)
         for r in events["flapping"]:
-            notify(f"FLAPPING: {r.label}",
-                   f"{r.url} is unstable across runs even though it is green now.", "high")
+            if not notify(f"FLAPPING: {r.label}",
+                          f"{r.url} is unstable across runs even though it is "
+                          f"green now.", "high"):
+                undelivered.append(r.label)
+                # Un-record the notification so the edge re-fires next run.
+                state["endpoints"][r.label].pop(
+                    "flapping_notified_at_transitions", None)
 
         if undelivered:
             # The alerting channel failing is itself a monitoring failure. Saying
