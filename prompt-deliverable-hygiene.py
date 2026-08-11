@@ -20,8 +20,18 @@ whose filename lacks the tokens, and overcounts non-deliverables that carry them
 count and a loose count -- and never a single point estimate. A structured parse
 with a narrow matcher is still a text match.
 
-Exit codes: 0 -- always. Advisory only; never blocks. Raising this to blocking
-would need the false-positive class below to be measured first.
+Exit codes: the MEASUREMENT paths (default, --json, --log) return 0 always -- advisory
+only, never blocking. `--self-check` is the exception and returns 1 on fixture failure:
+it is a test of this tool's own logic, not a drift measurement, and swallowing its
+result would make it useless to any caller gating on the exit code. Raising the
+measurement to blocking would need the false-positive class below to be measured first.
+
+KNOWN LIMIT -- the corpus is not the event. This scans files in ~/dev/share, but most
+prompts are emitted through the terminal / `Next:` channel and never become files here
+(~475 close.json artifacts carry a next-prompt field over the same period). So this
+measures a residue, and an agent that emits an unoptimized prompt without writing a file
+IMPROVES the number. Treat a good reading as weak evidence; the load-bearing check would
+observe the emission itself. Do not promote this to a gate without fixing that.
 
 Usage:
   prompt-deliverable-hygiene.py            # human-readable report
@@ -153,9 +163,11 @@ def measure() -> dict:
         # Never raise: an AssertionError would violate the exit-0-always contract this
         # file exists to uphold, and `python -O` strips asserts entirely -- the opposite
         # failure. Report the invariant breach instead of crashing on it.
-        for k in ("registered", "cite_lo", "cite_hi"):
-            if len(data[k if k != "registered" else "registered"]) > total:
-                warnings.append(f"{label}.{k}: numerator > denominator -- denominator is wrong")
+        # Reachable invariant only. An earlier version compared sublists of `names`
+        # against len(names) -- structurally impossible, i.e. a safeguard that could
+        # never fire. A check that cannot fail is not a check; it is reassurance.
+        if len(data["cite_lo"]) > len(data["cite_hi"]):
+            warnings.append(f"{label}: strict citations exceed loose -- the bounds are inverted")
         if data["unreadable"]:
             warnings.append(f"{label}: {len(data['unreadable'])} unreadable file(s), excluded from rates")
         if not data["library_readable"]:
@@ -183,6 +195,7 @@ def self_check() -> int:
     classification logic breaks.
     """
     failures = []
+    CHECKS_RUN = 5  # keep in step with the numbered checks below; printed, not assumed
 
     # 1. Both matchers must actually select something on the live tree.
     if not _collect(STRICT_RE):
@@ -213,7 +226,10 @@ def self_check() -> int:
     for f in failures:
         print(f"  [FAIL/self-check] {f}")
     if not failures:
-        print("  [PASS/self-check] 4/4 checks proved the evaluation logic")
+        # Count derived, never hardcoded: an earlier version printed a literal "4/4"
+        # after a 5th check was added. A measurement-honesty tool reporting a stale
+        # hardcoded count is the defect it exists to catch.
+        print(f"  [PASS/self-check] {CHECKS_RUN}/{CHECKS_RUN} checks proved the evaluation logic")
     return 1 if failures else 0
 
 
