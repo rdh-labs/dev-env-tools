@@ -74,6 +74,57 @@ def load_turn(path: Path) -> list[dict]:
     return events[last_text + 1:]
 
 
+def _first_dirty_tracked_file() -> str:
+    """A tracked file with pending changes, so the dirty branch can be exercised. "" when the
+    tree is clean, and the caller SKIPS rather than passing vacuously."""
+    import subprocess
+    root = Path(__file__).resolve().parent
+    try:
+        r = subprocess.run(["git", "-C", str(root), "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=15)
+        for line in r.stdout.splitlines():
+            name = line[3:].strip()
+            if name and not name.startswith("??"):
+                return str(root / name)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def _first_clean_tracked_file() -> str:
+    """A tracked file with no pending changes, for fixtures that need a genuinely-committed
+    path. Returns "" when none exists, and the caller SKIPS rather than passing vacuously."""
+    import subprocess
+    root = Path(__file__).resolve().parent
+    try:
+        r = subprocess.run(["git", "-C", str(root), "ls-files"],
+                           capture_output=True, text=True, timeout=15)
+        for name in r.stdout.split():
+            st = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--", name],
+                                capture_output=True, text=True, timeout=10)
+            if st.returncode == 0 and not st.stdout.strip():
+                return str(root / name)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def _git_status(path: str) -> str | None:
+    """Porcelain status for ONE path: '' when clean/committed, a code like '?? ' or ' M' when
+    not, None when git cannot answer. None is UNKNOWN and is never treated as clean."""
+    import subprocess
+    fp = Path(path)
+    try:
+        r = subprocess.run(["git", "-C", str(fp.parent), "status", "--porcelain", "--", fp.name],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+        line = r.stdout.strip()
+        return line[:2].strip() if line else ""
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _sha_resolves(sha: str, repos=None) -> bool:
     """Does this look-like-a-SHA actually name a commit? Checked, not assumed."""
     import subprocess
@@ -110,13 +161,17 @@ def summarise(events: list[dict]) -> dict:
             # A failure the record shows: an error result, or a non-zero EXIT we printed.
             if nxt.get("error") or re.search(r"EXIT=[1-9]|Exit code [1-9]|FAIL", out):
                 failures.append(c.splitlines()[0][:110])
-    # Only GIT commands count as "this file was handled". The first version joined ALL
-    # commands, so merely RUNNING a file made it look committed — found on this tool's own
-    # first run, where it failed to flag itself.
-    joined = " ".join(c for c in cmds if re.search(r"\bgit\s+(add|commit|rm|mv)\b", c))
+    # ASK GIT, do not pattern-match commands. Two prior versions were proxies: the first
+    # joined ALL commands (so merely RUNNING a file looked committed), the second matched the
+    # BASENAME inside git commands (so `git add other/alpha.py` cleared `/x/alpha.py`).
+    # Independent review flagged both as proxy-for-thing, the defect class this session hit
+    # repeatedly. `git status --porcelain <path>` answers the actual question.
     for f in files:
-        if Path(f).name not in joined:
-            uncommitted.append(f)
+        st = _git_status(f)
+        if st is None:
+            uncommitted.append(f"{f} (git state UNKNOWN — not evidence it was committed)")
+        elif st:
+            uncommitted.append(f"{f} [{st}]")
     return {"commits": sorted(set(commits)), "files": sorted(set(files)),
             "commands": len(cmds), "failures": failures,
             "uncommitted": sorted(set(uncommitted)),
@@ -186,7 +241,41 @@ def self_check() -> int:
     s = summarise(ev)
     ok.append(("a RESOLVING commit SHA is captured", _real_sha() in s["commits"]))
     ok.append(("a non-zero EXIT is captured as a failure", len(s["failures"]) == 1))
-    ok.append(("a file later git-added is NOT flagged uncommitted", not s["uncommitted"]))
+    # A file resolved at fixture time as genuinely clean in git. Using __file__ failed
+    # correctly: this file is MODIFIED while being edited, so git rightly flagged it. The
+    # fixture was wrong, not the code.
+    # A genuinely DIRTY tracked file. Sabotaging the dirty branch (`elif st:`) produced ZERO
+    # failures because every other fixture path returns UNKNOWN, and the only real file used
+    # was clean. The dirty branch was uncovered.
+    _dirty = _first_dirty_tracked_file()
+    if _dirty:
+        ok.append(("a MODIFIED tracked file IS flagged with its git status",
+                   any(_dirty in u and "[" in u for u in
+                       summarise([{"kind": "text"},
+                                  {"kind": "tool", "name": "Write",
+                                   "input": {"file_path": _dirty}},
+                                  {"kind": "result", "text": "ok"}])["uncommitted"])))
+    else:
+        print("  [SKIP] no dirty tracked file — the dirty branch cannot be exercised; NOT a pass")
+
+    _clean = _first_clean_tracked_file()
+    if _clean:
+        ok.append(("a genuinely CLEAN tracked file is not flagged (asks git, not command text)",
+                   not summarise([{"kind": "text"},
+                                  {"kind": "tool", "name": "Write",
+                                   "input": {"file_path": _clean}},
+                                  {"kind": "result", "text": "ok"}])["uncommitted"]))
+    else:
+        print("  [SKIP] no clean tracked file available — that fixture cannot run; NOT a pass")
+    ok.append(("git-add of a DIFFERENT file with the same basename does NOT clear this one",
+               any("/nonexistent-dir-xyz/alpha.py" in u for u in
+                   summarise([{"kind": "text"},
+                              {"kind": "tool", "name": "Write",
+                               "input": {"file_path": "/nonexistent-dir-xyz/alpha.py"}},
+                              {"kind": "result", "text": "ok"},
+                              {"kind": "tool", "name": "Bash",
+                               "input": {"command": "git add other/alpha.py"}},
+                              {"kind": "result", "text": ""}])["uncommitted"])))
     ev2 = [{"kind": "text"},
            {"kind": "tool", "name": "Write", "input": {"file_path": "/x/orphan.md"}},
            {"kind": "result", "text": "written"}]
@@ -199,9 +288,9 @@ def self_check() -> int:
               {"kind": "tool", "name": "Bash", "input": {"command": "python3 ran.py --self-check"}},
               {"kind": "result", "text": "PASS"}]
     ok.append(("a file that was only RUN (not git-added) must still be flagged uncommitted",
-               summarise(ev_run)["uncommitted"] == ["/x/ran.py"]))
+               any(u.startswith("/x/ran.py") for u in summarise(ev_run)["uncommitted"])))
     ok.append(("a file never referenced in a git command IS flagged",
-               summarise(ev2)["uncommitted"] == ["/x/orphan.md"]))
+               any(u.startswith("/x/orphan.md") for u in summarise(ev2)["uncommitted"])))
     ok.append(("an empty turn produces a draft that says so, not a clean Done",
                "NOTHING the record can attribute" in draft(summarise([{"kind": "text"}]))))
     ok.append(("the empty-Open case warns rather than reassures",
