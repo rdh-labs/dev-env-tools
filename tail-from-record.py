@@ -378,7 +378,23 @@ def main() -> int:
     if not paths:
         print(f"no transcript for session {sid[:8]} — cannot ground a tail in the record")
         return 2
-    print(draft(summarise(load_turn(paths[0]))))
+    tp = paths[0]
+    import os as _os
+    st = tp.stat()
+    own = sid == _os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    print(draft(summarise(load_turn(tp))))
+    print()
+    print(f"  read from: {tp.name[:8]}…  ({st.st_size} bytes at read time)")
+    if not own:
+        # THE MISATTRIBUTION MECHANISM, diagnosed 2026-08-11. A reviewer ran this against a
+        # session that was still working and got that session's in-flight tool calls, which
+        # from their position looked like "an unrelated concurrent actor's work". It was not a
+        # parsing bug: the transcript is a LIVE, append-only file with no as-of boundary, and
+        # it grew measurably during a 3-second observation. Reading another session's
+        # transcript is inherently a race.
+        print("  ⚠ THIS IS NOT YOUR SESSION. The transcript is live and append-only, so this")
+        print("    draft may describe work the owning session is still performing. Attributing")
+        print("    it to your own turn is the misattribution this warning exists to prevent.")
     return 0
 
 
