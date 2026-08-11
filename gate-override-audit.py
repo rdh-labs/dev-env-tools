@@ -21,9 +21,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 DEFAULT_OVERRIDES = Path.home() / "dev" / "infrastructure" / "multi-check" / "logs" / "gate-overrides.jsonl"
 DEFAULT_BYPASSES = Path.home() / ".claude" / "assumption-registry" / "test-bypasses.jsonl"
-# Declared QC skips. Same decision-plus-reason shape as the two sources above, which is
-# why this belongs here rather than in a sibling script. The field has been logged since
-# 2026-05-30; nothing consumed it until 2026-08-10.
+# Declared QC skips — same decision-plus-reason shape as the two sources above, which is why
+# this belongs here rather than in a sibling script.
 DEFAULT_SKIPS = Path.home() / ".claude" / "logs" / "session-end-no-handoff-t5.jsonl"
 DEFAULT_HANDOFFS = Path.home() / ".claude" / "logs" / "handoff.jsonl"
 
@@ -76,6 +75,20 @@ def normalize_reason(reason: str) -> str:
     return normalized
 
 
+LOW_QUALITY_REASONS = {"n/a", "none", "skip", "quick check"}
+LOW_QUALITY_MIN_LEN = 12
+
+
+def is_low_quality_reason(normalized: str) -> bool:
+    """Shared by every reason-bearing source, so the bar cannot drift between them."""
+    return len(normalized) < LOW_QUALITY_MIN_LEN or normalized in LOW_QUALITY_REASONS
+
+
+# TECH DEBT (Dart O7t4WAplaNNk): the three summarize_* functions below, and the three render
+# blocks that consume them, now repeat the same all_time/window/counter/top-N shape. A reuse
+# review flagged this as past the extraction threshold. BLOCKER IS TEST COVERAGE, not effort:
+# the override and bypass paths have no tests, so unifying them is an unverifiable change.
+# Add tests first, then extract. Do not unify while the paths are untested.
 def summarize_overrides(all_records: List[Dict[str, Any]], window_records: List[Dict[str, Any]]) -> Dict[str, Any]:
     reasons = Counter()
     questions = Counter()
@@ -98,7 +111,7 @@ def summarize_overrides(all_records: List[Dict[str, Any]], window_records: List[
             continue
         normalized_reason = normalize_reason(reason)
         reasons[normalized_reason] += 1
-        if len(normalized_reason) < 12 or normalized_reason in {"n/a", "none", "skip", "quick check"}:
+        if is_low_quality_reason(normalized_reason):
             reason_quality_warnings += 1
 
     total = len(window_records)
@@ -145,10 +158,8 @@ def summarize_skips(
     A declared skip is REVERSED when the session that declared it logged a handoff STRICTLY
     AFTER the earliest declaration. The ordering check is load-bearing, not decoration: a
     plain set intersection counts a session that logged a handoff mid-session and then ended
-    without one as "reversed" backwards. Measured 2026-08-10: 4 of 42 naive matches were
-    backwards, inflating the rate from the true 55.1% to 60.9%. The first version of this
-    function shipped the naive intersection and its number reached three governance artifacts
-    before a pre-ship review caught it.
+    without one as "reversed" backwards, which inflates the rate. `naive_intersection_count`
+    is reported alongside so the size of that correction stays visible in the output.
 
     Reversal is not self-reversal: user prompting is a likely driver. That does not weaken
     the metric, it IS the metric — it measures whether the skip judgement survives contact
@@ -161,38 +172,33 @@ def summarize_skips(
     """
     reasons = Counter()
     low_quality = 0
-
-    def sessions_declaring(records: Iterable[Dict[str, Any]]) -> set:
-        return {
-            str(r.get("session_id"))
-            for r in records
-            if r.get("skip_declared") and r.get("session_id")
-        }
-
-    declared_all = sessions_declaring(all_records)
-    declared_window = sessions_declaring(window_records)
-    declaration_rows = sum(1 for r in all_records if r.get("skip_declared"))
-
+    declaration_rows = 0
+    declared_all: set = set()
     # Earliest declaration per session — the ordering reference for the join below.
     first_declaration: Dict[str, datetime] = {}
-    for record in all_records:
-        sid = str(record.get("session_id") or "")
-        if not record.get("skip_declared") or not sid:
-            continue
-        ts = parse_iso_timestamp(str(record.get("timestamp", "")))
-        if ts and (sid not in first_declaration or ts < first_declaration[sid]):
-            first_declaration[sid] = ts
 
     for record in all_records:
         if not record.get("skip_declared"):
             continue
+        declaration_rows += 1
+        sid = str(record.get("session_id") or "")
+        if sid:
+            declared_all.add(sid)
+            ts = parse_iso_timestamp(str(record.get("timestamp", "")))
+            if ts and (sid not in first_declaration or ts < first_declaration[sid]):
+                first_declaration[sid] = ts
         reason = str(record.get("skip_reason", "")).strip()
-        if not reason:
-            continue
-        normalized = normalize_reason(reason)
-        reasons[normalized[:100]] += 1
-        if len(normalized) < 12 or normalized in {"n/a", "none", "skip", "quick check"}:
-            low_quality += 1
+        if reason:
+            normalized = normalize_reason(reason)
+            reasons[normalized[:100]] += 1
+            if is_low_quality_reason(normalized):
+                low_quality += 1
+
+    declared_window = {
+        str(r.get("session_id"))
+        for r in window_records
+        if r.get("skip_declared") and r.get("session_id")
+    }
 
     reversed_all = {
         sid for sid in declared_all
