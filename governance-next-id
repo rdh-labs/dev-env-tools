@@ -71,6 +71,21 @@ scan_max() {
   echo "${max:-0}"
 }
 
+scan_dupes() {
+  # Return any ID that appears as an ENTRY HEADING more than once, one per line.
+  # Added 2026-08-11: `verify` compared counter-to-max only, so it returned
+  # "OK" over a file containing a duplicate primary key. A concurrent-allocation
+  # collision (two sessions allocate before either writes; git merges both clean
+  # appends) is invisible to a max comparison by construction. This closes that.
+  # Uses the same PATTERN_FOR heading anchor as scan_max, so prose cross-references
+  # to an ID are not counted — only real entry headings.
+  local type="$1"
+  local file="${FILE_FOR[$type]}"
+  local pattern="${PATTERN_FOR[$type]}"
+  if [[ ! -f "$file" ]]; then return 0; fi
+  grep -oE "$pattern" "$file" | sort | uniq -d || true
+}
+
 format_id() {
   local type="$1" num="$2"
   # shellcheck disable=SC2059
@@ -173,7 +188,14 @@ cmd_verify() {
       echo "'"$type"': DRIFT — counter=$counter_val but file_max=$file_max (expected counter>=$expected)" >&2
       exit 1
     fi
-    echo "'"$type"': OK (counter=$counter_val, file_max=$file_max)"
+    dupes=$(scan_dupes "'"$type"'")
+    if [[ -n "$dupes" ]]; then
+      echo "'"$type"': DUPLICATE ENTRY IDS — $(echo $dupes | tr "\n" " ")" >&2
+      echo "  counter=$counter_val file_max=$file_max are consistent, but a primary key repeats." >&2
+      echo "  A counter-vs-max comparison cannot see this; do not treat a passing counter as uniqueness." >&2
+      exit 1
+    fi
+    echo "'"$type"': OK (counter=$counter_val, file_max=$file_max, no duplicate entry ids)"
   '
 }
 
