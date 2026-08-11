@@ -190,8 +190,27 @@ def main() -> int:
     # whichever PEER session wrote last, so the tool would draft a tail from another session's
     # work. Same class as the documented `usage.jsonl rows[-1]` trap. Resolve from the
     # environment, and refuse rather than guess.
-    sid = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID", "") \
-        or os.environ.get("CLAUDE_SESSION_ID", "")
+    # identity-authoritative: ~/.claude/.sessions/<uuid>.json — the per-session registry the
+    # SessionStart hook writes from the documented stdin session_id. An env var is only a
+    # LOOKUP KEY and is accepted ONLY after it validates against that registry; two distinct
+    # validated keys is a conflict we refuse rather than guess through. Pattern taken from the
+    # /handoff skill's authority-anchored resolver.
+    SESSIONS = Path.home() / ".claude" / ".sessions"
+    UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+    def _validated(k: str) -> str:
+        return k if k and UUID_RE.match(k) and (SESSIONS / f"{k}.json").exists() else ""
+
+    if args.session:
+        sid = args.session                      # explicit operator intent overrides discovery
+    else:
+        v1 = _validated(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+        v2 = _validated(os.environ.get("CLAUDE_SESSION_ID", ""))
+        if v1 and v2 and v1 != v2:
+            print("REFUSING: two distinct validated session ids in the environment. "
+                  "Pass --session explicitly.")
+            return 2
+        sid = v1 or v2
     if not sid:
         print("REFUSING TO GUESS: no session id. Pass --session <uuid> or set")
         print("CLAUDE_CODE_SESSION_ID. Picking the newest transcript by mtime would select")
