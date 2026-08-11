@@ -34,8 +34,33 @@ TESTED_RE = re.compile(r"\b(sabotage|self-check|fixture|verified by|test(?:ed)?)
 PROSE_RE = re.compile(r"\bnone\b|unbuilt|ACKs only|documented|recorded|noted", re.I)
 
 
+def has_trigger(cell: str) -> bool:
+    """Does anything make this remediation RUN without someone remembering?
+
+    Session-end critique 2026-08-11: BUILT previously meant "a commit SHA that resolves",
+    which proves a FILE WAS COMMITTED, not that a MECHANISM RUNS. `crontab -l` showed 5 of 6
+    tools built that day had zero triggers and zero references outside tools/ — all five
+    graded BUILT. The instrument for measuring form-over-substance was committing
+    form-over-substance. A committed file with no trigger is SHIPPED, not BUILT.
+    """
+    import subprocess
+    names = re.findall(r"[\w.-]+\.(?:py|sh|mjs|js)", cell)
+    if not names:
+        return False
+    try:
+        cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        cron = ""
+    settings = ""
+    sp = Path.home() / ".claude" / "settings.json"
+    if sp.exists():
+        try: settings = sp.read_text(errors="replace")
+        except OSError: pass
+    return any(n in cron or n in settings for n in names)
+
+
 def classify(cell: str, repo: Path | None) -> str:
-    """One register row's remediation cell -> BUILT / TESTED / WAIVED / PROSE.
+    """One register row's remediation cell -> BUILT / SHIPPED / TESTED / WAIVED / PROSE.
 
     Order matters: a cell claiming BOTH a SHA and 'none' is BUILT, because the artifact
     exists regardless of how the prose hedges. A SHA that does not RESOLVE is not BUILT --
@@ -45,7 +70,9 @@ def classify(cell: str, repo: Path | None) -> str:
         return "WAIVED"
     for sha in SHA_RE.findall(cell):
         if repo is None or sha_resolves(sha, repo):
-            return "BUILT"
+            # A SHA proves a file exists. A TRIGGER proves it runs. They are different claims
+            # and conflating them is exactly the defect this tool exists to measure.
+            return "BUILT" if has_trigger(cell) else "SHIPPED"
     if TESTED_RE.search(cell):
         return "TESTED"
     return "PROSE"
@@ -74,10 +101,11 @@ def parse(text: str, repo: Path | None) -> list[tuple[str, str]]:
 
 
 def report(rows, threshold=THRESHOLD_PCT):
-    counts = {k: 0 for k in ("BUILT", "TESTED", "WAIVED", "PROSE")}
+    counts = {k: 0 for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE")}
     for _, k in rows:
         counts[k] += 1
     total = len(rows)
+    # SHIPPED is NOT converted. A file nobody runs remediates nothing.
     converted = counts["BUILT"] + counts["TESTED"] + counts["WAIVED"]
     pct = (100.0 * converted / total) if total else 0.0
     return counts, total, converted, pct, pct >= threshold
@@ -89,13 +117,19 @@ def self_check() -> int:
     ok.append(("an unresolvable SHA is NOT counted as BUILT",
                classify("fixed in deadbeef1", Path("/nonexistent")) != "BUILT"))
     ok.append(("'none' is PROSE", classify("none", None) == "PROSE"))
+    ok.append(("a SHA with NO trigger is SHIPPED, not BUILT — a file nobody runs",
+               classify("fixed in 13de4bf, see foo-with-no-trigger.py", None) == "SHIPPED"))
+    ok.append(("SHIPPED must NOT count toward conversion",
+               report([("a", "SHIPPED"), ("b", "SHIPPED")], 25.0)[3] == 0.0))
     ok.append(("'ACKs only; unbuilt' is PROSE", classify("ACKs only; unbuilt", None) == "PROSE"))
     ok.append(("an explicit waiver is WAIVED, not PROSE",
                classify("no mechanism warranted -- one-off", None) == "WAIVED"))
     ok.append(("a sabotage-proven fixture counts as TESTED",
                classify("sabotage-proven fixture added", None) == "TESTED"))
-    ok.append(("a SHA outranks hedging prose in the same cell",
-               classify("mostly documented, none really, 13de4bf", None) == "BUILT"))
+    ok.append(("a SHA outranks hedging prose in the same cell (SHIPPED: no trigger named)",
+               classify("mostly documented, none really, 13de4bf", None) == "SHIPPED"))
+    ok.append(("a SHA naming a TRIGGERED file is BUILT",
+               classify("fixed in 13de4bf, session-artifact-sweep.py", None) == "BUILT"))
     rows = [("a", "BUILT"), ("b", "PROSE"), ("c", "PROSE"), ("d", "PROSE")]
     _, total, conv, pct, passed = report(rows, threshold=25.0)
     ok.append(("1 of 4 converted == 25.0% and meets a 25% threshold",
@@ -153,7 +187,7 @@ def main() -> int:
 
     print(f"ANOMALY CONVERSION: {pct:.1f}% ({converted}/{total} instances closed by something "
           f"that EXISTS)")
-    for k in ("BUILT", "TESTED", "WAIVED", "PROSE"):
+    for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE"):
         print(f"  {k:7s} {counts[k]}")
     if counts["PROSE"]:
         print(f"\n  {counts['PROSE']} instance(s) closed in PROSE. Prose is the failure mode,")
