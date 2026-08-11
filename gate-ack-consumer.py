@@ -11,8 +11,16 @@ gate blocks silently evaporates. This tool reports that as a FAILURE, not a foot
 
 WHAT IT ANSWERS, which no one could answer before:
   - which gates actually fire, ranked -- so enforcement effort can follow reality
-  - fire_count per block: a gate that fires repeatedly before an ACK is one being worked
-    around, not one being heeded
+
+FIRE_COUNT MEANS SOMETHING ELSE -- corrected 2026-08-11 by independent review, after this file
+shipped asserting the wrong mechanism and a governance proposal was built on top of it.
+It is NOT the guarded gate re-firing, and NOT a count of workarounds. Traced to
+`evidence_gate.py::check_gate_block_sentinel` (dev-env-config/claude/hooks/stop/evidence_gate.py
+:2491-2659): it counts A13 SELF-FIRES -- how many agent turns elapsed before a response
+contained `## Anomaly Analysis` -- attributed post-hoc to whichever gate originally blocked.
+So it measures the agent's PAPERWORK-COMPLIANCE LATENCY with an unrelated meta-gate, not
+evasion of the guarded action. A high value means the ACK was slow, not that the gate was
+routed around. Do not use it as an efficacy signal for the gate it is attributed to.
   - ack latency: how long a block sat before it was acknowledged
   - how much of the record is already past the retention horizon
 
@@ -69,13 +77,13 @@ def load(paths) -> tuple[list[dict], int]:
 def analyse(rows, bad, now=None):
     now = now or datetime.now(timezone.utc)
     by_hook = collections.Counter()
-    worked_around = 0        # fire_count > 1 => the gate fired again before being heeded
+    a13_latency_gt1 = 0      # fire_count > 1: see the FIRE_COUNT note in the docstring
     latencies, at_risk, undatable, future = [], 0, 0, 0
     for r in rows:
         by_hook[r.get("hook", "<unknown>")] += 1
         try:
             if int(r.get("fire_count", 1)) > 1:
-                worked_around += 1
+                a13_latency_gt1 += 1
         except (TypeError, ValueError):
             pass
         bt, at = _ts(r.get("block_timestamp")), _ts(r.get("acked_at"))
@@ -93,7 +101,7 @@ def analyse(rows, bad, now=None):
             future += 1          # a future stamp is corrupt data, never "comfortably fresh"
     return {
         "total": len(rows), "unparseable": bad, "by_hook": by_hook.most_common(),
-        "worked_around": worked_around,
+        "a13_latency_gt1": a13_latency_gt1,
         "median_ack_seconds": (sorted(latencies)[len(latencies) // 2] if latencies else None),
         "past_retention": at_risk, "undatable": undatable, "future_stamped": future,
         # A record past the horizon is not "old" -- it is GONE the next time /tmp is reaped.
@@ -118,9 +126,9 @@ def self_check() -> int:
     ok.append(("a fresh row must read OK",
                analyse([row("g", 1, 2, 1)], 0, now)["verdict"] == "OK"))
     ok.append(("fire_count > 1 counts as worked-around",
-               analyse([row("g", 3, 2, 1)], 0, now)["worked_around"] == 1))
+               analyse([row("g", 3, 2, 1)], 0, now)["a13_latency_gt1"] == 1))
     ok.append(("fire_count == 1 is NOT worked-around",
-               analyse([row("g", 1, 2, 1)], 0, now)["worked_around"] == 0))
+               analyse([row("g", 1, 2, 1)], 0, now)["a13_latency_gt1"] == 0))
     a = analyse([row("alpha", 1, 2, 1), row("alpha", 1, 3, 2), row("beta", 1, 2, 1)], 0, now)
     ok.append(("hooks rank by frequency", a["by_hook"][0] == ("alpha", 2)))
     ok.append(("ack latency is computed", a["median_ack_seconds"] is not None))
@@ -177,7 +185,8 @@ def main() -> int:
           f"{a['unparseable']} unparseable")
     if a["median_ack_seconds"] is not None:
         print(f"  median ack latency: {a['median_ack_seconds']:.0f}s")
-    print(f"  blocks that fired MORE THAN ONCE before being heeded: {a['worked_around']}")
+    print(f"  blocks where the A13 ACK took >1 turn: {a['a13_latency_gt1']}  "
+          f"(compliance latency, NOT gate evasion -- see docstring)")
     print("  gates by fire volume:")
     for hook, n in a["by_hook"][:10]:
         print(f"    {n:4d}  {hook}")
