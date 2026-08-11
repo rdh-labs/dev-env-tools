@@ -281,6 +281,28 @@ def self_check() -> int:
         ok.append(("the name guard alone would have MISSED the innocently-named file",
                    looks_like_credential("innocent-notes.txt") is False))
 
+    # ISOLATED same-size fixture. The version inside the shared block below asserted r == 1,
+    # but an EARLIER conflict in that same source root already forced r == 1 -- so it passed
+    # with the same-size check deleted. A fixture that cannot fail alone proves nothing.
+    with tempfile.TemporaryDirectory() as td_iso:
+        ti = Path(td_iso)
+        (ai := ti/"a").mkdir(); (si := ti/"s").mkdir()
+        (di := si/"claude-same").mkdir()
+        (di/"gate_blocks_acked.jsonl").write_text('{"z":22}\n')   # same LENGTH...
+        (ai/"claude-same.jsonl").write_text('{"z":11}\n')         # ...different CONTENT
+        ok.append(("same-size different-content must be reported, not silently skipped",
+                   archive_gate_ledgers(ai, src_root=si) == 1))
+        ok.append(("...and the archive must be left byte-for-byte intact",
+                   (ai/"claude-same.jsonl").read_text() == '{"z":11}\n'))
+    with tempfile.TemporaryDirectory() as td_ok:
+        to = Path(td_ok)
+        (ao := to/"a").mkdir(); (so := to/"s").mkdir()
+        (do := so/"claude-id").mkdir()
+        (do/"gate_blocks_acked.jsonl").write_text('{"z":1}\n')
+        (ao/"claude-id.jsonl").write_text('{"z":1}\n')            # identical -> clean run
+        ok.append(("an identical source is a CLEAN run, not a conflict",
+                   archive_gate_ledgers(ao, src_root=so) == 0))
+
     # ARCHIVE fixtures. The previous version pointed src_root at an EMPTY directory, so the
     # copy loop never ran and the test proved nothing -- two sabotages (removing the
     # append-only guard, and clearing the archive) both passed it 15/15. A fixture must
