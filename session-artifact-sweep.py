@@ -307,6 +307,22 @@ def self_check() -> int:
         archive_gate_ledgers(arch, src_root=srcroot)
         ok.append(("a GROWN source must be copied through",
                    (arch/"claude-aaa.jsonl").stat().st_size > big_before))
+        (sess3 := srcroot/"claude-ccc").mkdir()
+        (sess3/"gate_blocks_acked.jsonl").write_text('{"c":9}\n{"c":9}\n')
+        (arch/"claude-ccc.jsonl").write_text('{"c":1}\n')     # archive holds DIFFERENT bytes
+        archive_gate_ledgers(arch, src_root=srcroot)
+        ok.append(("a LARGER but REWRITTEN source is a conflict, never an overwrite",
+                   (arch/"claude-ccc.jsonl").read_text() == '{"c":1}\n'))
+        (sess4 := srcroot/"claude-ddd").mkdir()
+        (sess4/"gate_blocks_acked.jsonl").write_text('{"d":22}\n')   # same LENGTH...
+        (arch/"claude-ddd.jsonl").write_text('{"d":11}\n')           # ...different CONTENT
+        r = archive_gate_ledgers(arch, src_root=srcroot)
+        ok.append(("same-size different-content must be reported, not silently skipped",
+                   r == 1))
+        keep = (arch/"claude-bbb.jsonl").read_bytes()
+        archive_gate_ledgers(arch, src_root=srcroot)
+        ok.append(("re-running must leave archived bytes byte-for-byte identical",
+                   (arch/"claude-bbb.jsonl").read_bytes() == keep))
 
     # VERDICT-LINE fixtures: without these, hardcoding verdict="COMPLETE" passes everything.
     with tempfile.TemporaryDirectory() as td:
@@ -421,23 +437,53 @@ def archive_gate_ledgers(dest: Path = GATE_LEDGER_ARCHIVE, src_root: Path = Path
     without touching a hook, and a snapshot on a timer beats a snapshot taken once by hand.
     """
     dest.mkdir(parents=True, exist_ok=True)
-    copied = 0
+    copied = conflicts = failures = 0
     for src in sorted(src_root.glob("claude-*/gate_blocks_acked.jsonl")):
         target = dest / f"{src.parent.name}.jsonl"
         try:
             # Append-only ledgers: only copy when the source has MORE bytes, so a reaped or
             # truncated source can never shrink the archive.
             if target.exists() and target.stat().st_size >= src.stat().st_size:
+                # SAME size does NOT mean same content. Independent Agent review, 2026-08-11:
+                # a 52-byte stale ledger stayed archived while 52 bytes of genuinely different
+                # fresh data were discarded forever, under a printed success message. Size is a
+                # cheap prefilter, never an equality test.
+                if (target.stat().st_size == src.stat().st_size
+                        and target.read_bytes() != src.read_bytes()):
+                    print(f"  CONFLICT: {src.parent.name} is the same SIZE but different "
+                          f"CONTENT — archive left intact, fresh data NOT captured",
+                          file=sys.stderr)
+                    conflicts += 1
                 continue
-            shutil.copy2(src, target)
-        except OSError:
+            data = src.read_bytes()
+            if target.exists() and not data.startswith(target.read_bytes()):
+                # APPEND-ONLY CONTRACT: the source must EXTEND what we hold. A larger but
+                # REWRITTEN ledger is a conflict, not an update -- size alone cannot tell them
+                # apart. Independent review, 2026-08-11.
+                print(f"  CONFLICT: {src.parent.name} is larger but not an extension of the "
+                      f"archive — NOT overwritten", file=sys.stderr)
+                conflicts += 1
+                continue
+            # Write a sibling then os.replace: atomic on POSIX. shutil.copy2 TRUNCATES the
+            # destination first, so an interrupted copy destroyed the archive it protects.
+            tmp = target.with_suffix(".part")
+            tmp.write_bytes(data)
+            os.replace(tmp, target)
+        except OSError as exc:
+            print(f"  FAILED: {src} ({exc})", file=sys.stderr)
+            failures += 1
             continue
-        if target.exists() and target.stat().st_size == src.stat().st_size:
+        if target.exists() and target.read_bytes() == data:
             copied += 1
+        else:
+            failures += 1
     total = sum(1 for f in dest.glob("*.jsonl") for line in f.read_text(errors="replace").splitlines()
                 if line.strip().startswith("{"))
-    print(f"GATE LEDGER ARCHIVE: {copied} ledger(s) updated, {total} record(s) now durable at {dest}")
-    return 0
+    print(f"GATE LEDGER ARCHIVE: {copied} ledger(s) updated, {total} brace-prefixed line(s) "
+          f"in archive at {dest}")
+    if conflicts or failures:
+        print(f"  {conflicts} conflict(s), {failures} failure(s) — NOT a clean run", file=sys.stderr)
+    return 1 if (conflicts or failures) else 0
 
 
 def main() -> int:
