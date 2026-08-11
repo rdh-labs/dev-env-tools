@@ -102,6 +102,24 @@ def self_check() -> int:
                total == 4 and conv == 1 and abs(pct - 25.0) < 1e-9 and passed))
     _, _, _, _, failed_ok = report([("a", "PROSE")] * 4, threshold=25.0)
     ok.append(("0 of 4 converted must FAIL the threshold", failed_ok is False))
+    # I/O-BOUNDARY fixtures. Independent review (ACC-3): gutting parse() to return [] left
+    # 8/8 PASSING, because every fixture called classify()/report() directly. A reader that
+    # returns nothing then reports "0/0" as if it had measured something.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        reg = pathlib.Path(td)/"reg.md" if False else Path(td)/"reg.md"
+        reg.write_text("| # | Instance | Root | Chain? | Remediation |\n"
+                       "|---|---|---|---|---|\n"
+                       "| 1 | thing one | R1 | yes | none |\n"
+                       "| 2 | thing two | R2 | yes | no mechanism warranted -- one-off |\n")
+        parsed = parse(reg.read_text(), None)
+        ok.append(("parse() must actually READ table rows (not silently return [])",
+                   len(parsed) == 2))
+        ok.append(("parse() must classify the rows it read",
+                   sorted(k for _, k in parsed) == ["PROSE", "WAIVED"]))
+        _, total, _, _, _ = report(parsed)
+        ok.append(("an empty parse must not masquerade as a measured result", total == 2))
+
     bad = [m for m, good in ok if not good]
     for m in bad:
         print(f"  [FAIL/self-check] {m}")

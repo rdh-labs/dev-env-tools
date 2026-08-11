@@ -134,6 +134,18 @@ def self_check() -> int:
                analyse([{"hook": "g", "acked_at": "not-a-date"}], 0, now)["verdict"] == "UNRELIABLE"))
     ok.append(("a FUTURE timestamp is corrupt, not fresh",
                analyse([row("g", 1, -50, -50)], 0, now)["verdict"] == "UNRELIABLE"))
+    # I/O-BOUNDARY fixtures. Independent review (GAC-2): gutting load() to return ([], 0) left
+    # 12/12 PASSING, because every fixture built row dicts by hand and called analyse().
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        led = Path(td)/"l.jsonl"
+        led.write_text('{"hook":"g","fire_count":1}\n' + 'NOT JSON\n' + '{"hook":"h","fire_count":2}\n')
+        rows, badn = load([led])
+        ok.append(("load() must actually READ rows (not silently return [])", len(rows) == 2))
+        ok.append(("load() must COUNT malformed lines, not drop them", badn == 1))
+        ok.append(("a ledger that fails to load must not read as OK",
+                   analyse(*load([Path(td)/"missing.jsonl"]), now)["verdict"] == "EMPTY"))
+
     bad = [m for m, good in ok if not good]
     for m in bad:
         print(f"  [FAIL/self-check] {m}")
