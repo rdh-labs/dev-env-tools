@@ -7,8 +7,15 @@ Measures two things that the workspace declares it wants and does not enforce:
      (create -> register -> version -> retire, IDEA-10101). Measured 2026-08-10:
      4 of 65 registered.
   2. OPTIMIZER USE -- prompt-optimizer-v1.md is an Active governed 5-phase
-     procedure (IDEA-10068). Measured 2026-08-10: ~5 of 65 genuine consumer
-     citations.
+     procedure (IDEA-10068).
+
+WHAT THE NUMBERS ARE, PRECISELY -- the metric names are shorthand and overstate:
+  "registered" = the filename appears ANYWHERE in prompt-library.md. Not lifecycle
+     state, not a structured entry, not versioning or retirement.
+  "cites optimizer" = a regex hit in the file body. Not intent, not genuine use; the
+     upper bound deliberately includes negations ("did not use prompt-optimizer").
+  scope = TOP-LEVEL *.md in ~/dev/share only. No recursion, no other extensions.
+Neither number is evidence the procedure was followed -- only that it was mentioned.
 
 Why this exists: the gap was measurable for months and nobody measured it twice,
 so drift was invisible. Detection existed (8 open Dart tasks); measurement did not.
@@ -52,13 +59,11 @@ SHARE = Path.home() / "dev" / "share"
 LIBRARY = SHARE / "prompt-library.md"
 LOG = Path.home() / ".metrics" / "prompt-deliverable-hygiene.jsonl"
 
-# CITATION MATCHERS -- a LOWER and an UPPER bound, never one number.
-# The first version of this script required the literal filename including ".md"
-# and reported 1 citation where the true count was at least 4: three deliverables
-# cite the procedure as a named workflow ("via prompt-optimizer-v1 protocol",
-# "prompt-optimizer Phase 5.5") rather than as a filename. A stricter matcher is
-# not a safer matcher -- it just moves the error into the false-negative column,
-# where nothing complains. Caught by an independent tool-enabled review, 2026-08-10.
+# CITATION MATCHERS -- a LOWER and an UPPER bound, never one number. Deliverables cite
+# the procedure both as a filename and as a bare workflow name ("via prompt-optimizer-v1
+# protocol", "prompt-optimizer Phase 5.5"), so a filename-only matcher understates by
+# several times. A stricter matcher is not a safer matcher: it moves the error into the
+# false-negative column, where nothing complains.
 CITE_STRICT_RE = re.compile(r"prompt-optimizer-v1\.md")          # lower bound: filename
 CITE_LOOSE_RE = re.compile(r"prompt-optimizer(?:-v1)?\b", re.I)  # upper bound: incl. negations
 
@@ -80,24 +85,39 @@ EXCLUDE = {
 EXCLUDE_PREFIX = ("AA-",)  # anomaly analyses that discuss prompts
 
 
-def _classify(paths: list[Path]) -> dict:
+def _read_corpus() -> tuple[dict[str, str], list[str], str, bool]:
+    """Read every candidate body once. -> (bodies, unreadable, lib_text, lib_readable).
+
+    Separated from classification so that _classify below is PURE and can be driven
+    by fixtures. A self-check that can only observe the live tree cannot tell working
+    logic apart from a corpus that happens not to expose the bug.
+    """
     try:
         lib_text = LIBRARY.read_text(errors="replace")
         lib_readable = True
     except OSError:
-        # exists() then read() is a TOCTOU race; and a missing library must not
+        # exists()-then-read() is a TOCTOU race, and a missing library must not
         # silently render every file "unregistered" -- that reads as a 0% hygiene
         # catastrophe when the real fault is a missing index.
         lib_text, lib_readable = "", False
-    registered, cite_lo, cite_hi, names, unreadable = [], [], [], [], []
-    for p in paths:
-        name = p.name
-        names.append(name)
+    bodies: dict[str, str] = {}
+    unreadable: list[str] = []
+    for p in sorted(SHARE.glob("*.md")):
         try:
-            body = p.read_text(errors="replace")
+            bodies[p.name] = p.read_text(errors="replace")
         except OSError:
+            unreadable.append(p.name)
+    return bodies, unreadable, lib_text, lib_readable
+
+
+def _classify(names: list[str], bodies: dict[str, str], lib_text: str) -> dict:
+    """Pure. No I/O -- every input is passed in, so fixtures can exercise it."""
+    registered, cite_lo, cite_hi, unreadable = [], [], [], []
+    for name in names:
+        body = bodies.get(name)
+        if body is None:
             unreadable.append(name)
-            continue  # excluded from citation counts rather than counted as non-citing
+            continue  # excluded from citation rates, never counted as non-citing
         if name in lib_text:
             registered.append(name)
         if CITE_STRICT_RE.search(body):
@@ -110,23 +130,21 @@ def _classify(paths: list[Path]) -> dict:
         "cite_lo": cite_lo,
         "cite_hi": cite_hi,
         "unreadable": unreadable,
-        "library_readable": lib_readable,
     }
 
 
-def _collect(regex: re.Pattern) -> list[Path]:
-    out = []
-    for p in sorted(SHARE.glob("*.md")):
-        if p.name in EXCLUDE or p.name.startswith(EXCLUDE_PREFIX):
-            continue
-        if regex.search(p.name):
-            out.append(p)
-    return out
+def _collect(regex: re.Pattern, all_names: list[str]) -> list[str]:
+    return [
+        n for n in all_names
+        if n not in EXCLUDE and not n.startswith(EXCLUDE_PREFIX) and regex.search(n)
+    ]
 
 
 def measure() -> dict:
-    strict = _classify(_collect(STRICT_RE))
-    loose = _classify(_collect(LOOSE_RE))
+    bodies, unreadable_all, lib_text, lib_readable = _read_corpus()
+    all_names = sorted(set(bodies) | set(unreadable_all))
+    strict = _classify(_collect(STRICT_RE, all_names), bodies, lib_text)
+    loose = _classify(_collect(LOOSE_RE, all_names), bodies, lib_text)
     result = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "matcher_note": (
@@ -145,32 +163,25 @@ def measure() -> dict:
         result[label] = {
             "total": total,
             "unreadable": len(data["unreadable"]),
-            # REGISTRATION IS A COUNT, NOT A RATE -- deliberately.
-            # IDEA-10101 scopes prompt-library.md to *reusable* prompts. Most files
-            # here are dated one-off session handoffs, which the registry does not
-            # want. Dividing registrations by "every prompt-shaped filename" produced
-            # a 6.6% figure that overstated the gap against a population the policy
-            # never asked to be registered. Eligibility needs human judgement, so this
-            # tool reports the count and refuses to manufacture a rate it cannot ground.
+            # REGISTRATION IS A COUNT, NOT A RATE -- deliberately. IDEA-10101 scopes
+            # prompt-library.md to *reusable* prompts, but most files matched here are
+            # dated one-off handoffs the registry never wanted. Eligibility needs human
+            # judgement, so any percentage would be against the wrong population.
             "registered": len(data["registered"]),
             # Citation IS meaningful over all deliverables, and is reported as a BOUND.
             "cites_lo": len(data["cite_lo"]),
             "cites_hi": len(data["cite_hi"]),
             "cites_lo_pct": round(100 * len(data["cite_lo"]) / scored, 1) if scored else None,
             "cites_hi_pct": round(100 * len(data["cite_hi"]) / scored, 1) if scored else None,
-            "library_readable": data["library_readable"],
+            "library_readable": lib_readable,
         }
-        # Never raise: an AssertionError would violate the exit-0-always contract this
-        # file exists to uphold, and `python -O` strips asserts entirely -- the opposite
-        # failure. Report the invariant breach instead of crashing on it.
-        # Reachable invariant only. An earlier version compared sublists of `names`
-        # against len(names) -- structurally impossible, i.e. a safeguard that could
-        # never fire. A check that cannot fail is not a check; it is reassurance.
+        # Warn, never raise: an AssertionError would violate the exit-0-always contract,
+        # and `python -O` strips asserts entirely -- the opposite failure.
         if len(data["cite_lo"]) > len(data["cite_hi"]):
             warnings.append(f"{label}: strict citations exceed loose -- the bounds are inverted")
         if data["unreadable"]:
             warnings.append(f"{label}: {len(data['unreadable'])} unreadable file(s), excluded from rates")
-        if not data["library_readable"]:
+        if not lib_readable:
             warnings.append(f"{label}: prompt-library.md unreadable -- registration counts are not meaningful")
 
     result["warnings"] = warnings
@@ -194,42 +205,59 @@ def self_check() -> int:
     correctly' from 'measured nothing'. These fixtures fail loudly if the
     classification logic breaks.
     """
-    failures = []
-    CHECKS_RUN = 5  # keep in step with the numbered checks below; printed, not assumed
+    checks: list[tuple[str, bool]] = []  # (failure message, failed?) -- count is derived
 
-    # 1. Both matchers must actually select something on the live tree.
-    if not _collect(STRICT_RE):
-        failures.append("strict matcher selected 0 files -- matcher or path is broken")
-    # 2. Loose must be a superset of strict, by construction.
-    s = {p.name for p in _collect(STRICT_RE)}
-    l = {p.name for p in _collect(LOOSE_RE)}
-    if not s <= l:
-        failures.append(f"strict is not a subset of loose: {sorted(s - l)[:3]}")
-    # 3. The index and the procedure must never be counted as deliverables.
-    if any(n in (s | l) for n in ("prompt-library.md", "prompt-optimizer-v1.md")):
-        failures.append("self-referential file leaked into the deliverable set")
-    # 4. Rates must be well-formed.
+    def check(msg: str, ok: bool) -> None:
+        checks.append((msg, not ok))
+
+    # --- FIXTURES: synthetic inputs with known answers. These are the checks that
+    # actually prove the logic; the live-tree checks below only prove it ran.
+    FIX_BODIES = {
+        "a-prompt.md": "see prompt-optimizer-v1.md for the procedure",  # strict + loose
+        "b-prompt.md": "optimized via prompt-optimizer-v1 protocol",     # loose only
+        "c-prompt.md": "no reference at all",                            # neither
+        "d-prompt.md": "prompt-optimizer mentioned",                     # loose only
+    }
+    FIX_LIB = "| Thing | `~/dev/share/a-prompt.md` | IDEA-1 |"
+    fx = _classify(sorted(FIX_BODIES), FIX_BODIES, FIX_LIB)
+    check(f"fixture: strict citations {fx['cite_lo']} != ['a-prompt.md']",
+          fx["cite_lo"] == ["a-prompt.md"])
+    check(f"fixture: loose citations {fx['cite_hi']} != a,b,d",
+          fx["cite_hi"] == ["a-prompt.md", "b-prompt.md", "d-prompt.md"])
+    check(f"fixture: registered {fx['registered']} != ['a-prompt.md']",
+          fx["registered"] == ["a-prompt.md"])
+    # A name absent from bodies must land in unreadable, never in a citation list.
+    fx2 = _classify(["ghost.md"], {}, "")
+    check("fixture: missing body not routed to unreadable",
+          fx2["unreadable"] == ["ghost.md"] and not fx2["cite_hi"])
+    # Strict must never exceed loose on any input -- the bound that makes the range honest.
+    check("fixture: strict citations exceed loose", len(fx["cite_lo"]) <= len(fx["cite_hi"]))
+
+    # --- LIVE TREE: these prove the matcher is pointed at something real.
+    bodies, unreadable_all, lib_text, _ = _read_corpus()
+    all_names = sorted(set(bodies) | set(unreadable_all))
+    s = set(_collect(STRICT_RE, all_names))
+    l = set(_collect(LOOSE_RE, all_names))
+    check("live: strict matcher selected 0 files -- matcher or path is broken", bool(s))
+    check(f"live: strict is not a subset of loose: {sorted(s - l)[:3]}", s <= l)
+    check("live: self-referential file leaked into the deliverable set",
+          not any(n in (s | l) for n in ("prompt-library.md", "prompt-optimizer-v1.md")))
     m = measure()
     for label in ("strict", "loose"):
         b = m[label]
-        if b["cites_lo"] > b["cites_hi"]:
-            failures.append(f"{label}: strict citation count exceeds loose -- bounds inverted")
-        if b["registered"] > b["total"]:
-            failures.append(f"{label}: registered > total -- denominator is wrong")
+        check(f"live: {label} registered > total -- denominator is wrong",
+              b["registered"] <= b["total"])
         for k in ("cites_lo_pct", "cites_hi_pct"):
-            if b[k] is not None and not (0 <= b[k] <= 100):
-                failures.append(f"{label}: {k} out of range")
-    # 5. Zero data must never read as PASS.
-    if m["strict"]["total"] and m["verdict"] == "UNKNOWN":
-        failures.append("verdict UNKNOWN despite live data -- verdict logic broken")
+            check(f"live: {label} {k} out of range",
+                  b[k] is None or 0 <= b[k] <= 100)
+    check("live: verdict UNKNOWN despite live data -- verdict logic broken",
+          not (m["strict"]["total"] and m["verdict"] == "UNKNOWN"))
 
+    failures = [msg for msg, failed in checks if failed]
     for f in failures:
         print(f"  [FAIL/self-check] {f}")
     if not failures:
-        # Count derived, never hardcoded: an earlier version printed a literal "4/4"
-        # after a 5th check was added. A measurement-honesty tool reporting a stale
-        # hardcoded count is the defect it exists to catch.
-        print(f"  [PASS/self-check] {CHECKS_RUN}/{CHECKS_RUN} checks proved the evaluation logic")
+        print(f"  [PASS/self-check] {len(checks)}/{len(checks)} checks proved the evaluation logic")
     return 1 if failures else 0
 
 
