@@ -204,7 +204,11 @@ def main() -> int:
     if args.session:
         sid = args.session                      # explicit operator intent overrides discovery
     else:
+        # identity-authoritative: ~/.claude/.sessions/<uuid>.json — _validated() requires
+        # the registry file to exist, so this env var is a lookup key, never the source.
         v1 = _validated(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+        # identity-authoritative: ~/.claude/.sessions/<uuid>.json — _validated() requires
+        # the registry file to exist, so this env var is a lookup key, never the source.
         v2 = _validated(os.environ.get("CLAUDE_SESSION_ID", ""))
         if v1 and v2 and v1 != v2:
             print("REFUSING: two distinct validated session ids in the environment. "
