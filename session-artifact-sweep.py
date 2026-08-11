@@ -281,6 +281,14 @@ def self_check() -> int:
         ok.append(("the name guard alone would have MISSED the innocently-named file",
                    looks_like_credential("innocent-notes.txt") is False))
 
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)/"arch"; d.mkdir()
+        (d/"claude-x.jsonl").write_text('{"a":1}\n{"a":2}\n')
+        before = (d/"claude-x.jsonl").stat().st_size
+        archive_gate_ledgers(d, src_root=Path(td)/"empty")   # hermetic: no real /tmp reads
+        ok.append(("archiving must never shrink or clear an existing archive",
+                   (d/"claude-x.jsonl").exists() and (d/"claude-x.jsonl").stat().st_size == before))
+
     # VERDICT-LINE fixtures: without these, hardcoding verdict="COMPLETE" passes everything.
     with tempfile.TemporaryDirectory() as td:
         t = Path(td); (s2 := t/"s").mkdir(); (d2 := t/"d").mkdir()
@@ -381,11 +389,45 @@ def audit_credentials() -> int:
     return 1 if hits else 0
 
 
+GATE_LEDGER_ARCHIVE = Path.home() / "dev/share/gate-ack-archive"
+
+
+def archive_gate_ledgers(dest: Path = GATE_LEDGER_ARCHIVE, src_root: Path = Path("/tmp")) -> int:
+    """Copy every session's gate_blocks_acked.jsonl somewhere durable.
+
+    CLAUDE.md calls that ledger the DURABLE record of gate-block acknowledgements. It is
+    written to /tmp/claude-<session>/, which is reaped in ~24-36h. Measured 2026-08-11:
+    92 of 111 records were already past the horizon. This is not the ideal fix -- the ideal
+    fix is writing it somewhere durable in the first place -- but it stops an ACTIVE loss
+    without touching a hook, and a snapshot on a timer beats a snapshot taken once by hand.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for src in sorted(src_root.glob("claude-*/gate_blocks_acked.jsonl")):
+        target = dest / f"{src.parent.name}.jsonl"
+        try:
+            # Append-only ledgers: only copy when the source has MORE bytes, so a reaped or
+            # truncated source can never shrink the archive.
+            if target.exists() and target.stat().st_size >= src.stat().st_size:
+                continue
+            shutil.copy2(src, target)
+        except OSError:
+            continue
+        if target.exists() and target.stat().st_size == src.stat().st_size:
+            copied += 1
+    total = sum(1 for f in dest.glob("*.jsonl") for line in f.read_text(errors="replace").splitlines()
+                if line.strip().startswith("{"))
+    print(f"GATE LEDGER ARCHIVE: {copied} ledger(s) updated, {total} record(s) now durable at {dest}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     ap.add_argument("--all-sessions", action="store_true", help="scheduled mode: check every live session")
     ap.add_argument("--self-check", action="store_true")
+    ap.add_argument("--archive-gate-ledgers", action="store_true",
+                    help="copy gate_blocks_acked.jsonl out of /tmp before retention reaps it")
     ap.add_argument("--audit-credentials", action="store_true",
                     help="read-only: find secret-shaped content in ephemeral session dirs")
     # NOT required=True: that made --self-check and --all-sessions unrunnable without an
@@ -398,6 +440,9 @@ def main() -> int:
     if args.self_check:
         print("SESSION ARTIFACT SWEEP: self-check")
         return self_check()
+
+    if args.archive_gate_ledgers:
+        return archive_gate_ledgers()
 
     if args.audit_credentials:
         return audit_credentials()
