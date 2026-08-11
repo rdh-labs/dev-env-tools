@@ -281,13 +281,32 @@ def self_check() -> int:
         ok.append(("the name guard alone would have MISSED the innocently-named file",
                    looks_like_credential("innocent-notes.txt") is False))
 
+    # ARCHIVE fixtures. The previous version pointed src_root at an EMPTY directory, so the
+    # copy loop never ran and the test proved nothing -- two sabotages (removing the
+    # append-only guard, and clearing the archive) both passed it 15/15. A fixture must
+    # EXERCISE the path it claims to cover.
     with tempfile.TemporaryDirectory() as td:
-        d = Path(td)/"arch"; d.mkdir()
-        (d/"claude-x.jsonl").write_text('{"a":1}\n{"a":2}\n')
-        before = (d/"claude-x.jsonl").stat().st_size
-        archive_gate_ledgers(d, src_root=Path(td)/"empty")   # hermetic: no real /tmp reads
-        ok.append(("archiving must never shrink or clear an existing archive",
-                   (d/"claude-x.jsonl").exists() and (d/"claude-x.jsonl").stat().st_size == before))
+        t = Path(td)
+        (arch := t/"arch").mkdir()
+        (srcroot := t/"src").mkdir()
+        (sess := srcroot/"claude-aaa").mkdir()
+        (sess/"gate_blocks_acked.jsonl").write_text('{"a":1}\n')          # 1 record, SMALL
+        (arch/"claude-aaa.jsonl").write_text('{"a":1}\n{"a":2}\n{"a":3}\n')  # 3 records, BIG
+        big_before = (arch/"claude-aaa.jsonl").stat().st_size
+        archive_gate_ledgers(arch, src_root=srcroot)
+        ok.append(("a TRUNCATED source must never shrink the archive",
+                   (arch/"claude-aaa.jsonl").stat().st_size == big_before))
+        (sess2 := srcroot/"claude-bbb").mkdir()
+        (sess2/"gate_blocks_acked.jsonl").write_text('{"b":1}\n{"b":2}\n')
+        archive_gate_ledgers(arch, src_root=srcroot)
+        ok.append(("a NEW session ledger must be archived",
+                   (arch/"claude-bbb.jsonl").exists()))
+        ok.append(("archiving must not delete unrelated archived ledgers",
+                   (arch/"claude-aaa.jsonl").exists()))
+        (sess/"gate_blocks_acked.jsonl").write_text('{"a":1}\n{"a":2}\n{"a":3}\n{"a":4}\n')
+        archive_gate_ledgers(arch, src_root=srcroot)
+        ok.append(("a GROWN source must be copied through",
+                   (arch/"claude-aaa.jsonl").stat().st_size > big_before))
 
     # VERDICT-LINE fixtures: without these, hardcoding verdict="COMPLETE" passes everything.
     with tempfile.TemporaryDirectory() as td:
