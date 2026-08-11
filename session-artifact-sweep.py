@@ -22,6 +22,7 @@ did not ask it to fix them. That non-zero is deliberate: this is a check, not te
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import shutil
 import subprocess
@@ -46,15 +47,41 @@ def find_session_dir(session_id: str) -> Path | None:
 DURABLE_ROOTS = (Path.home() / ".claude" / "projects", Path.home() / "dev")
 
 
+def digest(path: Path) -> str | None:
+    """sha256 of the file's bytes. None when unreadable -- which is itself reportable."""
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
 def collect(root: Path) -> dict[str, Path]:
-    """Every file under root, keyed by basename. Extension-blind by construction."""
+    """Every file under root, keyed by path RELATIVE TO root -- never by basename.
+
+    Basename keying silently collapsed `a/report.py` and `b/report.py` into one entry, so a
+    durable directory holding either made both read as rescued. That is a false SAFE, the one
+    failure this tool exists to prevent. Found by independent review AFTER the local
+    self-check passed 4/4 -- the fixtures shared the author's blind spot.
+    """
     out: dict[str, Path] = {}
     if not root.exists():
         return out
     for p in root.rglob("*"):
-        if p.is_file():
-            out[p.name] = p
+        if p.is_symlink() and not p.exists():
+            out[str(p.relative_to(root))] = p      # broken symlink: counted, never invisible
+        elif p.is_file():
+            out[str(p.relative_to(root))] = p
     return out
+
+
+def content_index(root: Path) -> set[str]:
+    """Hashes of everything already durable. Rescue is proven by CONTENT, not by filename --
+    a stale file with the right name is not a copy of anything."""
+    return {d for p in collect(root).values() if (d := digest(p))}
 
 
 def already_durable(path: Path) -> Path | None:
@@ -68,7 +95,9 @@ def already_durable(path: Path) -> Path | None:
     if not path.is_symlink():
         return None
     target = path.resolve()
-    return target if any(str(target).startswith(str(r)) for r in DURABLE_ROOTS) else None
+    # is_relative_to, NOT startswith: "/home/u/dev-old" string-prefixes "/home/u/dev" and
+    # would have been wrongly excused as durable.
+    return target if any(target.is_relative_to(r) for r in DURABLE_ROOTS) else None
 
 
 def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0):
@@ -78,21 +107,34 @@ def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0):
                 "missing": [], "src": None, "durable": str(durable)}
 
     src = collect(src_dir)
-    dst = set(collect(durable))
-    missing, elsewhere = [], []
+    dst_hashes = content_index(durable)
+    missing, elsewhere, unreadable = [], [], []
     for name, path in sorted(src.items()):
-        if name in dst:
-            continue
         if (target := already_durable(path)) is not None:
             elsewhere.append({"name": name, "target": str(target)})
             continue
-        size_mb = path.stat().st_size / 1_048_576
+        d = digest(path)
+        if d is None:
+            # Broken symlink or unreadable file: NEVER silently dropped. Being unable to
+            # read it is a reason to report it, not a reason to omit it.
+            unreadable.append({"name": name, "path": str(path)})
+            continue
+        if d in dst_hashes:
+            continue                       # proven rescued: identical BYTES exist in durable
+        try:
+            size_mb = path.stat().st_size / 1_048_576
+        except OSError:
+            unreadable.append({"name": name, "path": str(path)})
+            continue
         missing.append({"name": name, "path": str(path), "size_mb": round(size_mb, 2),
                         "oversize": size_mb > skip_large_mb})
-    verdict = "COMPLETE" if not missing else "MISSING"
-    return {"verdict": verdict, "detail": f"{len(missing)} of {len(src)} source file(s) not in durable",
-            "missing": missing, "durable_elsewhere": elsewhere, "src": str(src_dir),
-            "durable": str(durable), "source_count": len(src), "durable_count": len(dst)}
+    verdict = "COMPLETE" if not (missing or unreadable) else "MISSING"
+    return {"verdict": verdict,
+            "detail": f"{len(missing)} of {len(src)} source file(s) have no byte-identical "
+                      f"copy in durable ({len(unreadable)} unreadable)",
+            "missing": missing, "durable_elsewhere": elsewhere, "unreadable": unreadable,
+            "src": str(src_dir), "durable": str(durable),
+            "source_count": len(src), "durable_count": len(dst_hashes)}
 
 
 def rescue(result, durable: Path) -> list[str]:
@@ -117,27 +159,44 @@ def rescue(result, durable: Path) -> list[str]:
 
 
 def self_check() -> int:
-    """Fixtures with known answers, run on every scheduled invocation. A checker that cannot
-    demonstrate it still works is indistinguishable from one that silently stopped working."""
+    """Fixtures with known answers, run on every scheduled invocation.
+
+    Every case below is a defect that ACTUALLY SHIPPED and was caught by independent review
+    after an earlier 4/4 local pass. Fixtures written by the author of the bug share the
+    author's blind spot, so these are regression tests against real history, not imagination.
+    """
     import tempfile
     ok = []
     with tempfile.TemporaryDirectory() as td:
         t = Path(td)
-        (src := t / "src").mkdir()
-        (dur := t / "dur").mkdir()
-        (src / "kept.md").write_text("x")
-        (src / "lost.py").write_text("y")          # the ORIGINAL defect: a non-.md file
-        (dur / "kept.md").write_text("x")
-        found = {m["name"] for m in
-                 [{"name": n} for n in sorted(collect(src)) if n not in set(collect(dur))]}
-        ok.append((".py file must be seen as missing (the extension-glob defect)", "lost.py" in found))
-        ok.append(("already-copied file must not be flagged", "kept.md" not in found))
+        (src := t / "src").mkdir(); (dur := t / "dur").mkdir()
+        (src / "a").mkdir(); (src / "b").mkdir()
+        (src / "kept.md").write_text("x");  (dur / "kept.md").write_text("x")
+        (src / "lost.py").write_text("y")                       # extension-glob defect
+        (src / "a" / "report.py").write_text("AAA")             # basename collision...
+        (src / "b" / "report.py").write_text("BBB")             # ...same name, other bytes
+        (dur / "report.py").write_text("AAA")                   # only ONE is really rescued
+        (src / "stale.md").write_text("fresh content")
+        (dur / "stale.md").write_text("DIFFERENT old content")  # right name, wrong bytes
+        idx = content_index(dur)
+        got = {n for n, pth in collect(src).items() if (d := digest(pth)) and d not in idx}
+        ok.append(("non-.md file must be flagged (the original extension-glob defect)",
+                   "lost.py" in got))
+        ok.append(("byte-identical copy must NOT be flagged", "kept.md" not in got))
+        ok.append(("basename collision: the UNRESCUED twin must be flagged",
+                   "b/report.py" in got))
+        ok.append(("basename collision: the rescued twin must not be flagged",
+                   "a/report.py" not in got))
+        ok.append(("same name + different bytes is NOT a rescue", "stale.md" in got))
         (real := t / "real.txt").write_text("z")
-        (link := src / "link.txt").symlink_to(real)
-        ok.append(("symlink outside a durable root is NOT excused", already_durable(link) is None))
+        ok.append(("symlink outside a durable root is NOT excused",
+                   already_durable(src / "l.txt") is None if not (src / "l.txt").symlink_to(real) else True))
+        (src / "broken.lnk").symlink_to(t / "gone")
+        ok.append(("broken symlink is counted, never invisible",
+                   "broken.lnk" in collect(src)))
     ok.append(("a nonexistent session is SOURCE_GONE, never COMPLETE",
                sweep("00000000-0000-0000-0000-000000000000", Path("/nonexistent"))["verdict"]
-               in ("SOURCE_GONE",)))
+               == "SOURCE_GONE"))
     failed = [m for m, good in ok if not good]
     for m in failed:
         print(f"  [FAIL/self-check] {m}")
@@ -153,7 +212,7 @@ def all_sessions(durable_root: Path) -> int:
     if not TMP_ROOT.exists():
         print("SWEEP(all): no /tmp session root — nothing to check")
         return 0
-    at_risk, checked = [], 0
+    at_risk, unstarted, checked = [], [], 0
     for proj in TMP_ROOT.iterdir():
         if not proj.is_dir():
             continue
@@ -163,11 +222,18 @@ def all_sessions(durable_root: Path) -> int:
             checked += 1
             durable = durable_root / f"session-{sess.name[:8]}-artifacts"
             r = sweep(sess.name, durable)
-            if r["verdict"] == "MISSING" and not durable.exists():
-                continue  # no rescue dir was ever started for this session — not a broken promise
-            if r["verdict"] == "MISSING":
-                at_risk.append((sess.name[:8], len(r["missing"])))
-    print(f"SWEEP(all): {checked} session(s) checked, {len(at_risk)} with unrescued artifacts")
+            if r["verdict"] != "MISSING":
+                continue
+            # Sessions with no rescue dir were previously SKIPPED as "not a broken promise".
+            # That printed "0 with unrescued artifacts" while real data sat in /tmp under a
+            # deletion clock — a false SAFE in the autonomous path, the worst place for one.
+            # They are now their own category: reported, counted, never suppressed.
+            (unstarted if not durable.exists() else at_risk).append(
+                (sess.name[:8], len(r["missing"])))
+    print(f"SWEEP(all): {checked} session(s) checked, {len(at_risk)} with unrescued artifacts, "
+          f"{len(unstarted)} with no rescue directory at all")
+    for sid, n in unstarted:
+        print(f"  NO-RESCUE-DIR  {sid}  {n} file(s) live only in /tmp")
     for sid, n in at_risk:
         print(f"  AT RISK  {sid}  {n} file(s) not in its rescue directory")
     if at_risk and (NOTIFY := Path.home() / "bin" / "notify.sh").exists():
