@@ -107,7 +107,7 @@ def self_check() -> int:
     # returns nothing then reports "0/0" as if it had measured something.
     import tempfile
     with tempfile.TemporaryDirectory() as td:
-        reg = pathlib.Path(td)/"reg.md" if False else Path(td)/"reg.md"
+        reg = Path(td)/"reg.md"
         reg.write_text("| # | Instance | Root | Chain? | Remediation |\n"
                        "|---|---|---|---|---|\n"
                        "| 1 | thing one | R1 | yes | none |\n"
