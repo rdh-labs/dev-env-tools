@@ -63,9 +63,14 @@ def _git(repo: Path, *args, timeout=180):
 # reported SEPARATELY and never auto-hidden -- silently filtering them would make the number
 # look clean, which is the defect this whole exercise exists to prevent.
 EXPECTED_PATH_RE = re.compile(
-    r"(?:^|/)(?:test|tests|fixtures?)/|corpus|scanner|credential_scanner|"
-    r"-fp-|fp-measurement|governed-outcomes-check|session-artifact-sweep|"
-    r"selfcheck-mutation-canary|sanitize-pii", re.I)
+    # PATH-SEGMENT anchored, never substring. The first version used bare `scanner|corpus`,
+    # so `services/keyscanner_service/prod_config.py` was excused — an independent reviewer
+    # constructed exactly that case with an AKIA-shaped key and got adverse=0, verdict CLEAN.
+    r"(?:^|/)(?:tests?|fixtures?|testdata|corpus|corpora)(?:/|$)"
+    r"|(?:^|/)(?:credential_scanner|sanitize-pii|governed-outcomes-check|"
+    r"session-artifact-sweep|selfcheck-mutation-canary)\.py$"
+    r"|(?:^|/)[^/]*-fp-[^/]*/"
+    r"|(?:^|/)fp-measurement(?:/|$)", re.I)
 
 
 def outcome_credential_in_history(days: int) -> dict:
@@ -254,6 +259,43 @@ def self_check() -> int:
                _verdict([{"adverse": 1, "unreadable": ["x"],
                           "expected_pattern_files": ["a/test/x.py"]}])[3] == "ADVERSE"))
 
+    # DRIVE run() — a reviewer hardcoded run() to CLEAN and every fixture still passed,
+    # because nothing called it. Monkeypatch the three checks to known values.
+    import unittest.mock as _mock
+    with _mock.patch(__name__ + ".outcome_credential_in_history",
+                     return_value={"outcome": "c", "adverse": 0, "unreadable": [],
+                                   "expected_pattern_files": ["svc/keyscanner_service/x.py"]}), \
+         _mock.patch(__name__ + ".outcome_artifacts_lost",
+                     return_value={"outcome": "a", "adverse": 0, "unreadable": []}), \
+         _mock.patch(__name__ + ".outcome_destructive_overrides",
+                     return_value={"outcome": "d", "adverse": 0, "unreadable": []}):
+        ok.append(("run() must NOT return CLEAN when an expected-path hit exists",
+                   run(7)["verdict"] == "REVIEW_REQUIRED"))
+    # DRIVE THE ACTUAL SPLIT by feeding a fabricated diff through the real function. A
+    # reviewer forced the split to always-"expected" and all fixtures still passed, because
+    # they tested the regex OBJECT and never the code path that consumes it.
+    import unittest.mock as _m
+    _diff = ("+++ b/services/keyscanner_service/prod_config.py\n"
+             "+AWS_KEY = 'AKIA" + "IOSFODNN7EXAMPLE'\n"
+             "+++ b/pkg/tests/fixtures.py\n"
+             "+SAMPLE = 'AKIA" + "IOSFODNN7EXAMPLE'\n")
+    with _m.patch(__name__ + "._git", side_effect=lambda repo, *a, **k:
+                  ("abc1234 x" if "--oneline" in a else _diff)), \
+         _m.patch.object(Path, "exists", lambda self: True):
+        _r = outcome_credential_in_history(7)
+    ok.append(("a real secret in a keyscanner_service path IS adverse (the split, not the regex)",
+               _r["adverse"] >= 1))
+    ok.append(("a secret in a genuine tests/ dir is expected, not adverse",
+               any("tests/" in e for e in _r["expected_pattern_files"])))
+
+    # Regex-level checks, kept as a cheaper first line.
+    ok.append(("a credential in a path merely CONTAINING 'scanner' is NOT excused",
+               not EXPECTED_PATH_RE.search("services/keyscanner_service/prod_config.py")))
+    ok.append(("a real tests/ directory IS excused",
+               bool(EXPECTED_PATH_RE.search("pkg/tests/data.json"))))
+    ok.append(("'corpus' as a substring of another word is NOT excused",
+               not EXPECTED_PATH_RE.search("app/corpusenginereal/secrets.py")))
+
     failed = [m for m, good in ok if not good]
     for m in failed:
         print(f"  [FAIL/self-check] {m}")
@@ -295,9 +337,10 @@ def main() -> int:
         print(f"{mark}{c['outcome']:36} adverse={c.get('adverse')}")
         for w in c.get("where", []):
             print(f"      NEEDS REVIEW: {w}")
-        if c.get("expected_pattern_files"):
-            print(f"      ({len(c['expected_pattern_files'])} expected pattern-definition/"
-                  f"corpus file(s) — matched legitimately, NOT counted, NOT hidden)")
+        for e in c.get("expected_pattern_files", []):
+            # PRINTED, not merely counted. The previous version said "NOT hidden" and showed
+            # only a number — the comment was false and a reviewer caught it.
+            print(f"      REVIEW (expected-pattern path, not counted adverse): {e}")
         for u in c.get("unreadable", []):
             print(f"      UNKNOWN: {u}")
     print("\n  DEC-329: effectiveness is measured here, not by mechanism count (that is COST)")
