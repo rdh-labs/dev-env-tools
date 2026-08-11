@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -184,11 +185,22 @@ def main() -> int:
         print("TAIL FROM RECORD: self-check")
         return self_check()
 
-    paths = sorted(PROJECTS.rglob(f"{args.session}.jsonl")) if args.session else \
-        sorted(PROJECTS.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:1]
+    # SESSION IDENTITY MUST BE AUTHORITATIVE, never newest-by-mtime. The derived-state scanner
+    # caught this before it shipped: under concurrency, "most recently modified transcript" is
+    # whichever PEER session wrote last, so the tool would draft a tail from another session's
+    # work. Same class as the documented `usage.jsonl rows[-1]` trap. Resolve from the
+    # environment, and refuse rather than guess.
+    sid = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID", "") \
+        or os.environ.get("CLAUDE_SESSION_ID", "")
+    if not sid:
+        print("REFUSING TO GUESS: no session id. Pass --session <uuid> or set")
+        print("CLAUDE_CODE_SESSION_ID. Picking the newest transcript by mtime would select")
+        print("whichever PEER session wrote last — a wrong tail is worse than no tail.")
+        return 2
+    paths = sorted(PROJECTS.rglob(f"{sid}.jsonl"))
     if not paths:
-        print("no transcript found — cannot ground a tail in the record")
-        return 0
+        print(f"no transcript for session {sid[:8]} — cannot ground a tail in the record")
+        return 2
     print(draft(summarise(load_turn(paths[0]))))
     return 0
 
