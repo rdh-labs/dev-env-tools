@@ -74,8 +74,22 @@ def load_turn(path: Path) -> list[dict]:
     return events[last_text + 1:]
 
 
+def _sha_resolves(sha: str, repos=None) -> bool:
+    """Does this look-like-a-SHA actually name a commit? Checked, not assumed."""
+    import subprocess
+    for r in (repos or [Path.home() / "dev/infrastructure/tools", Path.home() / "dev/share"]):
+        try:
+            if subprocess.run(["git", "-C", str(r), "cat-file", "-e", f"{sha}^{{commit}}"],
+                              capture_output=True, timeout=10).returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
 def summarise(events: list[dict]) -> dict:
     commits, files, cmds, failures, uncommitted = [], [], [], [], []
+    sha_shaped = []
     for i, e in enumerate(events):
         if e["kind"] != "tool":
             continue
@@ -89,7 +103,10 @@ def summarise(events: list[dict]) -> dict:
             c = str(inp.get("command", ""))[:400]
             cmds.append(c)
             for sha in re.findall(r"^\s*([0-9a-f]{7,10})\s+\S", out, re.M):
-                commits.append(sha)
+                # A SHA-SHAPED STRING IS NOT A COMMIT. Independent review: this captured any
+                # hex-looking token from any command's output. Verify it resolves to a real
+                # commit object before claiming it; unverifiable ones are reported separately.
+                (commits if _sha_resolves(sha) else sha_shaped).append(sha)
             # A failure the record shows: an error result, or a non-zero EXIT we printed.
             if nxt.get("error") or re.search(r"EXIT=[1-9]|Exit code [1-9]|FAIL", out):
                 failures.append(c.splitlines()[0][:110])
@@ -102,14 +119,18 @@ def summarise(events: list[dict]) -> dict:
             uncommitted.append(f)
     return {"commits": sorted(set(commits)), "files": sorted(set(files)),
             "commands": len(cmds), "failures": failures,
-            "uncommitted": sorted(set(uncommitted))}
+            "uncommitted": sorted(set(uncommitted)),
+            "sha_shaped_unverified": sorted(set(sha_shaped))}
 
 
 def draft(s: dict) -> str:
     out = ["DRAFT TAIL — from the tool-call record, not from recollection", ""]
     out.append("Done (what the record shows):")
     if s["commits"]:
-        out.append(f"  commits: {', '.join(s['commits'][:8])}")
+        out.append(f"  commits (verified to resolve): {', '.join(s['commits'][:8])}")
+    if s.get("sha_shaped_unverified"):
+        out.append(f"  SHA-SHAPED but NOT a resolving commit — do not cite as done: "
+                   f"{', '.join(s['sha_shaped_unverified'][:6])}")
     if s["files"]:
         out.append(f"  files written/edited: {len(s['files'])} — " +
                    ", ".join(Path(f).name for f in s["files"][:6]))
@@ -134,17 +155,36 @@ def draft(s: dict) -> str:
     return "\n".join(out)
 
 
+def _real_sha() -> str:
+    """A SHA that genuinely resolves in this repo, so the fixture tests verification rather
+    than string-shape. Falls back to a shape-only value if git is unavailable, and the
+    dependent fixture is skipped in that case rather than passing vacuously."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent),
+                            "rev-parse", "--short=7", "HEAD"],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def self_check() -> int:
     ok = []
+    if not _real_sha():
+        print("  [SKIP] git unavailable — SHA-verification fixtures cannot run; NOT a pass")
+        return 2
     ev = [{"kind": "text"},
           {"kind": "tool", "name": "Write", "input": {"file_path": "/x/alpha.py"}},
           {"kind": "result", "text": "written"},
           {"kind": "tool", "name": "Bash", "input": {"command": "git add alpha.py && git commit"}},
-          {"kind": "result", "text": "  abc1234 feat: thing"},
+          # A REAL resolving SHA, injected at fixture time. The old fixture used a made-up
+          # one and passed only because SHA-shaped text was accepted as a commit.
+          {"kind": "result", "text": f"  {_real_sha()} feat: thing"},
           {"kind": "tool", "name": "Bash", "input": {"command": "python3 broken.py"}},
           {"kind": "result", "text": "EXIT=1"}]
     s = summarise(ev)
-    ok.append(("a commit SHA in output is captured", "abc1234" in s["commits"]))
+    ok.append(("a RESOLVING commit SHA is captured", _real_sha() in s["commits"]))
     ok.append(("a non-zero EXIT is captured as a failure", len(s["failures"]) == 1))
     ok.append(("a file later git-added is NOT flagged uncommitted", not s["uncommitted"]))
     ev2 = [{"kind": "text"},
@@ -167,6 +207,31 @@ def self_check() -> int:
     ok.append(("the empty-Open case warns rather than reassures",
                "is not" in draft(summarise([{"kind": "text"}])) and
                "evidence that nothing is open" in draft(summarise([{"kind": "text"}]))))
+    # DRIVE load_turn() — a reviewer flipped its first-text/last-text boundary and every
+    # fixture still passed, because nothing called it. Written to a real temp transcript.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        _t = Path(_td) / "s.jsonl"
+        _t.write_text("\n".join([
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "old turn"}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "OLD"}}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "NEW turn"}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "NEW"}}]}}),
+        ]) + "\n")
+        _ev = load_turn(_t)
+        _cmds = [e["input"]["command"] for e in _ev if e["kind"] == "tool"]
+    ok.append(("load_turn returns only events AFTER the LAST text block", _cmds == ["NEW"]))
+    ok.append(("load_turn does not leak the previous turn's commands", "OLD" not in _cmds))
+    # DRIVE the SHA verification: a made-up hex string must NOT be reported as a commit.
+    ev_fake = [{"kind": "text"},
+               {"kind": "tool", "name": "Bash", "input": {"command": "echo hi"}},
+               {"kind": "result", "text": "  deadbee f00 not-a-real-commit"}]
+    _sf = summarise(ev_fake)
+    ok.append(("a SHA-shaped string that does not resolve is NOT reported as a commit",
+               "deadbee" not in _sf["commits"] and "deadbee" in _sf["sha_shaped_unverified"]))
+
     failed = [m for m, good in ok if not good]
     for m in failed:
         print(f"  [FAIL/self-check] {m}")
