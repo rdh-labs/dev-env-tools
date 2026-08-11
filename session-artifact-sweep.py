@@ -281,6 +281,22 @@ def self_check() -> int:
         ok.append(("the name guard alone would have MISSED the innocently-named file",
                    looks_like_credential("innocent-notes.txt") is False))
 
+    # SYMLINK fixture (Agent review SAS-2). shutil.copy2 WRITES THROUGH a symlinked target,
+    # silently overwriting whatever it points at. os.replace severs the link instead. This was
+    # fixed incidentally by the atomic-write change made for a different reviewer's finding --
+    # so it is pinned here, because an accidental fix is one refactor away from regressing.
+    with tempfile.TemporaryDirectory() as td_sym:
+        ts = Path(td_sym)
+        (asym := ts/"a").mkdir(); (ssym := ts/"s").mkdir()
+        (dsym := ssym/"claude-sym").mkdir()
+        victim = ts/"unrelated.txt"
+        victim.write_text("PRECIOUS\n")
+        (dsym/"gate_blocks_acked.jsonl").write_text('PRECIOUS\n{"x":1}\n')  # larger extension
+        (asym/"claude-sym.jsonl").symlink_to(victim)
+        archive_gate_ledgers(asym, src_root=ssym)
+        ok.append(("a symlinked archive target must NOT be written through",
+                   victim.read_text() == "PRECIOUS\n"))
+
     # ISOLATED same-size fixture. The version inside the shared block below asserted r == 1,
     # but an EARLIER conflict in that same source root already forced r == 1 -- so it passed
     # with the same-size check deleted. A fixture that cannot fail alone proves nothing.
