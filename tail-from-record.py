@@ -330,11 +330,24 @@ def self_check() -> int:
     # the advisory version, which is the version that failed.
     import subprocess as _sp
     _env = dict(_os_environ_snapshot(), CLAUDE_CODE_SESSION_ID="deadbeef-not-this-session")
-    _r = _sp.run([sys.executable, str(Path(__file__).resolve()),
-                  "--session", "00000000-0000-0000-0000-000000000000"],
-                 capture_output=True, text=True, timeout=60, env=_env)
-    ok.append(("reading a FOREIGN session without the flag must REFUSE (exit 2), not warn",
-               _r.returncode == 2))
+    # Must use a transcript that EXISTS. The first version passed a nonexistent session id, so
+    # exit 2 came from the missing-transcript path and the fixture passed even with the refusal
+    # removed — the EIGHTH fixture this session that passed for the wrong reason. Assert on the
+    # REFUSED marker, not merely the exit code.
+    _real = sorted(PROJECTS.rglob("*.jsonl"))
+    if _real:
+        _sid = _real[0].stem
+        _r = _sp.run([sys.executable, str(Path(__file__).resolve()), "--session", _sid],
+                     capture_output=True, text=True, timeout=90, env=_env)
+        ok.append(("a FOREIGN but EXISTING transcript must REFUSE, not warn-and-proceed",
+                   _r.returncode == 2 and "REFUSED" in _r.stdout))
+        _r2 = _sp.run([sys.executable, str(Path(__file__).resolve()), "--session", _sid,
+                       "--allow-foreign-session"],
+                      capture_output=True, text=True, timeout=90, env=_env)
+        ok.append(("--allow-foreign-session must let it proceed deliberately",
+                   _r2.returncode == 0 and "REFUSED" not in _r2.stdout))
+    else:
+        print("  [SKIP] no transcript available — the refusal path cannot be exercised; NOT a pass")
 
     failed = [m for m, good in ok if not good]
     for m in failed:
