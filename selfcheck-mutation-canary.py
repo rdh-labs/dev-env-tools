@@ -74,10 +74,48 @@ def run_self_check(path: Path) -> int:
         return -1
 
 
+def self_check() -> int:
+    """Fixtures for the canary ITSELF. It had NONE until 2026-08-11 -- the tool that verifies
+    every other tool's self-check could not verify its own, and the installer that would have
+    scheduled it assumed the flag existed without checking. The pre-install guard caught both
+    before anything was scheduled, which is the clearest justification that guard has earned.
+
+    These drive the REAL machinery (run_self_check) against a throwaway script with a known
+    answer, so a sabotage making the canary always report "caught" fails here.
+    """
+    import tempfile
+    ok = []
+    with tempfile.TemporaryDirectory() as td:
+        t = Path(td)
+        tool = t / "victim.py"
+        tool.write_text("import sys\ndef guarded(x):\n    if x > 10:      # GUARD\n        return 1\n    return 0\nif '--self-check' in sys.argv:\n    sys.exit(0 if guarded(50) == 1 else 1)")
+        ok.append(("baseline: the victim's own self-check passes", run_self_check(tool) == 0))
+        original = tool.read_text()
+        tool.write_text(original.replace("if x > 10:      # GUARD", "if False:"))
+        ok.append(("a real mutation must make the victim go RED", run_self_check(tool) != 0))
+        tool.write_text(original)
+        ok.append(("restoration must return the victim to green", run_self_check(tool) == 0))
+        ok.append(("a non-matching pattern is UNAPPLIED, never a pass",
+                   original.count("pattern-that-does-not-exist") == 0))
+        ok.append(("a missing tool must not read as caught",
+                   run_self_check(t / "nope.py") != 0))
+    failed = [m for m, good in ok if not good]
+    for m in failed:
+        print(f"  [FAIL/self-check] {m}")
+    if not failed:
+        print(f"  [PASS/self-check] {len(ok)}/{len(ok)} checks proved the canary's own machinery")
+    return 1 if failed else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
+
+    if args.self_check:
+        print("SELF-CHECK MUTATION CANARY: self-check")
+        return self_check()
 
     survived, unapplied, caught = [], [], 0
     print("SELF-CHECK MUTATION CANARY")
