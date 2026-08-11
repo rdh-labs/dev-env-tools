@@ -224,6 +224,11 @@ def _real_sha() -> str:
         return ""
 
 
+def _os_environ_snapshot():
+    import os
+    return dict(os.environ)
+
+
 def self_check() -> int:
     ok = []
     if not _real_sha():
@@ -321,6 +326,16 @@ def self_check() -> int:
     ok.append(("a SHA-shaped string that does not resolve is NOT reported as a commit",
                "deadbee" not in _sf["commits"] and "deadbee" in _sf["sha_shaped_unverified"]))
 
+    # The refusal must be STRUCTURAL. A fixture that only checks warning text would pass on
+    # the advisory version, which is the version that failed.
+    import subprocess as _sp
+    _env = dict(_os_environ_snapshot(), CLAUDE_CODE_SESSION_ID="deadbeef-not-this-session")
+    _r = _sp.run([sys.executable, str(Path(__file__).resolve()),
+                  "--session", "00000000-0000-0000-0000-000000000000"],
+                 capture_output=True, text=True, timeout=60, env=_env)
+    ok.append(("reading a FOREIGN session without the flag must REFUSE (exit 2), not warn",
+               _r.returncode == 2))
+
     failed = [m for m, good in ok if not good]
     for m in failed:
         print(f"  [FAIL/self-check] {m}")
@@ -333,6 +348,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--session", default="")
     ap.add_argument("--self-check", action="store_true")
+    ap.add_argument("--allow-foreign-session", action="store_true",
+                    help="deliberately read ANOTHER session's live transcript (refused by default)")
     args = ap.parse_args()
 
     if args.self_check:
@@ -382,11 +399,22 @@ def main() -> int:
     import os as _os
     st = tp.stat()
     own = sid == _os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not own and not args.allow_foreign_session:
+        # STRUCTURAL, not advisory. The first version printed a warning and produced the draft
+        # anyway. This session measured advisory enforcement failing: 12 L-654 advisory prompts
+        # with no behavioural change, against a workspace record of 4,618 advisory fires with no
+        # effect. Shipping a warning as the remedy WAS the failure mode. Refuse by default;
+        # reading another session requires choosing it explicitly.
+        print("REFUSED: that transcript belongs to another session, and it is LIVE and")
+        print("append-only — a draft from it may describe work the owning session is still")
+        print("performing. Measured: 2,838 bytes of growth between two runs seconds apart.")
+        print("If you mean to do this, pass --allow-foreign-session.")
+        return 2
     print(draft(summarise(load_turn(tp))))
     print()
     print(f"  read from: {tp.name[:8]}…  ({st.st_size} bytes at read time)")
     if not own:
-        # THE MISATTRIBUTION MECHANISM, diagnosed 2026-08-11. A reviewer ran this against a
+        # Reached only with --allow-foreign-session. THE MISATTRIBUTION MECHANISM, diagnosed 2026-08-11. A reviewer ran this against a
         # session that was still working and got that session's in-flight tool calls, which
         # from their position looked like "an unrelated concurrent actor's work". It was not a
         # parsing bug: the transcript is a LIVE, append-only file with no as-of boundary, and
