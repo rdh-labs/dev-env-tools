@@ -146,16 +146,40 @@ def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0, src_overri
             "source_count": len(src), "durable_count": len(dst_hashes)}
 
 
+# Filenames whose CONTENT is typically a live credential. Rescuing these moves secrets from
+# an ephemeral dir into a git repo. Found the hard way: a rescue copied live JWT session
+# cookies for a client site into ~/dev/share. They were untracked and removed, but the tool
+# is scheduled — an autonomous copier must never blind-copy a secret.
+CREDENTIAL_NAMES = (".jar", ".cookies", "cookies.txt", "login.json", ".netrc",
+                    "credentials.json", "token.json", ".pem", ".key", "id_rsa")
+
+
+def looks_like_credential(name: str) -> bool:
+    n = name.lower()
+    return any(n.endswith(x) or n.rsplit("/", 1)[-1] == x for x in CREDENTIAL_NAMES)
+
+
 def rescue(result, durable: Path) -> list[str]:
-    """Copy missing files, then RE-READ to confirm each landed. cp exit 0 proves nothing."""
+    """Copy missing files, then RE-READ to confirm each landed. cp exit 0 proves nothing.
+
+    Credential-shaped files are SKIPPED and NAMED — never silently, because a silent skip
+    would recreate the original defect (something absent from durable with no record why).
+    """
     durable.mkdir(parents=True, exist_ok=True)
     confirmed, failed = [], []
     for m in result["missing"]:
+        if looks_like_credential(m["name"]):
+            failed.append(f"{m['name']} (SKIPPED: credential-shaped — not copied into a repo)")
+            continue
         if m["oversize"]:
             failed.append(f"{m['name']} (oversize {m['size_mb']}MB — copy manually if wanted)")
             continue
         target = durable / m["name"]
         try:
+            # names are RELATIVE PATHS since the basename-collision fix; without this the
+            # copy fails ENOENT on every nested file. Caught by RUNNING it, not by review:
+            # both review legs saw the pre-relative-path commit.
+            target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(m["path"], target)
         except OSError as exc:
             failed.append(f"{m['name']} ({exc})")
