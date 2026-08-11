@@ -70,7 +70,7 @@ def analyse(rows, bad, now=None):
     now = now or datetime.now(timezone.utc)
     by_hook = collections.Counter()
     worked_around = 0        # fire_count > 1 => the gate fired again before being heeded
-    latencies, at_risk = [], 0
+    latencies, at_risk, undatable, future = [], 0, 0, 0
     for r in rows:
         by_hook[r.get("hook", "<unknown>")] += 1
         try:
@@ -82,15 +82,26 @@ def analyse(rows, bad, now=None):
         if bt and at and at >= bt:
             latencies.append((at - bt).total_seconds())
         stamp = at or bt
-        if stamp and (now - stamp) > timedelta(hours=RETENTION_HOURS):
+        if stamp is None:
+            # Cannot evaluate retention for this row. Independent review, 2026-08-11: this
+            # previously fell through to OK -- the tool reported health on data it could not
+            # assess, which is the false negative it exists to prevent.
+            undatable += 1
+        elif (now - stamp) > timedelta(hours=RETENTION_HOURS):
             at_risk += 1
+        elif stamp > now + timedelta(minutes=5):
+            future += 1          # a future stamp is corrupt data, never "comfortably fresh"
     return {
         "total": len(rows), "unparseable": bad, "by_hook": by_hook.most_common(),
         "worked_around": worked_around,
         "median_ack_seconds": (sorted(latencies)[len(latencies) // 2] if latencies else None),
-        "past_retention": at_risk,
+        "past_retention": at_risk, "undatable": undatable, "future_stamped": future,
         # A record past the horizon is not "old" -- it is GONE the next time /tmp is reaped.
-        "verdict": "LOSING_RECORD" if at_risk else ("EMPTY" if not rows else "OK"),
+        # UNRELIABLE outranks OK: corrupt or undatable input means the measurement failed,
+        # and a failed measurement must never be reported as health.
+        "verdict": ("LOSING_RECORD" if at_risk else
+                    "EMPTY" if not rows else
+                    "UNRELIABLE" if (bad or undatable or future) else "OK"),
     }
 
 
@@ -115,6 +126,14 @@ def self_check() -> int:
     ok.append(("ack latency is computed", a["median_ack_seconds"] is not None))
     ok.append(("unparseable rows are surfaced, not dropped",
                analyse([], 7, now)["unparseable"] == 7))
+    ok.append(("malformed rows must NOT read as OK",
+               analyse([row("g", 1, 2, 1)], 9, now)["verdict"] == "UNRELIABLE"))
+    ok.append(("a row with no usable timestamp must NOT read as OK",
+               analyse([{"hook": "g", "fire_count": 1}], 0, now)["verdict"] == "UNRELIABLE"))
+    ok.append(("an unparsable timestamp must NOT read as OK",
+               analyse([{"hook": "g", "acked_at": "not-a-date"}], 0, now)["verdict"] == "UNRELIABLE"))
+    ok.append(("a FUTURE timestamp is corrupt, not fresh",
+               analyse([row("g", 1, -50, -50)], 0, now)["verdict"] == "UNRELIABLE"))
     bad = [m for m, good in ok if not good]
     for m in bad:
         print(f"  [FAIL/self-check] {m}")
