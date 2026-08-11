@@ -121,24 +121,8 @@ def outcome_artifacts_lost() -> dict:
             "unreadable": [] if m else ["could not parse sweep output"]}
 
 
-def outcome_destructive_overrides(days: int) -> dict:
-    """THE OUTCOME: was the destructive-op confirmation BYPASSED via break-glass?
-
-    SEMANTICS, read from the log before counting (2026-08-11) — the third time in one session
-    that a metric was nearly built on an unread field. The log carries TWO event types:
-      `token_used`     (205 of 221) — a SCOPED, short-TTL token was minted and used. This is
-                       the AUTHORISED path. The control working as designed. NOT adverse.
-      `override_used`  (16 of 221)  — the ~15-minute break-glass window was used, bypassing
-                       per-op confirmation entirely. THIS is the adverse outcome.
-    Counting all rows reported 15 "overrides" in 7 days when nearly all were the control
-    functioning. Compare `fire_count` (measured ACK latency, not evasion) and
-    `claim-probe-fires` (records detections, not effect).
-    """
-    f = Path.home() / ".claude" / "logs" / "destructive-overrides.jsonl"
-    if not f.exists():
-        return {"outcome": "destructive_breakglass_used", "adverse": 0,
-                "authorised_token_uses": 0, "unreadable": [],
-                "note": "no override log -- no break-glass ever recorded"}
+def _count_override_log(f: Path, days: int) -> dict:
+    """Pure counting over ONE log file, so fixtures can drive it without live state."""
     n, bad, authorised = 0, 0, 0
     cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
     for line in f.read_text(errors="replace").splitlines():
@@ -159,36 +143,71 @@ def outcome_destructive_overrides(days: int) -> dict:
         if t < cutoff:
             continue
         if r.get("event") == "override_used":
-            n += 1                      # break-glass: the confirmation was BYPASSED
+            n += 1
         else:
-            authorised += 1             # token_used: the control worked as designed
+            authorised += 1
     return {"outcome": "destructive_breakglass_used", "adverse": n,
             "authorised_token_uses": authorised,
             "unreadable": [f"{bad} unparseable row(s)"] if bad else [],
-            "note": "adverse counts ONLY event=override_used. event=token_used is the "
+            "note": "adverse counts ONLY event=override_used; event=token_used is the "
                     "authorised scoped-token path and is the control functioning."}
+
+
+def outcome_destructive_overrides(days: int) -> dict:
+    """THE OUTCOME: was the destructive-op confirmation BYPASSED via break-glass?
+
+    SEMANTICS, read from the log before counting (2026-08-11) — the third time in one session
+    that a metric was nearly built on an unread field. The log carries TWO event types:
+      `token_used`     (205 of 221) — a SCOPED, short-TTL token was minted and used. This is
+                       the AUTHORISED path. The control working as designed. NOT adverse.
+      `override_used`  (16 of 221)  — the ~15-minute break-glass window was used, bypassing
+                       per-op confirmation entirely. THIS is the adverse outcome.
+    Counting all rows reported 15 "overrides" in 7 days when nearly all were the control
+    functioning. Compare `fire_count` (measured ACK latency, not evasion) and
+    `claim-probe-fires` (records detections, not effect).
+    """
+    f = Path.home() / ".claude" / "logs" / "destructive-overrides.jsonl"
+    if not f.exists():
+        return {"outcome": "destructive_breakglass_used", "adverse": 0,
+                "authorised_token_uses": 0, "unreadable": [],
+                "note": "no override log -- no break-glass ever recorded"}
+    return _count_override_log(f, days)
+
+
+def _verdict(checks):
+    """Verdict from a list of check dicts. Extracted so fixtures can DRIVE it — the previous
+    inline version could be sabotaged to always return CLEAN and every fixture still passed.
+    Seventh untested fix in one session; the pattern is fixing without testing the fix.
+
+    Precedence: ADVERSE > UNKNOWN > REVIEW_REQUIRED > CLEAN. REVIEW_REQUIRED exists because
+    downgrading expected-path hits to nothing let a real leak in any path containing
+    "test"/"corpus"/"scanner" read as CLEAN (independent review, 2026-08-11).
+    """
+    unknown = [c for c in checks if c.get("adverse") is None or c.get("unreadable")]
+    adverse = sum(c["adverse"] for c in checks if isinstance(c.get("adverse"), int))
+    expected_hits = sum(len(c.get("expected_pattern_files", [])) for c in checks)
+    verdict = ("ADVERSE" if adverse else "UNKNOWN" if unknown
+               else "REVIEW_REQUIRED" if expected_hits else "CLEAN")
+    return adverse, unknown, expected_hits, verdict
 
 
 def run(days: int) -> dict:
     checks = [outcome_credential_in_history(days), outcome_artifacts_lost(),
               outcome_destructive_overrides(days)]
-    unknown = [c for c in checks if c.get("adverse") is None or c.get("unreadable")]
-    adverse = sum(c["adverse"] for c in checks if isinstance(c.get("adverse"), int))
+    adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
-    verdict = "ADVERSE" if adverse else ("UNKNOWN" if unknown else "CLEAN")
     return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
+            "expected_pattern_hits": expected_hits,
             "checks": checks, "unknown_count": len(unknown)}
 
 
 def self_check() -> int:
     ok = []
-    ok.append(("a check that could not run makes the verdict UNKNOWN, never CLEAN",
-               run.__doc__ is None or True))  # structural; exercised below
+
     fake_unknown = {"verdict": None}
     checks = [{"outcome": "a", "adverse": 0, "unreadable": []},
               {"outcome": "b", "adverse": None, "unreadable": ["failed"]}]
-    unknown = [c for c in checks if c.get("adverse") is None or c.get("unreadable")]
-    adverse = sum(c["adverse"] for c in checks if isinstance(c.get("adverse"), int))
+    adverse, unknown, expected_hits, verdict = _verdict(checks)
     v = "ADVERSE" if adverse else ("UNKNOWN" if unknown else "CLEAN")
     ok.append(("one unreadable check forces UNKNOWN", v == "UNKNOWN"))
     checks2 = [{"outcome": "a", "adverse": 2, "unreadable": []}]
@@ -201,14 +220,40 @@ def self_check() -> int:
                bool(EXPECTED_PATH_RE.search("x/checker-fp-review/corpus.jsonl"))))
     ok.append(("an ordinary source path is NOT excused",
                not EXPECTED_PATH_RE.search("projects/app/config.py")))
-    d = outcome_destructive_overrides(3650)
-    ok.append(("token_used is NOT counted as adverse — it is the control working",
-               d.get("authorised_token_uses", 0) > d.get("adverse", 0)))
-    ok.append(("the adverse count is break-glass only", d["outcome"] == "destructive_breakglass_used"))
+    # SYNTHETIC, not the live log. The previous version asserted
+    # authorised_token_uses > adverse against real local state, so it would fail on a machine
+    # whose log was empty or override-heavy even with correct logic — a fixture that depends
+    # on the environment is not a fixture.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        _f = Path(_td) / "ov.jsonl"
+        _now = datetime.now(timezone.utc).isoformat()
+        _f.write_text("\n".join([
+            json.dumps({"event": "token_used", "ts": _now}),
+            json.dumps({"event": "token_used", "ts": _now}),
+            json.dumps({"event": "override_used", "ts": _now}),
+        ]) + "\n")
+        d = _count_override_log(_f, 3650)
+    ok.append(("token_used is NOT adverse — it is the control working",
+               d["authorised_token_uses"] == 2 and d["adverse"] == 1))
+    ok.append(("the adverse count is break-glass only",
+               d["outcome"] == "destructive_breakglass_used"))
     ok.append(("the report NEVER contains matched secret text",
                "where" in outcome_credential_in_history(0) and
                all(isinstance(x, str) and "eyJ" not in x
                    for x in outcome_credential_in_history(0)["where"])))
+    clean = [{"adverse": 0, "unreadable": []}]
+    ok.append(("no hits at all is CLEAN", _verdict(clean)[3] == "CLEAN"))
+    exp = [{"adverse": 0, "unreadable": [], "expected_pattern_files": ["a/test/x.py"]}]
+    ok.append(("an EXPECTED-path hit is REVIEW_REQUIRED, never CLEAN",
+               _verdict(exp)[3] == "REVIEW_REQUIRED"))
+    ok.append(("UNKNOWN outranks REVIEW_REQUIRED",
+               _verdict([{"adverse": None, "unreadable": ["x"],
+                          "expected_pattern_files": ["a/test/x.py"]}])[3] == "UNKNOWN"))
+    ok.append(("ADVERSE outranks everything",
+               _verdict([{"adverse": 1, "unreadable": ["x"],
+                          "expected_pattern_files": ["a/test/x.py"]}])[3] == "ADVERSE"))
+
     failed = [m for m, good in ok if not good]
     for m in failed:
         print(f"  [FAIL/self-check] {m}")
