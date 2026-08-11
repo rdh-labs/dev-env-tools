@@ -31,6 +31,9 @@ from pathlib import Path
 
 TMP_ROOT = Path("/tmp/claude-1001")
 
+# Directories os.walk could not read. Non-empty => the sweep saw less than the whole tree.
+COLLECT_ERRORS: list[str] = []
+
 
 def find_session_dir(session_id: str) -> Path | None:
     if not TMP_ROOT.exists():
@@ -70,11 +73,17 @@ def collect(root: Path) -> dict[str, Path]:
     out: dict[str, Path] = {}
     if not root.exists():
         return out
-    for p in root.rglob("*"):
-        if p.is_symlink() and not p.exists():
-            out[str(p.relative_to(root))] = p      # broken symlink: counted, never invisible
-        elif p.is_file():
-            out[str(p.relative_to(root))] = p
+    # os.walk with onerror, NOT rglob: rglob SILENTLY skips directories it cannot read, so an
+    # unreadable subtree yields "0 of 0 missing -> COMPLETE" -- the cleanest possible report
+    # over data that is entirely invisible. Unreadable dirs are collected and surfaced.
+    errors: list[str] = []
+    for dirpath, _dirnames, filenames in os.walk(root, onerror=lambda e: errors.append(str(e))):
+        for fn in filenames:
+            fp = Path(dirpath) / fn
+            out[str(fp.relative_to(root))] = fp
+    if errors:
+        out["__WALK_ERRORS__"] = Path("/dev/null")   # forces a non-COMPLETE verdict
+        COLLECT_ERRORS.extend(errors)
     return out
 
 
@@ -100,8 +109,8 @@ def already_durable(path: Path) -> Path | None:
     return target if any(target.is_relative_to(r) for r in DURABLE_ROOTS) else None
 
 
-def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0):
-    src_dir = find_session_dir(session_id)
+def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0, src_override: Path | None = None):
+    src_dir = src_override or find_session_dir(session_id)
     if src_dir is None:
         return {"verdict": "SOURCE_GONE", "detail": f"no /tmp dir for {session_id} — ephemeral state already lost",
                 "missing": [], "src": None, "durable": str(durable)}
@@ -194,6 +203,17 @@ def self_check() -> int:
         (src / "broken.lnk").symlink_to(t / "gone")
         ok.append(("broken symlink is counted, never invisible",
                    "broken.lnk" in collect(src)))
+    # VERDICT-LINE fixtures: without these, hardcoding verdict="COMPLETE" passes everything.
+    with tempfile.TemporaryDirectory() as td:
+        t = Path(td); (s2 := t/"s").mkdir(); (d2 := t/"d").mkdir()
+        (s2/"only-here.py").write_text("irreplaceable")
+        r_missing = sweep("x", d2, src_override=s2)
+        (d2/"only-here.py").write_text("irreplaceable")
+        r_complete = sweep("x", d2, src_override=s2)
+        ok.append(("sweep() must return MISSING when a file is genuinely unrescued",
+                   r_missing["verdict"] == "MISSING"))
+        ok.append(("sweep() must return COMPLETE once the bytes exist in durable",
+                   r_complete["verdict"] == "COMPLETE"))
     ok.append(("a nonexistent session is SOURCE_GONE, never COMPLETE",
                sweep("00000000-0000-0000-0000-000000000000", Path("/nonexistent"))["verdict"]
                == "SOURCE_GONE"))
