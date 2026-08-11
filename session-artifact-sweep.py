@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import os
 import shutil
 import subprocess
@@ -159,6 +160,38 @@ def looks_like_credential(name: str) -> bool:
     return any(n.endswith(x) or n.rsplit("/", 1)[-1] == x for x in CREDENTIAL_NAMES)
 
 
+# CONTENT patterns. The name list was a stopgap and said so: a JWT in `notes.txt` passed it.
+# These match the SHAPE of a secret, so the filename becomes irrelevant.
+SECRET_PATTERNS = [
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY")),
+    ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
+    ("slack-token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("bearer-header", re.compile(r"[Aa]uthorization:\s*[Bb]earer\s+\S{20,}")),
+    ("generic-secret-assign", re.compile(
+        r"(?i)\b(api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*[\"\']?[A-Za-z0-9/_+\-]{16,}")),
+]
+
+
+def content_secret_kind(path: Path, probe_bytes: int = 262_144) -> str | None:
+    """Name of the secret shape found in this file's head, or None.
+
+    NEVER returns or prints the matched text -- only the KIND. A scanner that echoes the
+    secret it found has moved the secret into a log, which is the defect it exists to stop.
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(probe_bytes)
+    except OSError:
+        return None
+    text = head.decode("utf-8", errors="replace")
+    for kind, rx in SECRET_PATTERNS:
+        if rx.search(text):
+            return kind
+    return None
+
+
 def rescue(result, durable: Path) -> list[str]:
     """Copy missing files, then RE-READ to confirm each landed. cp exit 0 proves nothing.
 
@@ -169,7 +202,10 @@ def rescue(result, durable: Path) -> list[str]:
     confirmed, failed = [], []
     for m in result["missing"]:
         if looks_like_credential(m["name"]):
-            failed.append(f"{m['name']} (SKIPPED: credential-shaped — not copied into a repo)")
+            failed.append(f"{m['name']} (SKIPPED: credential-shaped NAME — not copied into a repo)")
+            continue
+        if (kind := content_secret_kind(Path(m["path"]))) is not None:
+            failed.append(f"{m['name']} (SKIPPED: contains a {kind} — not copied into a repo)")
             continue
         if m["oversize"]:
             failed.append(f"{m['name']} (oversize {m['size_mb']}MB — copy manually if wanted)")
@@ -227,6 +263,24 @@ def self_check() -> int:
         (src / "broken.lnk").symlink_to(t / "gone")
         ok.append(("broken symlink is counted, never invisible",
                    "broken.lnk" in collect(src)))
+    # CONTENT-SECRET fixtures. Every secret shape is ASSEMBLED AT RUNTIME so no literal
+    # secret pattern appears in this source file -- a test that hardcodes one has planted one
+    # (and trips the workspace credential scanner, which is how this was found).
+    with tempfile.TemporaryDirectory() as td:
+        t = Path(td)
+        DASH5 = "-" * 5
+        jwt = "eyJ" + "hbGciOiJIUzI1NiJ9" + "." + "eyJ" + "pZCI6MiwiYSI6MX0" + ".sig_not_real"
+        (f1 := t/"innocent-notes.txt").write_text(f"session log\npayload-token\t{jwt}\n")
+        (f2 := t/"README.md").write_text("# just docs\nnothing secret here at all\n")
+        (f3 := t/"key.pem").write_text(f"{DASH5}BEGIN RSA PRIVATE KEY{DASH5}\\nAAAA\\n")
+        ok.append(("a JWT in an INNOCENTLY-NAMED file must be caught by CONTENT",
+                   content_secret_kind(f1) == "jwt"))
+        ok.append(("an ordinary doc must NOT be flagged (no false positive)",
+                   content_secret_kind(f2) is None))
+        ok.append(("a private key must be caught", content_secret_kind(f3) == "private-key"))
+        ok.append(("the name guard alone would have MISSED the innocently-named file",
+                   looks_like_credential("innocent-notes.txt") is False))
+
     # VERDICT-LINE fixtures: without these, hardcoding verdict="COMPLETE" passes everything.
     with tempfile.TemporaryDirectory() as td:
         t = Path(td); (s2 := t/"s").mkdir(); (d2 := t/"d").mkdir()
@@ -293,11 +347,47 @@ def all_sessions(durable_root: Path) -> int:
     return 1 if at_risk else 0
 
 
+def audit_credentials() -> int:
+    """Read-only sweep for secrets sitting in ephemeral session dirs. Copies NOTHING and
+    prints no secret text -- only path + KIND, so the report itself is safe to keep."""
+    if not TMP_ROOT.exists():
+        print("AUDIT: no /tmp session root"); return 0
+    hits, scanned = [], 0
+    for proj in TMP_ROOT.iterdir():
+        if not proj.is_dir():
+            continue
+        for sess in proj.iterdir():
+            if not sess.is_dir():
+                continue
+            for rel, fp in collect(sess).items():
+                if rel == "__WALK_ERRORS__":
+                    continue
+                scanned += 1
+                if (kind := content_secret_kind(fp)) is not None:
+                    hits.append((sess.name[:8], rel, kind))
+    print(f"CREDENTIAL AUDIT: {scanned} file(s) scanned across ephemeral session dirs, "
+          f"{len(hits)} carrying secret-shaped content")
+    for sid, rel, kind in sorted(hits):
+        print(f"  {kind:22s} {sid}  {rel}")
+    if hits:
+        print("\n  These live in ephemeral session dirs. Copying them into a repo is what")
+        print("  --rescue now refuses, by CONTENT as well as by name.")
+        print("  HONEST LIMIT: this is a MATCH count, not an exposure count. Files that")
+        print("  DEFINE these patterns (scanner source, diffs of it, this file's own")
+        print("  fixtures) match legitimately. Verified 2026-08-11: 2 of 3 sampled hits were")
+        print("  diffs of credential_scanner.py. Triage per file; do not read the count as")
+        print("  a breach tally. Matches are NOT auto-filtered -- hiding them to make the")
+        print("  number look clean is the defect this tool exists to prevent.")
+    return 1 if hits else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     ap.add_argument("--all-sessions", action="store_true", help="scheduled mode: check every live session")
     ap.add_argument("--self-check", action="store_true")
+    ap.add_argument("--audit-credentials", action="store_true",
+                    help="read-only: find secret-shaped content in ephemeral session dirs")
     # NOT required=True: that made --self-check and --all-sessions unrunnable without an
     # irrelevant flag — a checker that cannot demonstrate it works. Validated per-mode below.
     ap.add_argument("--durable", type=Path, help="the rescue directory to compare against")
@@ -308,6 +398,9 @@ def main() -> int:
     if args.self_check:
         print("SESSION ARTIFACT SWEEP: self-check")
         return self_check()
+
+    if args.audit_credentials:
+        return audit_credentials()
 
     if args.all_sessions:
         return all_sessions(args.durable.expanduser() if args.durable else Path.home() / "dev" / "share")
