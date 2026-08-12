@@ -34,7 +34,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SECRET_RE = re.compile(
@@ -408,11 +408,81 @@ def outcome_handoff_misfiled(path: Path | None = None) -> dict:
                     "filename-globbing gate"}
 
 
+HEARTBEAT = Path.home() / ".metrics" / "scheduled-check-heartbeat.jsonl"
+
+# Cadence in hours, from the live schedule. Grace is 2x: one missed run is noise (a closed
+# laptop), two is a signal.
+EXPECTED_CADENCE_H = {
+    "artifact-sweep": 12, "gate-ledger-archive": 1, "selfcheck-canary": 168,
+    "anomaly-conversion": 168, "correction-rate": 168, "gate-ack": 24,
+    "governed-outcomes": 168,
+}
+
+
+def outcome_check_not_running(path: Path | None = None) -> dict:
+    """THE OUTCOME: has a scheduled check silently STOPPED RUNNING?
+
+    Consumer for the heartbeat `scheduled-check-runner.sh` writes. Without it the heartbeat is
+    another artifact nobody reads -- the exact defect it exists to fix, one layer up. A detector
+    that stops running produces the same silence as a clean result.
+
+    NOT compliance measurement (see this file's contract). This is the controls' own BLINDNESS
+    in durable state: if a check is not running, every outcome it covers is unmeasured.
+
+    HONEST LIMIT, circular and stated: this runs on the schedule it audits. If THIS stops,
+    nothing detects it. Six of seven become falsifiable; the seventh needs an external observer
+    this workspace does not have.
+    """
+    hb = path or HEARTBEAT
+    if not hb.exists():
+        return {"outcome": "scheduled_check_not_running", "adverse": None,
+                "stale": [], "never_seen": sorted(EXPECTED_CADENCE_H),
+                "unreadable": ["no heartbeat yet -- no scheduled run has completed"],
+                "note": "expected before the first scheduled run; UNKNOWN, never a pass"}
+    last, bad = {}, 0
+    for line in hb.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if not isinstance(r, dict) or "check" not in r:
+            bad += 1
+            continue
+        try:
+            ts = datetime.fromisoformat(str(r.get("ts", "")).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except ValueError:
+            bad += 1
+            continue
+        k = r["check"]
+        if k not in last or ts > last[k]:
+            last[k] = ts
+    now = datetime.now(timezone.utc)
+    stale, never = [], []
+    for name, cad in EXPECTED_CADENCE_H.items():
+        if name not in last:
+            never.append(name)
+        elif (now - last[name]).total_seconds() > cad * 3600 * 2:
+            stale.append(f"{name}: last ran {(now - last[name]).total_seconds() / 3600:.1f}h ago, "
+                         f"cadence {cad}h")
+    return {"outcome": "scheduled_check_not_running", "adverse": len(stale),
+            "stale": stale, "never_seen": sorted(never),
+            "unreadable": ([f"{bad} unparseable heartbeat row(s)"] if bad else [])
+                          + ([f"{len(never)} check(s) have never heartbeated"] if never else []),
+            "note": "a check that stopped running is indistinguishable from a clean one "
+                    "without this"}
+
+
 def run(days: int) -> dict:
     checks = [outcome_credential_in_history(days), outcome_artifacts_lost(),
               outcome_destructive_overrides(days), outcome_canary_survivors(),
               outcome_handoff_log_artifact_disagreement(days),
-              outcome_handoff_misfiled()]
+              outcome_handoff_misfiled(),
+              outcome_check_not_running()]
     adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
     return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
@@ -488,7 +558,9 @@ def self_check() -> int:
          _mock.patch(__name__ + ".outcome_handoff_log_artifact_disagreement",
                      return_value={"outcome": "h", "adverse": 0, "unreadable": []}), \
          _mock.patch(__name__ + ".outcome_handoff_misfiled",
-                     return_value={"outcome": "m", "adverse": 0, "unreadable": []}):
+                     return_value={"outcome": "m", "adverse": 0, "unreadable": []}), \
+         _mock.patch(__name__ + ".outcome_check_not_running",
+                     return_value={"outcome": "r", "adverse": 0, "unreadable": []}):
         ok.append(("run() must NOT return CLEAN when an expected-path hit exists",
                    run(7)["verdict"] == "REVIEW_REQUIRED"))
     # DRIVE THE ACTUAL SPLIT by feeding a fabricated diff through the real function. A
@@ -641,6 +713,46 @@ def self_check() -> int:
         r_ = outcome_handoff_misfiled(hd)
         ok.append(("a deprecated short-form filename is SKIPPED, not adverse",
                    r_["adverse"] == 0 and r_["compared"] == 0))
+
+    # --- outcome_check_not_running: drive the REAL function over a temp heartbeat ----------
+    with _tf.TemporaryDirectory() as td3:
+        _hb = Path(td3) / "hb.jsonl"
+        _now = datetime.now(timezone.utc)
+
+        def _row(name, hours_ago):
+            return json.dumps({"ts": (_now - timedelta(hours=hours_ago)).isoformat(),
+                               "check": name, "rc": 0, "status": "ok"})
+
+        # An ABSENT heartbeat must return the SAME KEY SET as the main path. An early return
+        # with fewer keys crashes any consumer indexing them -- caught by a smoke test raising
+        # KeyError, which is why this fixture exists.
+        _r = outcome_check_not_running(Path(td3) / "nope.jsonl")
+        ok.append(("absent heartbeat -> UNKNOWN with the full key set",
+                   _r["adverse"] is None and {"stale", "never_seen", "note"} <= set(_r)))
+
+        _hb.write_text("\n".join(_row(n, 0.1) for n in EXPECTED_CADENCE_H) + "\n")
+        ok.append(("all checks fresh -> adverse 0", outcome_check_not_running(_hb)["adverse"] == 0))
+
+        _rows = [_row(n, 0.1) for n in EXPECTED_CADENCE_H if n != "gate-ledger-archive"]
+        _hb.write_text("\n".join(_rows + [_row("gate-ledger-archive", 5)]) + "\n")
+        _r = outcome_check_not_running(_hb)
+        ok.append(("beyond 2x cadence -> ADVERSE",
+                   _r["adverse"] == 1 and "gate-ledger-archive" in _r["stale"][0]))
+
+        _hb.write_text("\n".join(_rows + [_row("gate-ledger-archive", 1.5)]) + "\n")
+        ok.append(("within the 2x grace -> NOT adverse",
+                   outcome_check_not_running(_hb)["adverse"] == 0))
+
+        # Never-seen is UNKNOWN, not adverse: before first run everything is never-seen, and
+        # calling that ADVERSE would cry wolf on every fresh install.
+        _hb.write_text(_row("governed-outcomes", 0.1) + "\n")
+        _r = outcome_check_not_running(_hb)
+        ok.append(("never-seen checks are UNKNOWN, not adverse",
+                   _r["adverse"] == 0 and len(_r["never_seen"]) == 6 and _r["unreadable"]))
+
+        _hb.write_text("[]\n" + _row("governed-outcomes", 0.1) + "\n")
+        ok.append(("a non-object heartbeat row is counted bad, not fatal",
+                   any("unparseable" in u for u in outcome_check_not_running(_hb)["unreadable"])))
 
     failed = [m for m, good in ok if not good]
     for m in failed:
