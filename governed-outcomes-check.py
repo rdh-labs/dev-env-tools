@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -477,12 +478,112 @@ def outcome_check_not_running(path: Path | None = None) -> dict:
                     "without this"}
 
 
+CRON_RUNNER = "scheduled-check-runner.sh"
+
+
+def _live_scheduled_checks(crontab_text: str | None = None) -> tuple[list[dict], list[str]]:
+    """Parse the wrapped entries out of the LIVE schedule, not out of this file's assumptions."""
+    if crontab_text is None:
+        try:
+            crontab_text = subprocess.run(["crontab", "-l"], capture_output=True,
+                                          text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            return [], ["crontab unreadable — live schedule UNKNOWN"]
+    entries, errs = [], []
+    for line in crontab_text.splitlines():
+        s = line.strip()
+        if s.startswith("#") or CRON_RUNNER not in s:
+            continue
+        try:
+            toks = shlex.split(s)
+        except ValueError:
+            errs.append(f"unparseable cron line: {s[:60]}")
+            continue
+        i = next((k for k, t in enumerate(toks) if t.endswith(CRON_RUNNER)), None)
+        if i is None or len(toks) < i + 4:
+            errs.append(f"wrapped entry missing name/log/marker: {s[:60]}")
+            continue
+        entries.append({"name": toks[i + 1], "log": toks[i + 2], "marker": toks[i + 3]})
+    return entries, errs
+
+
+def outcome_marker_cannot_fire(crontab_text: str | None = None) -> dict:
+    """THE OUTCOME: is a scheduled check's notification path DECORATION?
+
+    `scheduled-check-runner.sh` decides adverse-vs-ok by matching a MARKER regex against the
+    check's output. That marker is configuration living in the crontab, while the output it
+    must match is produced by code that changes independently. Nothing joined the two. A marker
+    that no longer matches -- a renamed heading, a reworded verdict -- makes the check
+    PERMANENTLY SILENT while every heartbeat reports `ok`. Silence then means "clean" and "the
+    regex died" identically, which is the precise defect the wrapper was built to end, one
+    layer up in the configuration rather than in the code.
+
+    This check was written because the notification layer was DEPLOYED AND DECLARED WORKING
+    with its central property -- can the marker actually fire? -- never tested. The test cost
+    three seconds and was run twelve hours after deployment, prompted by the user rather than
+    by the build. So the real defect is not the marker; it is that nothing proved the mechanism
+    before it was trusted. This is that proof, run continuously.
+
+    Two conditions are ADVERSE because they are decidable:
+      - a marker that is not a valid regex: it can never fire, today or ever;
+      - REGISTRATION DRIFT between the live crontab and EXPECTED_CADENCE_H. That table is
+        hand-maintained. A check added to cron and not to the table is never audited for going
+        silent; one removed from cron but left in the table reports stale forever. Either way
+        the consumer's population and the world's have diverged -- the join error this
+        workspace keeps finding, here between code and deployed configuration.
+
+    "Marker has never matched its own log" is deliberately UNKNOWN, not adverse: a check that
+    has genuinely never been adverse is indistinguishable from a dead regex by this evidence.
+    UNKNOWN is never a pass, so it still reaches a human -- without asserting more than is known.
+    """
+    entries, errs = _live_scheduled_checks(crontab_text)
+    if not entries:
+        return {"outcome": "scheduled_marker_cannot_fire", "adverse": None,
+                "dead_regex": [], "registration_drift": [], "unproven": [],
+                "unreadable": errs or ["no wrapped scheduled entries found — layer not deployed"],
+                "note": "cannot confirm a notification path that is not installed"}
+
+    live = {e["name"] for e in entries}
+    drift = [f"{n}: in the live schedule but absent from EXPECTED_CADENCE_H — "
+             f"never audited for going silent" for n in sorted(live - set(EXPECTED_CADENCE_H))]
+    drift += [f"{n}: expected by the consumer but NOT in the live schedule — "
+              f"will report stale forever" for n in sorted(set(EXPECTED_CADENCE_H) - live)]
+
+    dead, unproven = [], []
+    for e in entries:
+        if e["marker"] == "-":
+            continue                      # no marker by design; the wrapper falls back to rc
+        try:
+            rx = re.compile(e["marker"])
+        except re.error as exc:
+            dead.append(f"{e['name']}: marker is not a valid regex ({exc}) — can never fire")
+            continue
+        log = Path(e["log"])
+        try:
+            text = log.read_text(errors="replace") if log.exists() else ""
+        except OSError as exc:
+            unproven.append(f"{e['name']}: log unreadable ({exc}) — marker unproven")
+            continue
+        if not text.strip():
+            unproven.append(f"{e['name']}: log empty or absent — marker never exercised")
+        elif not rx.search(text):
+            unproven.append(f"{e['name']}: marker has never matched its own log — never adverse "
+                            f"or dead regex, indistinguishable from here")
+
+    return {"outcome": "scheduled_marker_cannot_fire", "adverse": len(dead) + len(drift),
+            "dead_regex": dead, "registration_drift": drift, "unproven": unproven,
+            "unreadable": errs + unproven,
+            "note": "a marker is configuration; the output it must match is code. Nothing else "
+                    "joins them, so a silent check looks exactly like a clean one"}
+
+
 def run(days: int) -> dict:
     checks = [outcome_credential_in_history(days), outcome_artifacts_lost(),
               outcome_destructive_overrides(days), outcome_canary_survivors(),
               outcome_handoff_log_artifact_disagreement(days),
               outcome_handoff_misfiled(),
-              outcome_check_not_running()]
+              outcome_check_not_running(),
+              outcome_marker_cannot_fire()]
     adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
     return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
@@ -545,24 +646,29 @@ def self_check() -> int:
 
     # DRIVE run() — a reviewer hardcoded run() to CLEAN and every fixture still passed,
     # because nothing called it. Monkeypatch the three checks to known values.
+    # DERIVED FROM THE MODULE, never hand-listed. This fixture broke on the FOURTH consecutive
+    # occasion an outcome was added to run() while a parallel list of mocks here was not
+    # updated. That is the same join defect as EXPECTED_CADENCE_H against the live crontab --
+    # two populations maintained by hand and assumed equal -- sitting in the harness that is
+    # supposed to catch it. Enumerating the real functions makes the desync impossible rather
+    # than detectable.
     import unittest.mock as _mock
-    with _mock.patch(__name__ + ".outcome_credential_in_history",
-                     return_value={"outcome": "c", "adverse": 0, "unreadable": [],
-                                   "expected_pattern_files": ["svc/keyscanner_service/x.py"]}), \
-         _mock.patch(__name__ + ".outcome_artifacts_lost",
-                     return_value={"outcome": "a", "adverse": 0, "unreadable": []}), \
-         _mock.patch(__name__ + ".outcome_destructive_overrides",
-                     return_value={"outcome": "d", "adverse": 0, "unreadable": []}), \
-         _mock.patch(__name__ + ".outcome_canary_survivors",
-                     return_value={"outcome": "k", "adverse": 0, "unreadable": []}), \
-         _mock.patch(__name__ + ".outcome_handoff_log_artifact_disagreement",
-                     return_value={"outcome": "h", "adverse": 0, "unreadable": []}), \
-         _mock.patch(__name__ + ".outcome_handoff_misfiled",
-                     return_value={"outcome": "m", "adverse": 0, "unreadable": []}), \
-         _mock.patch(__name__ + ".outcome_check_not_running",
-                     return_value={"outcome": "r", "adverse": 0, "unreadable": []}):
+    import contextlib as _ctx
+    _special = {"outcome_credential_in_history":
+                {"outcome": "c", "adverse": 0, "unreadable": [],
+                 "expected_pattern_files": ["svc/keyscanner_service/x.py"]}}
+    _names = [n for n in sorted(globals()) if n.startswith("outcome_")]
+    with _ctx.ExitStack() as _stack:
+        for _n in _names:
+            _stack.enter_context(_mock.patch(
+                __name__ + "." + _n,
+                return_value=_special.get(_n, {"outcome": _n, "adverse": 0, "unreadable": []})))
         ok.append(("run() must NOT return CLEAN when an expected-path hit exists",
                    run(7)["verdict"] == "REVIEW_REQUIRED"))
+        # An outcome function that exists but was never wired into run() is a detector on disk
+        # that never runs -- the phantom-governance shape, in this file. Counting catches it.
+        ok.append(("every outcome_* function is actually registered in run()",
+                   len(run(7)["checks"]) == len(_names)))
     # DRIVE THE ACTUAL SPLIT by feeding a fabricated diff through the real function. A
     # reviewer forced the split to always-"expected" and all fixtures still passed, because
     # they tested the regex OBJECT and never the code path that consumes it.
@@ -753,6 +859,51 @@ def self_check() -> int:
         _hb.write_text("[]\n" + _row("governed-outcomes", 0.1) + "\n")
         ok.append(("a non-object heartbeat row is counted bad, not fatal",
                    any("unparseable" in u for u in outcome_check_not_running(_hb)["unreadable"])))
+
+    # --- outcome_marker_cannot_fire: drive the REAL function over synthetic crontabs ---------
+    import tempfile as _tf4
+    with _tf4.TemporaryDirectory() as td4:
+        _log = Path(td4) / "c.log"
+        _R = "/x/scheduled-check-runner.sh"
+
+        def _cron(name, marker, log):
+            return f'17 * * * * {_R} {name} {log} "{marker}" -- /bin/true'
+
+        # every live name must be in EXPECTED_CADENCE_H or the drift arm fires on the fixture
+        _all = " and ".join(EXPECTED_CADENCE_H)  # noqa: F841  (documents the coupling)
+        _full = "\n".join(_cron(n, "ADVERSE", str(_log)) for n in EXPECTED_CADENCE_H)
+
+        _log.write_text("all quiet\n")
+        _r = outcome_marker_cannot_fire(_full)
+        ok.append(("marker that never matched its log is UNKNOWN, never adverse",
+                   _r["adverse"] == 0 and len(_r["unproven"]) == len(EXPECTED_CADENCE_H)))
+
+        _log.write_text("verdict: ADVERSE\n")
+        _r = outcome_marker_cannot_fire(_full)
+        ok.append(("marker proven against real log output is clean",
+                   _r["adverse"] == 0 and not _r["unproven"]))
+
+        _bad = _full + "\n" + _cron("gate-ack", "ADVERSE|[unclosed", str(_log))
+        _r = outcome_marker_cannot_fire(_bad)
+        ok.append(("a marker that cannot compile is ADVERSE",
+                   _r["adverse"] == 1 and any("never fire" in d for d in _r["dead_regex"])))
+
+        _r = outcome_marker_cannot_fire(_full + "\n" + _cron("brand-new", "X", str(_log)))
+        ok.append(("a scheduled check absent from the cadence table is ADVERSE",
+                   _r["adverse"] == 1 and any("brand-new" in d for d in _r["registration_drift"])))
+
+        _one = _cron(sorted(EXPECTED_CADENCE_H)[0], "ADVERSE", str(_log))
+        _r = outcome_marker_cannot_fire(_one)
+        ok.append(("a check dropped from the schedule is ADVERSE",
+                   _r["adverse"] == len(EXPECTED_CADENCE_H) - 1))
+
+        ok.append(("no wrapped entries at all is UNKNOWN, never a pass",
+                   outcome_marker_cannot_fire("# nothing here\n")["adverse"] is None))
+
+        ok.append(("a marker of '-' is skipped, not judged",
+                   not outcome_marker_cannot_fire(
+                       "\n".join(_cron(n, "-", str(_log))
+                                 for n in EXPECTED_CADENCE_H))["unproven"]))
 
     failed = [m for m, good in ok if not good]
     for m in failed:
