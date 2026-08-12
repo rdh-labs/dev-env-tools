@@ -161,8 +161,16 @@ def check_handoff_readback(verbose: bool = False) -> tuple[int, list[str]]:
              if f.stat().st_size > 0 and re.match(r"handoff-[0-9a-f]{8}-[0-9a-f]{4}-", f.name)]
     if not cands:
         return 0, ["no full-uuid handoff artifact to drive the fixtures — UNKNOWN, not a pass"]
+    # discovery-advisory: newest-by-mtime is the trap that resolved a PEER's transcript in
+    # ANOMALY-REGISTER row 77 — flagged here by derived_state_scanner, correctly. It is safe in
+    # THIS use and only this one: the fixtures need ANY well-formed handoff artifact to drive
+    # the read-back, never THIS session's. Picking a peer's file is a valid fixture input. If
+    # this code is ever changed to assert something about the CURRENT session, this line must
+    # become an authoritative lookup (get_session_key / stdin session_id) instead.
     sample = max(cands, key=lambda f: f.stat().st_mtime)
     sid = re.match(r"handoff-([0-9a-f-]{36})-", sample.name).group(1)
+    # age-only: mtime is used purely to straddle the artifact in time (one day either side) so
+    # the run-scoped filter is exercised in both directions. No identity is derived from it.
     old = datetime.fromtimestamp(sample.stat().st_mtime) - timedelta(days=1)
     now = datetime.now() + timedelta(days=1)   # strictly after every artifact
 
