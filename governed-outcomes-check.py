@@ -221,8 +221,9 @@ def outcome_canary_survivors() -> dict:
     # Only the LAST run matters; earlier survivors may already be fixed.
     runs = text.split("SELF-CHECK MUTATION CANARY")
     last = runs[-1] if runs else ""
-    survivors = [l.strip() for l in last.splitlines() if l.strip().startswith("SURVIVED")]
-    unapplied = [l.strip() for l in last.splitlines() if "NOT APPLIED" in l]
+    lines = [l.strip() for l in last.splitlines()]
+    survivors = [l for l in lines if l.startswith("SURVIVED")]
+    unapplied = [l for l in lines if "NOT APPLIED" in l]
     return {"outcome": "canary_survivors_untriaged", "adverse": len(survivors),
             "survivors": survivors[:6],
             "unreadable": [f"{len(unapplied)} mutation(s) could not be applied — refactored "
@@ -332,16 +333,15 @@ def self_check() -> int:
     ok.append(("'corpus' as a substring of another word is NOT excused",
                not EXPECTED_PATH_RE.search("app/corpusenginereal/secrets.py")))
 
-    import tempfile as _t2, unittest.mock as _m2
-    with _t2.TemporaryDirectory() as _td2:
-        _lg = Path(_td2) / "c.log"
-        _lg.write_text("SELF-CHECK MUTATION CANARY\n  SURVIVED  x.py: guard removed\n")
-        with _m2.patch.object(Path, "home", staticmethod(lambda: Path(_td2))):
+    import tempfile as _tmp
+    with _tmp.TemporaryDirectory() as _td2:
+        with _mock.patch.object(Path, "home", staticmethod(lambda: Path(_td2))):
             (Path(_td2) / ".logs").mkdir(exist_ok=True)
-            (Path(_td2) / ".logs" / "selfcheck-mutation-canary.log").write_text(_lg.read_text())
+            (Path(_td2) / ".logs" / "selfcheck-mutation-canary.log").write_text(
+                "SELF-CHECK MUTATION CANARY\n  SURVIVED  x.py: guard removed\n")
             _c = outcome_canary_survivors()
     ok.append(("an untriaged canary SURVIVOR is an adverse outcome", _c["adverse"] == 1))
-    with _m2.patch.object(Path, "home", staticmethod(lambda: Path("/nonexistent-xyz-abc"))):
+    with _mock.patch.object(Path, "home", staticmethod(lambda: Path("/nonexistent-xyz-abc"))):
         _c2 = outcome_canary_survivors()
     ok.append(("a MISSING canary log is UNKNOWN, never clean",
                _c2["adverse"] is None and bool(_c2["unreadable"])))

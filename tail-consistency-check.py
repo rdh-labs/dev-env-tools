@@ -35,7 +35,7 @@ UNRESOLVED = [
     ("Not checked:", re.compile(r"^\s*[-*]?\s*Not checked:", re.I | re.M)),
     ("Limitation:", re.compile(r"^\s*[-*]?\s*Limitation:", re.I | re.M)),
 ]
-# Forward-looking work descriptions with NO actor and NO timing. "Next action is giving that
+# Forward-looking work descriptions missing an actor OR a timing. "Next action is giving that
 # log a consumer" reads equally as a plan, an offer, and a handoff — the user has had to ask
 # "this session or a new one?" three times. A next-action statement must name WHO and WHEN.
 FORWARD_VAGUE = re.compile(
@@ -106,7 +106,8 @@ def check(text: str) -> tuple[list[str], bool]:
             f"whether it was tried, what was done, why it could not be closed, or what ensures "
             f"it will be. A named gap is not a disposed gap.")
 
-    # C4 — a forward-looking statement with neither actor nor timing. Third recurrence before
+    # C4 — a forward-looking statement MISSING an actor OR a timing. Both are required to
+    # make it answerable; the predicate is `not (ACTOR and TIMING)`, so either omission flags. Third recurrence before
     # this check existed; the tool caught contradictions but not ambiguity.
     for label, val in (("Open", open_f), ("You", you_f)):
         if val and FORWARD_VAGUE.search(val) and not (HAS_ACTOR.search(val)
