@@ -47,6 +47,22 @@ HAS_TIMING = re.compile(
     r"\b(?:now|this session|next session|this turn|today|immediately|before |after |"
     r"weekly|daily|on \w+day|once )\b", re.I)
 
+# A gap stated as INCOMPLETE. Measured 2026-08-11: this is the shape the checker missed in 19
+# of the 30 tails the user corrected (recall was 36%). Grammatically clean, non-contradictory,
+# and invisible to C1-C4 — "four remediations named and not built", "I did not build it",
+# "delivery remains unproven", "crons written but not installed".
+INCOMPLETE_RE = re.compile(
+    r"\b(?:not (?:built|installed|run|done|attempted|tried|yet|proven|verified|wired|fixed)|"
+    r"un(?:built|installed|run|proven|verified|addressed|read|fixed|investigated|audited)\b|"
+    r"remains? (?:open|unproven|unfixed|unbuilt|outstanding)|still (?:open|unbuilt|unfixed)|"
+    r"in flight|pending|never (?:ran|built|read))", re.I)
+# The four elements a stated gap owes: whether tried, what was done, why not closed, what
+# ensures closure. Any ONE of these turns a bare gap into a disposition.
+DISPOSITION_RE = re.compile(
+    r"\b(?:tried:|why(?: not)?:|ensured by:|no-execution-path|tracked via|"
+    r"i (?:tried|attempted|ran|could not)|because |so that |requires your|user must drive)",
+    re.I)
+
 # An imperative aimed at the user, i.e. an actual assignment.
 IMPERATIVE = re.compile(
     r"\b(run|read|install|decide|confirm|approve|tell me|say the word|paste|check)\b", re.I)
@@ -81,6 +97,15 @@ def check(text: str) -> tuple[list[str], bool]:
             f"CONTRADICTION: 'You: {you_f[:60]}' says nothing is required AND issues an "
             f"instruction in the same line.")
 
+    # C5 — a gap stated as incomplete with NO disposition. The dominant miss: 19 of 30
+    # user-corrected tails carried this and C1-C4 saw none of them.
+    if open_f and not NOTHING.match(open_f) and INCOMPLETE_RE.search(open_f) \
+            and not DISPOSITION_RE.search(open_f):
+        findings.append(
+            f"NO DISPOSITION: 'Open: {open_f[:60]}' states something incomplete without saying "
+            f"whether it was tried, what was done, why it could not be closed, or what ensures "
+            f"it will be. A named gap is not a disposed gap.")
+
     # C4 — a forward-looking statement with neither actor nor timing. Third recurrence before
     # this check existed; the tool caught contradictions but not ambiguity.
     for label, val in (("Open", open_f), ("You", you_f)):
@@ -107,8 +132,12 @@ def self_check() -> int:
     f, _ = check(bad_tail)
     ok.append(("Open: Nothing while Risk: lines exist must be caught",
                any("CONTRADICTION" in x and "Open:" in x for x in f)))
+    # This example previously read "Open: the thing is unverified" with no disposition, which
+    # C5 now correctly flags — the fixture's notion of "consistent" predated the check. A
+    # genuinely consistent tail states the gap AND its disposition.
     good = ("## Risks\n- Risk: something might break\n\nDone: stuff\n"
-            "Open: the thing is unverified\nYou: run the installer\n")
+            "Open: the thing is unverified. Tried: yes, the probe timed out; "
+            "Ensured by: retry scheduled.\nYou: run the installer\n")
     f2, _ = check(good)
     ok.append(("a consistent tail must NOT be flagged", not f2))
     f3, _ = check("Done: x\nOpen: Nothing\nYou: Nothing — run the installer\n")
@@ -130,6 +159,17 @@ def self_check() -> int:
     f9, _ = check("Done: x\nOpen: the fix is unbuilt\nYou: run it\n")
     ok.append(("'the fix is ...' with no actor/timing is flagged",
                any("AMBIGUOUS" in x for x in f9)))
+
+    fa, _ = check("Done: x\nOpen: Four remediations named and not built.\nYou: run it\n")
+    ok.append(("a bare incomplete gap is flagged NO DISPOSITION",
+               any("NO DISPOSITION" in x for x in fa)))
+    fb, _ = check("Done: x\nOpen: crons not installed. Tried: yes, blocked by the auth gate; "
+                  "Ensured by: installer committed.\nYou: run it\n")
+    ok.append(("the same gap WITH a disposition is NOT flagged",
+               not any("NO DISPOSITION" in x for x in fb)))
+    fc, _ = check("Done: x\nOpen: Nothing\nYou: run it\n")
+    ok.append(("'Open: Nothing' is not a NO-DISPOSITION case",
+               not any("NO DISPOSITION" in x for x in fc)))
 
     bad = [m for m, good_ in ok if not good_]
     for m in bad:
