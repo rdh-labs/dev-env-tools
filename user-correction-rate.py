@@ -121,7 +121,12 @@ def main() -> int:
         if len(msgs) < 5:          # too short to mean anything; excluded and SAID so
             continue
         r = measure(msgs)
-        r["session"] = p.stem[:8]
+        # Full id for machines, short label for humans. The 8-char form is AMBIGUOUS:
+        # 4 of 1962 workspace sessions share an 8-char prefix, and one pair differs by a
+        # SINGLE hex digit (ANOMALY-REGISTER 141). Display truncation is fine; emitting a
+        # truncated id into --json invites a downstream join that silently merges sessions.
+        r["session_id"] = p.stem
+        r["session"] = p.stem[:8]      # label only — never join on this
         rows.append(r)
 
     rows.sort(key=lambda r: r["correction_rate"] or 0, reverse=True)

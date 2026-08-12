@@ -35,10 +35,13 @@ applied (unknown state, never treated as a pass).
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -83,7 +86,7 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ("governed-outcomes-check.py", "handoff pre-cutover rows read as CLEAN again",
      "    if pre:", "    if False:"),
     ("governed-outcomes-check.py", "unreadable input no longer forces UNKNOWN",
-     '"adverse": None if unreadable else adverse,', '"adverse": adverse,'),
+     '"adverse": adverse if adverse else (None if unreadable else 0),', '"adverse": adverse,'),
     ("governed-outcomes-check.py", "handoff log window bound removed",
      "        if ts.timestamp() >= cutoff:", "        if True:"),
     ("tail-consistency-check.py", "declarative-assignment branch removed (C2 recall gap)",
@@ -95,6 +98,116 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ("tail-from-record.py", "UNKNOWN git state treated as clean",
      "        if st is None:", "        if False:"),
 ]
+
+
+# ── Embedded-executable coverage (ANOMALY-REGISTER 138) ────────────────────────────────
+# `commands/handoff.md` contains EXECUTABLE PYTHON inside a markdown file: the artifact
+# read-back that decides whether a handoff is logged `success` or `attempted`. It has no
+# --self-check, no CI, and no canary entry, so every test of it was an ad-hoc probe typed
+# and discarded. It is the least-tested code in the handoff chain and it gates whether the
+# log tells the truth. This makes that coverage durable and weekly.
+HANDOFF_MD = Path.home() / ".claude" / "commands" / "handoff.md"
+
+
+def _extract_readback(text: str) -> str | None:
+    """Pull the read-back block out of the markdown. Returns None if the shape changed."""
+    m = re.search(r"## Unified Logging.*?```python\n(.*?)```", text, re.S)
+    if not m:
+        return None
+    body = m.group(1)
+    if "# --- ARTIFACT READ-BACK" not in body or "# At end of handoff work" not in body:
+        return None
+    return "# --- ARTIFACT READ-BACK" + body.split("# --- ARTIFACT READ-BACK")[1] \
+                                            .split("# At end of handoff work")[0]
+
+
+def _probe_readback(block: str, sid: str | None, start: datetime) -> dict:
+    env_backup = {k: os.environ.get(k) for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")}
+    try:
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        os.environ.pop("CLAUDE_SESSION_ID", None)
+        if sid:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = sid
+        ns: dict = {"os": os, "Path": Path, "datetime": datetime, "start_time": start}
+        exec(block, ns)
+        return ns
+    finally:
+        for k, v in env_backup.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def check_handoff_readback(verbose: bool = False) -> tuple[int, list[str]]:
+    """Behavioural fixtures + mutations for the embedded read-back. Returns (caught, problems)."""
+    problems: list[str] = []
+    if not HANDOFF_MD.exists():
+        return 0, ["handoff.md missing — embedded read-back UNCHECKED, never a pass"]
+    text = HANDOFF_MD.read_text(errors="replace")
+    block = _extract_readback(text)
+    if block is None:
+        # The markdown was restructured. UNKNOWN, never a pass — update the extractor.
+        return 0, ["read-back block not found in handoff.md (shape changed) — UNKNOWN, not a pass"]
+    try:
+        compile(block, "<handoff-readback>", "exec")
+    except SyntaxError as e:
+        return 0, [f"read-back block does not compile: {e}"]
+
+    # A session whose handoff exists (this repo always has at least one) drives the True path.
+    hdir = Path.home() / ".claude" / "handoffs"
+    # Pick by MTIME among FULL-UUID names only. Sorting by name landed on a deprecated
+    # short-form file and the check correctly returned UNKNOWN — right behaviour, wrong input.
+    cands = [f for f in hdir.glob("handoff-*.md")
+             if f.stat().st_size > 0 and re.match(r"handoff-[0-9a-f]{8}-[0-9a-f]{4}-", f.name)]
+    if not cands:
+        return 0, ["no full-uuid handoff artifact to drive the fixtures — UNKNOWN, not a pass"]
+    sample = max(cands, key=lambda f: f.stat().st_mtime)
+    sid = re.match(r"handoff-([0-9a-f-]{36})-", sample.name).group(1)
+    old = datetime.fromtimestamp(sample.stat().st_mtime) - timedelta(days=1)
+    now = datetime.now() + timedelta(days=1)   # strictly after every artifact
+
+    fixtures = [
+        ("artifact newer than run start reads VERIFIED",
+         lambda b: _probe_readback(b, sid, old).get("artifact_verified") is True),
+        ("artifact older than run start reads UNVERIFIED (stale-match closed)",
+         lambda b: _probe_readback(b, sid, now).get("artifact_verified") is False),
+        ("unverified must not fabricate a path",
+         lambda b: _probe_readback(b, sid, now).get("handoff_file") is None),
+        ("absent session id reads UNVERIFIED without crashing",
+         lambda b: _probe_readback(b, None, old).get("artifact_verified") is False),
+    ]
+    for name, fn in fixtures:
+        try:
+            if not fn(block):
+                problems.append(f"FIXTURE FAILED: {name}")
+        except Exception as exc:                      # a crash is a failure, never a pass
+            problems.append(f"FIXTURE CRASHED ({name}): {exc}")
+
+    # Mutations: prove the fixtures are not vacuous.
+    muts = [("run-scoped filter removed",
+             "_cands = [p for p in _cands if p.stat().st_mtime >= start_time.timestamp()]",
+             "_cands = _cands"),
+            ("path fabrication restored",
+             "handoff_file = _cands[0] if _cands else None",
+             'handoff_file = _cands[0] if _cands else Path("/nonexistent-fabricated.md")')]
+    caught = 0
+    for name, old_s, new_s in muts:
+        if block.count(old_s) != 1:
+            problems.append(f"MUTATION NOT APPLIED ({name}): matched {block.count(old_s)}x — UNKNOWN")
+            continue
+        mutated = block.replace(old_s, new_s, 1)
+        try:
+            ns = _probe_readback(mutated, sid, now)
+            went_red = ns.get("artifact_verified") is not False or ns.get("handoff_file") is not None
+        except Exception:
+            went_red = True                            # a crash IS detection
+        if went_red:
+            caught += 1
+            if verbose:
+                print(f"  caught    handoff.md readback: {name}")
+        else:
+            problems.append(f"MUTATION SURVIVED ({name}) — fixture is vacuous")
+    return caught, problems
 
 
 def run_self_check(path: Path) -> int:
@@ -131,6 +244,16 @@ def self_check() -> int:
                    original.count("pattern-that-does-not-exist") == 0))
         ok.append(("a missing tool must not read as caught",
                    run_self_check(t / "nope.py") != 0))
+    # The embedded-read-back checker is itself code; prove it can report a problem.
+    ok.append(("embedded-readback extractor returns None on a changed shape",
+               _extract_readback("## Unified Logging\n```python\nnothing here\n```") is None))
+    ok.append(("embedded-readback extractor finds the real block",
+               _extract_readback(HANDOFF_MD.read_text(errors="replace")) is not None
+               if HANDOFF_MD.exists() else True))
+    _c, _p = check_handoff_readback()
+    ok.append(("embedded-readback check reports no problems against the live file", not _p))
+    ok.append(("embedded-readback mutations are both caught", _c == 2))
+
     failed = [m for m, good in ok if not good]
     for m in failed:
         print(f"  [FAIL/self-check] {m}")
@@ -183,7 +306,15 @@ def main() -> int:
             if args.verbose:
                 print(f"  caught    {tool}: {desc}")
 
-    total = len(MUTATIONS)
+    # Embedded-executable coverage (row 138): handoff.md's read-back has no --self-check of
+    # its own, so it cannot be a MUTATIONS entry. It is checked here so the weekly run covers it.
+    hb_caught, hb_problems = check_handoff_readback(args.verbose)
+    caught += hb_caught
+    for prob in hb_problems:
+        (survived if prob.startswith("MUTATION SURVIVED") else unapplied).append(
+            f"handoff.md readback: {prob}")
+
+    total = len(MUTATIONS) + 2      # +2 embedded-read-back mutations
     print(f"\n  {caught}/{total} mutation(s) caught by --self-check")
     for u in unapplied:
         print(f"  NOT APPLIED: {u}")
