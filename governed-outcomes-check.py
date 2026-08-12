@@ -298,14 +298,36 @@ def outcome_handoff_unverified(days: int, path: Path | None = None) -> dict:
         # The 4ac72061 incident IS such a row. UNKNOWN, never clean — ages out of the window.
         unreadable.append(f"{len(pre)} pre-cutover row(s) predate the read-back field "
                           f"— artifact state UNKNOWN, not clean")
-    return {"outcome": "handoff_logged_without_artifact",
+    # RECONCILIATION, both directions (outbox prior art, register rows 165-166). Until now this
+    # checked only LOG -> ARTIFACT. The inverse — an artifact with no log row — is the window an
+    # ordered-write-plus-read-back leaves open, and it is precisely the 8-9 orphan handoffs this
+    # workspace could not explain. Checking one direction and calling it reconciliation is how
+    # the inverse class stayed invisible.
+    orphan_artifacts = []
+    if path is None:                      # live mode only; fixtures drive the log side
+        hdir = Path.home() / ".claude" / "handoffs"
+        if hdir.is_dir():
+            logged = {r.get("session_id") for r in rows if r.get("session_id")}
+            for f in hdir.glob("handoff-*.md"):
+                m = re.match(r"handoff-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                             r"[0-9a-f]{4}-[0-9a-f]{12})-", f.name)
+                if m and m.group(1) not in logged:
+                    try:
+                        if f.stat().st_mtime >= datetime.now(timezone.utc).timestamp() - days*86400:
+                            orphan_artifacts.append(f.name)
+                    except OSError:
+                        pass
+
+    return {"outcome": "handoff_log_artifact_disagreement",
+            "orphan_artifacts": sorted(orphan_artifacts),
             # UNKNOWN only when there is nothing adverse to report. A CLI review recommended
             # `None if unreadable else adverse`; applied verbatim, it ERASED real counts —
             # `_verdict` sums only int `adverse` values, so a genuine finding vanished from the
             # JSON entirely and ADVERSE could never outrank UNKNOWN. Verified 2026-08-12 with a
             # real adverse row + one legacy row: verdict UNKNOWN, adverse_total 0.
             # A real count always survives; incomplete evidence still shows in `unreadable`.
-            "adverse": adverse if adverse else (None if unreadable else 0),
+            # BOTH directions count. A clean log side with orphaned artifacts is not clean.
+            "adverse": (adverse + len(orphan_artifacts)) or (None if unreadable else 0),
             "unreadable": unreadable}
 
 
