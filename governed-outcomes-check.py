@@ -196,9 +196,43 @@ def _verdict(checks):
     return adverse, unknown, expected_hits, verdict
 
 
+def outcome_canary_survivors() -> dict:
+    """THE OUTCOME: is the weekly mutation canary reporting survivors nobody has triaged?
+
+    Added by CONSOLIDATION, not as a ninth tool. The canary logs to
+    ~/.logs/selfcheck-mutation-canary.log and had NO reader — DEC-327's own rule ("every
+    producer needs a consumer") violated by the tool built to enforce that class of finding.
+    This file already runs weekly, so the log gets a consumer without adding a mechanism,
+    which is what CONSOLIDATE-AND-NET-SUBTRACT asks for.
+
+    A SURVIVOR is not automatically a defect (it may be defence in depth) — but an
+    UNTRIAGED one is, because nobody looked. Exit-2/NOT APPLIED lines are UNKNOWN state.
+    """
+    log = Path.home() / ".logs" / "selfcheck-mutation-canary.log"
+    if not log.exists():
+        return {"outcome": "canary_survivors_untriaged", "adverse": None,
+                "unreadable": ["canary log absent — it has never run, which is not evidence "
+                               "the tools are sound"]}
+    try:
+        text = log.read_text(errors="replace")
+    except OSError as exc:
+        return {"outcome": "canary_survivors_untriaged", "adverse": None,
+                "unreadable": [f"canary log unreadable: {exc}"]}
+    # Only the LAST run matters; earlier survivors may already be fixed.
+    runs = text.split("SELF-CHECK MUTATION CANARY")
+    last = runs[-1] if runs else ""
+    survivors = [l.strip() for l in last.splitlines() if l.strip().startswith("SURVIVED")]
+    unapplied = [l.strip() for l in last.splitlines() if "NOT APPLIED" in l]
+    return {"outcome": "canary_survivors_untriaged", "adverse": len(survivors),
+            "survivors": survivors[:6],
+            "unreadable": [f"{len(unapplied)} mutation(s) could not be applied — refactored "
+                           f"code, UNKNOWN, never a pass"] if unapplied else [],
+            "note": "a survivor may be defence-in-depth; an UNTRIAGED survivor is the finding"}
+
+
 def run(days: int) -> dict:
     checks = [outcome_credential_in_history(days), outcome_artifacts_lost(),
-              outcome_destructive_overrides(days)]
+              outcome_destructive_overrides(days), outcome_canary_survivors()]
     adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
     return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
@@ -268,7 +302,9 @@ def self_check() -> int:
          _mock.patch(__name__ + ".outcome_artifacts_lost",
                      return_value={"outcome": "a", "adverse": 0, "unreadable": []}), \
          _mock.patch(__name__ + ".outcome_destructive_overrides",
-                     return_value={"outcome": "d", "adverse": 0, "unreadable": []}):
+                     return_value={"outcome": "d", "adverse": 0, "unreadable": []}), \
+         _mock.patch(__name__ + ".outcome_canary_survivors",
+                     return_value={"outcome": "k", "adverse": 0, "unreadable": []}):
         ok.append(("run() must NOT return CLEAN when an expected-path hit exists",
                    run(7)["verdict"] == "REVIEW_REQUIRED"))
     # DRIVE THE ACTUAL SPLIT by feeding a fabricated diff through the real function. A
@@ -295,6 +331,20 @@ def self_check() -> int:
                bool(EXPECTED_PATH_RE.search("pkg/tests/data.json"))))
     ok.append(("'corpus' as a substring of another word is NOT excused",
                not EXPECTED_PATH_RE.search("app/corpusenginereal/secrets.py")))
+
+    import tempfile as _t2, unittest.mock as _m2
+    with _t2.TemporaryDirectory() as _td2:
+        _lg = Path(_td2) / "c.log"
+        _lg.write_text("SELF-CHECK MUTATION CANARY\n  SURVIVED  x.py: guard removed\n")
+        with _m2.patch.object(Path, "home", staticmethod(lambda: Path(_td2))):
+            (Path(_td2) / ".logs").mkdir(exist_ok=True)
+            (Path(_td2) / ".logs" / "selfcheck-mutation-canary.log").write_text(_lg.read_text())
+            _c = outcome_canary_survivors()
+    ok.append(("an untriaged canary SURVIVOR is an adverse outcome", _c["adverse"] == 1))
+    with _m2.patch.object(Path, "home", staticmethod(lambda: Path("/nonexistent-xyz-abc"))):
+        _c2 = outcome_canary_survivors()
+    ok.append(("a MISSING canary log is UNKNOWN, never clean",
+               _c2["adverse"] is None and bool(_c2["unreadable"])))
 
     failed = [m for m, good in ok if not good]
     for m in failed:
