@@ -35,6 +35,18 @@ UNRESOLVED = [
     ("Not checked:", re.compile(r"^\s*[-*]?\s*Not checked:", re.I | re.M)),
     ("Limitation:", re.compile(r"^\s*[-*]?\s*Limitation:", re.I | re.M)),
 ]
+# Forward-looking work descriptions with NO actor and NO timing. "Next action is giving that
+# log a consumer" reads equally as a plan, an offer, and a handoff — the user has had to ask
+# "this session or a new one?" three times. A next-action statement must name WHO and WHEN.
+FORWARD_VAGUE = re.compile(
+    r"\b(?:next (?:action|step)s? (?:is|are|would be)|the fix is|remains to be|"
+    r"still (?:needs|requires)|will (?:keep|continue)|going to)\b", re.I)
+# Either of these makes a forward statement answerable.
+HAS_ACTOR = re.compile(r"\b(?:I|you|next session|this session|the next session|agent|user)\b", re.I)
+HAS_TIMING = re.compile(
+    r"\b(?:now|this session|next session|this turn|today|immediately|before |after |"
+    r"weekly|daily|on \w+day|once )\b", re.I)
+
 # An imperative aimed at the user, i.e. an actual assignment.
 IMPERATIVE = re.compile(
     r"\b(run|read|install|decide|confirm|approve|tell me|say the word|paste|check)\b", re.I)
@@ -69,6 +81,16 @@ def check(text: str) -> tuple[list[str], bool]:
             f"CONTRADICTION: 'You: {you_f[:60]}' says nothing is required AND issues an "
             f"instruction in the same line.")
 
+    # C4 — a forward-looking statement with neither actor nor timing. Third recurrence before
+    # this check existed; the tool caught contradictions but not ambiguity.
+    for label, val in (("Open", open_f), ("You", you_f)):
+        if val and FORWARD_VAGUE.search(val) and not (HAS_ACTOR.search(val)
+                                                      and HAS_TIMING.search(val)):
+            findings.append(
+                f"AMBIGUOUS: '{label}: {val[:60]}' describes future work without naming WHO "
+                f"and WHEN. The reader cannot tell whether this is happening now, is being "
+                f"handed to them, or is a plan for a later session.")
+
     # C3 — a You: line that assigns nothing and names no artifact is a reconstruction task.
     if you_f and not NOTHING.match(you_f) and not IMPERATIVE.search(you_f):
         findings.append(
@@ -99,6 +121,16 @@ def self_check() -> int:
     ok.append(("absence of a tail is reported, not treated as consistent", ht is False))
     f6, _ = check("Done: x\nOpen: Nothing\nYou: Nothing — complete\n")
     ok.append(("Open: Nothing with NO risk lines is legitimately clean", not f6))
+    f7, _ = check("Done: x\nOpen: Next action is giving that log a consumer\nYou: run it\n")
+    ok.append(("a forward statement with no actor and no timing is flagged AMBIGUOUS",
+               any("AMBIGUOUS" in x for x in f7)))
+    f8, _ = check("Done: x\nOpen: I will give that log a consumer in this session\nYou: run it\n")
+    ok.append(("the same statement WITH actor and timing is NOT flagged",
+               not any("AMBIGUOUS" in x for x in f8)))
+    f9, _ = check("Done: x\nOpen: the fix is unbuilt\nYou: run it\n")
+    ok.append(("'the fix is ...' with no actor/timing is flagged",
+               any("AMBIGUOUS" in x for x in f9)))
+
     bad = [m for m, good_ in ok if not good_]
     for m in bad:
         print(f"  [FAIL/self-check] {m}")
