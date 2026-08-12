@@ -250,6 +250,9 @@ def _handoff_rows(path: Path, days: int) -> tuple[list[dict], list[str]]:
         except ValueError:
             bad += 1
             continue
+        if not isinstance(r, dict):     # `[]` and `"x"` are valid JSON and have no .get
+            bad += 1
+            continue
         try:
             ts = datetime.fromisoformat(str(r.get("timestamp", "")).replace("Z", "+00:00"))
             if ts.tzinfo is None:
@@ -296,9 +299,13 @@ def outcome_handoff_unverified(days: int, path: Path | None = None) -> dict:
         unreadable.append(f"{len(pre)} pre-cutover row(s) predate the read-back field "
                           f"— artifact state UNKNOWN, not clean")
     return {"outcome": "handoff_logged_without_artifact",
-            # Q2: ANY unreadable input forces UNKNOWN. Returning 0 beside an unparseable row
-            # claims a clean outcome on incomplete evidence — the defect this file exists to catch.
-            "adverse": None if unreadable else adverse,
+            # UNKNOWN only when there is nothing adverse to report. A CLI review recommended
+            # `None if unreadable else adverse`; applied verbatim, it ERASED real counts —
+            # `_verdict` sums only int `adverse` values, so a genuine finding vanished from the
+            # JSON entirely and ADVERSE could never outrank UNKNOWN. Verified 2026-08-12 with a
+            # real adverse row + one legacy row: verdict UNKNOWN, adverse_total 0.
+            # A real count always survives; incomplete evidence still shows in `unreadable`.
+            "adverse": adverse if adverse else (None if unreadable else 0),
             "unreadable": unreadable}
 
 
@@ -436,8 +443,23 @@ def self_check() -> int:
         r = outcome_handoff_unverified(30, _log)
         ok.append(("a verified handoff is not adverse", r["adverse"] == 0 and not r["unreadable"]))
 
-        _write({"timestamp": _now, "result": "attempted", "artifact_verified": False})
-        ok.append(("result=attempted is ADVERSE", outcome_handoff_unverified(30, _log)["adverse"] == 1))
+        # artifact_verified TRUE, so ONLY the result=attempted clause can make this adverse.
+        # The original fixture set it False and passed via the other clause -- vacuous.
+        _write({"timestamp": _now, "result": "attempted", "artifact_verified": True})
+        ok.append(("result=attempted is ADVERSE on its own clause",
+                   outcome_handoff_unverified(30, _log)["adverse"] == 1))
+        # H1 regression guard: a real adverse count must SURVIVE an unreadable row.
+        _write({"timestamp": _now, "result": "success", "artifact_verified": False},
+               {"timestamp": "2026-01-02T03:04:05", "result": "success"})
+        _r = outcome_handoff_unverified(3650, _log)
+        ok.append(("a real adverse count survives unreadable rows (ADVERSE > UNKNOWN)",
+                   _r["adverse"] == 1 and _r["unreadable"]))
+        # H3: a valid-JSON non-object line must not crash.
+        _log.write_text("[]\n" + json.dumps({"timestamp": _now, "result": "attempted",
+                                             "artifact_verified": True}) + "\n")
+        _r = outcome_handoff_unverified(30, _log)
+        ok.append(("a non-object JSON line is counted bad, not fatal",
+                   _r["adverse"] == 1 and any("unparseable" in u for u in _r["unreadable"])))
 
         # The incident: success claimed, artifact absent. Must not read as clean.
         _write({"timestamp": _now, "result": "success", "artifact_verified": False})
