@@ -309,10 +309,80 @@ def outcome_handoff_unverified(days: int, path: Path | None = None) -> dict:
             "unreadable": unreadable}
 
 
+HANDOFF_SID_RE = re.compile(r"Session ID:?\**\s*`?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                            r"[0-9a-f]{4}-[0-9a-f]{12})`?", re.I)
+
+
+def outcome_handoff_misfiled(path: Path | None = None) -> dict:
+    """THE OUTCOME: does a handoff name a session other than the one it is filed under?
+
+    HONEST PROVENANCE — read this before trusting the check's framing. I built this believing
+    `handoff-f28dbcbc-…md` declared a DIFFERENT session id in its body, and called the class
+    "misfiled handoffs". That was FALSE (ANOMALY-REGISTER row 160): the file contains its own
+    uuid three times and merely REFERENCES another. I had misread my own scan output, which
+    printed the alphabetically-first uuid rather than an internal id. The founding example
+    evaporated; the check did not, because it independently surfaced 5 real cases.
+
+    WHAT IT ACTUALLY MEASURES, stated narrowly: a handoff whose body declares a `Session ID:`
+    different from its filename, OR (absent that label) whose body names full uuids and NEVER
+    its own. 382 of 387 comparable handoffs DO name their own id, so the 5 that do not are
+    unusual. **Whether "unusual" means MISFILED is UNKNOWN and UNTRIAGED** — do not let this
+    docstring imply a mechanism. The last mechanism proposed here was wrong.
+
+    WHY IT MATTERS IF REAL: every handoff gate globs by FILENAME, so a handoff filed under the
+    wrong id is indistinguishable from an absent one — the session reads as never having handed
+    off, permanently, while its work sits on disk under another name.
+
+    KNOWN FALSE-NEGATIVE HISTORY: the first version required a literal `Session ID:` label and
+    reported adverse=0; the second read only the first 4KB and also reported 0. Both were clean
+    on the very corpus that motivated the check. It reports what it can compare (`compared`) so
+    a low denominator is visible rather than passing silently.
+    """
+    hdir = path or (Path.home() / ".claude" / "handoffs")
+    if not hdir.is_dir():
+        return {"outcome": "handoff_misfiled", "adverse": None,
+                "unreadable": ["handoffs dir absent"]}
+    bad, unreadable, checked = [], [], 0
+    for f in sorted(hdir.glob("handoff-*.md")):
+        m = re.match(r"handoff-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-", f.name)
+        if not m:
+            continue                      # deprecated short-form names carry no full id to compare
+        try:
+            # WHOLE file, not a head slice. A 4000-char window missed the founding positive
+            # (f28dbcbc declares its true id well past 4KB). Handoffs are ~10KB; reading
+            # them fully costs nothing and a truncated read is a silent false negative.
+            head = f.read_text(errors="replace")
+        except OSError as exc:
+            unreadable.append(f"{f.name}: {exc}")
+            continue
+        # A labelled `Session ID:` is the strong signal, but not every handoff carries one --
+        # the f28dbcbc case (the incident that motivated this check) has NO label and was
+        # reported CLEAN by the first version. A check that reads clean on its own founding
+        # positive is vacuous. Fall back to the SET of full uuids in the body.
+        labelled = HANDOFF_SID_RE.search(head)
+        body_ids = set(re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                                  head))
+        if labelled:
+            checked += 1
+            if labelled.group(1) != m.group(1):
+                bad.append(f"{f.name} declares Session ID {labelled.group(1)}")
+        elif body_ids:
+            # Bodies legitimately mention OTHER sessions (peer coordination), so a differing id
+            # is not enough. Adverse only when the filename's own id appears NOWHERE in the body.
+            checked += 1
+            if m.group(1) not in body_ids:
+                bad.append(f"{f.name} body names {sorted(body_ids)[0]} and never its own id")
+    return {"outcome": "handoff_misfiled", "adverse": len(bad) if (checked or not unreadable) else None,
+            "where": bad, "compared": checked, "unreadable": unreadable,
+            "note": "a misfiled handoff is indistinguishable from an absent one to every "
+                    "filename-globbing gate"}
+
+
 def run(days: int) -> dict:
     checks = [outcome_credential_in_history(days), outcome_artifacts_lost(),
               outcome_destructive_overrides(days), outcome_canary_survivors(),
-              outcome_handoff_unverified(days)]
+              outcome_handoff_unverified(days),
+              outcome_handoff_misfiled()]
     adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
     return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
@@ -386,7 +456,9 @@ def self_check() -> int:
          _mock.patch(__name__ + ".outcome_canary_survivors",
                      return_value={"outcome": "k", "adverse": 0, "unreadable": []}), \
          _mock.patch(__name__ + ".outcome_handoff_unverified",
-                     return_value={"outcome": "h", "adverse": 0, "unreadable": []}):
+                     return_value={"outcome": "h", "adverse": 0, "unreadable": []}), \
+         _mock.patch(__name__ + ".outcome_handoff_misfiled",
+                     return_value={"outcome": "m", "adverse": 0, "unreadable": []}):
         ok.append(("run() must NOT return CLEAN when an expected-path hit exists",
                    run(7)["verdict"] == "REVIEW_REQUIRED"))
     # DRIVE THE ACTUAL SPLIT by feeding a fabricated diff through the real function. A
@@ -500,6 +572,45 @@ def self_check() -> int:
         _log.write_text("not json at all\n")
         ok.append(("an unparseable row is UNREADABLE, never a pass",
                    bool(outcome_handoff_unverified(30, _log)["unreadable"])))
+
+    # --- outcome_handoff_misfiled: drive the REAL function over a temp handoffs dir --------
+    # It had NO fixtures when first written and its first two versions reported adverse=0 on the
+    # corpus that motivated it. Fixtures now encode BOTH known false-negative shapes.
+    with _tf.TemporaryDirectory() as td2:
+        hd = Path(td2)
+        A = "aaaaaaaa-1111-2222-3333-444444444444"
+        B = "bbbbbbbb-5555-6666-7777-888888888888"
+
+        (hd / f"handoff-{A}-2026-08-12.md").write_text(f"# Handoff\nSession ID: {A}\nwork\n")
+        ok.append(("a self-consistent labelled handoff is NOT adverse",
+                   outcome_handoff_misfiled(hd)["adverse"] == 0))
+
+        (hd / f"handoff-{A}-2026-08-12.md").write_text(f"# Handoff\nSession ID: {B}\nwork\n")
+        ok.append(("a labelled id differing from the filename IS adverse",
+                   outcome_handoff_misfiled(hd)["adverse"] == 1))
+
+        # Regression: the label-only version missed unlabelled files entirely.
+        (hd / f"handoff-{A}-2026-08-12.md").write_text(f"# Handoff\nno label, mentions {B} only\n")
+        ok.append(("an UNLABELLED body naming only another uuid IS adverse",
+                   outcome_handoff_misfiled(hd)["adverse"] == 1))
+
+        # A body may legitimately reference peers; naming its own id anywhere clears it.
+        (hd / f"handoff-{A}-2026-08-12.md").write_text(f"# Handoff\npeer {B}\nmine {A}\n")
+        ok.append(("naming a PEER while also naming its own id is NOT adverse",
+                   outcome_handoff_misfiled(hd)["adverse"] == 0))
+
+        # Regression: the 4KB-head version truncated past the declaration.
+        (hd / f"handoff-{A}-2026-08-12.md").write_text("x" * 5000 + f"\nmentions {B} only\n")
+        ok.append(("a declaration BEYOND 4KB is still seen (no head-slice truncation)",
+                   outcome_handoff_misfiled(hd)["adverse"] == 1))
+
+        # Deprecated short-form names carry no full id to compare — skipped, never adverse.
+        for f in hd.glob("*.md"):
+            f.unlink()
+        (hd / "handoff-aaaaaaaa-2026-08-12.md").write_text(f"# Handoff\nmentions {B}\n")
+        r_ = outcome_handoff_misfiled(hd)
+        ok.append(("a deprecated short-form filename is SKIPPED, not adverse",
+                   r_["adverse"] == 0 and r_["compared"] == 0))
 
     failed = [m for m, good in ok if not good]
     for m in failed:
