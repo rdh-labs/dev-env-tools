@@ -313,6 +313,9 @@ def outcome_handoff_unverified(days: int, path: Path | None = None) -> dict:
                              r"[0-9a-f]{4}-[0-9a-f]{12})-", f.name)
                 if m and m.group(1) not in logged:
                     try:
+                        # age-only: mtime bounds the reporting window. No identity is
+                        # derived from it — the session id comes from the FILENAME, which
+                        # is authoritative for that artifact.
                         if f.stat().st_mtime >= datetime.now(timezone.utc).timestamp() - days*86400:
                             orphan_artifacts.append(f.name)
                     except OSError:
