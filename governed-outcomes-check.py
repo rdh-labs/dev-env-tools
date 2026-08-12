@@ -231,9 +231,81 @@ def outcome_canary_survivors() -> dict:
             "note": "a survivor may be defence-in-depth; an UNTRIAGED survivor is the finding"}
 
 
+# The date /handoff began reading its artifact back (§12). Rows before this carry no
+# `artifact_verified` field and are UNKNOWN by construction — never counted as verified.
+HANDOFF_READBACK_CUTOVER = "2026-08-12"
+
+
+def _handoff_rows(path: Path, days: int) -> tuple[list[dict], list[str]]:
+    """Pure parse over ONE log file, so fixtures drive it without live state."""
+    if not path.exists():
+        return [], [f"{path.name} absent"]
+    cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+    rows, bad = [], 0
+    for line in path.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        try:
+            ts = datetime.fromisoformat(str(r.get("timestamp", "")).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except ValueError:
+            bad += 1
+            continue
+        if ts.timestamp() >= cutoff:
+            r["_ts"] = ts          # normalized UTC; callers MUST NOT compare timestamps lexically
+            rows.append(r)
+    return rows, ([f"{bad} unparseable row(s)"] if bad else [])
+
+
+def outcome_handoff_unverified(days: int, path: Path | None = None) -> dict:
+    """THE OUTCOME: did a session log a handoff that does not exist on disk?
+
+    Consumer for the `artifact_verified` field added to /handoff on 2026-08-12. Before that,
+    handoff.jsonl was pure self-report: `result` was computed from knowledge-capture counts and
+    `scope`, so it read "success" whenever scope was project or global — i.e. always. Session
+    4ac72061 logged `result: "success"` on 2026-08-11 with no .md on disk until the next day,
+    and every disk-side check (A45, A62-T5/T9, handoff_validation.py) keys off this log.
+
+    Two distinct adverse signals, deliberately NOT merged:
+      - a row that read back FALSE, or `result: attempted` — the handoff did not persist;
+      - a post-cutover row with NO `artifact_verified` field at all, which means /handoff is
+        not running the read-back. That is UNKNOWN, not clean: this check monitors its own
+        upstream fix, so silent removal of the read-back surfaces here rather than passing.
+    """
+    rows, unreadable = _handoff_rows(
+        path or Path.home() / ".claude" / "logs" / "handoff.jsonl", days)
+    adverse = sum(1 for r in rows
+                  if ("artifact_verified" in r and r["artifact_verified"] is not True)
+                  or r.get("result") == "attempted")
+    _cut = datetime.fromisoformat(HANDOFF_READBACK_CUTOVER).replace(tzinfo=timezone.utc)
+    unfielded = [r for r in rows if "artifact_verified" not in r]
+    post = [r for r in unfielded if r["_ts"] >= _cut]      # normalized compare, never lexical:
+    pre = [r for r in unfielded if r["_ts"] < _cut]        # "2026-08-11T23:30-01:00" IS post-cutover
+    if post:
+        unreadable.append(f"{len(post)} post-cutover row(s) with no artifact_verified field "
+                          f"— /handoff read-back is not running")
+    if pre:
+        # Q3(a): a legacy row claiming success with no artifact reads identically to a real one.
+        # The 4ac72061 incident IS such a row. UNKNOWN, never clean — ages out of the window.
+        unreadable.append(f"{len(pre)} pre-cutover row(s) predate the read-back field "
+                          f"— artifact state UNKNOWN, not clean")
+    return {"outcome": "handoff_logged_without_artifact",
+            # Q2: ANY unreadable input forces UNKNOWN. Returning 0 beside an unparseable row
+            # claims a clean outcome on incomplete evidence — the defect this file exists to catch.
+            "adverse": None if unreadable else adverse,
+            "unreadable": unreadable}
+
+
 def run(days: int) -> dict:
     checks = [outcome_credential_in_history(days), outcome_artifacts_lost(),
-              outcome_destructive_overrides(days), outcome_canary_survivors()]
+              outcome_destructive_overrides(days), outcome_canary_survivors(),
+              outcome_handoff_unverified(days)]
     adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
     return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
@@ -305,7 +377,9 @@ def self_check() -> int:
          _mock.patch(__name__ + ".outcome_destructive_overrides",
                      return_value={"outcome": "d", "adverse": 0, "unreadable": []}), \
          _mock.patch(__name__ + ".outcome_canary_survivors",
-                     return_value={"outcome": "k", "adverse": 0, "unreadable": []}):
+                     return_value={"outcome": "k", "adverse": 0, "unreadable": []}), \
+         _mock.patch(__name__ + ".outcome_handoff_unverified",
+                     return_value={"outcome": "h", "adverse": 0, "unreadable": []}):
         ok.append(("run() must NOT return CLEAN when an expected-path hit exists",
                    run(7)["verdict"] == "REVIEW_REQUIRED"))
     # DRIVE THE ACTUAL SPLIT by feeding a fabricated diff through the real function. A
@@ -345,6 +419,65 @@ def self_check() -> int:
         _c2 = outcome_canary_survivors()
     ok.append(("a MISSING canary log is UNKNOWN, never clean",
                _c2["adverse"] is None and bool(_c2["unreadable"])))
+
+    # --- outcome_handoff_unverified: drive the REAL function over a temp log ------------
+    # NOT a mock. The verdict-precedence fixture above mocks this check to a canned value;
+    # if that were the only coverage, gutting the function would leave every check green --
+    # the exact vacuous-fixture defect this file's canary exists to catch.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        _log = Path(_td) / "handoff.jsonl"
+        _now = datetime.now(timezone.utc).isoformat()
+
+        def _write(*rows):
+            _log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+        _write({"timestamp": _now, "result": "success", "artifact_verified": True})
+        r = outcome_handoff_unverified(30, _log)
+        ok.append(("a verified handoff is not adverse", r["adverse"] == 0 and not r["unreadable"]))
+
+        _write({"timestamp": _now, "result": "attempted", "artifact_verified": False})
+        ok.append(("result=attempted is ADVERSE", outcome_handoff_unverified(30, _log)["adverse"] == 1))
+
+        # The incident: success claimed, artifact absent. Must not read as clean.
+        _write({"timestamp": _now, "result": "success", "artifact_verified": False})
+        ok.append(("success + artifact_verified False is ADVERSE",
+                   outcome_handoff_unverified(30, _log)["adverse"] == 1))
+
+        # Self-monitoring: a post-cutover row with NO field means /handoff stopped reading back.
+        _write({"timestamp": _now, "result": "success"})
+        r = outcome_handoff_unverified(30, _log)
+        ok.append(("post-cutover row missing the field is UNKNOWN, never clean",
+                   r["adverse"] is None and any("read-back is not running" in u for u in r["unreadable"])))
+
+        # A legacy row claiming success with no artifact is INDISTINGUISHABLE from a real one --
+        # the 4ac72061 incident is exactly such a row. UNKNOWN, never clean. These age out of the
+        # 7-day window, so this does not scream forever.
+        _write({"timestamp": "2026-01-02T03:04:05", "result": "success"})
+        r = outcome_handoff_unverified(3650, _log)
+        ok.append(("pre-cutover legacy row is UNKNOWN, not clean",
+                   r["adverse"] is None and any("predate the read-back field" in u for u in r["unreadable"])))
+
+        # An explicit null must NOT pass as verified (only `is True` counts).
+        _write({"timestamp": _now, "result": "success", "artifact_verified": None})
+        ok.append(("artifact_verified: null is ADVERSE, not clean",
+                   outcome_handoff_unverified(30, _log)["adverse"] == 1))
+
+        # Timezone offsets must not be compared lexically: this is UTC 2026-08-12T00:30 (POST),
+        # but the string "2026-08-11T23:30:00-01:00" sorts BEFORE the cutover.
+        _write({"timestamp": "2026-08-11T23:30:00-01:00", "result": "success"})
+        r = outcome_handoff_unverified(3650, _log)
+        ok.append(("tz-offset row is classified by NORMALIZED time, not string order",
+                   any("read-back is not running" in u for u in r["unreadable"])))
+
+        # Window must actually bound: an old adverse row falls out of a 1-day window.
+        _write({"timestamp": "2026-01-02T03:04:05", "result": "attempted"})
+        ok.append(("out-of-window adverse row is excluded",
+                   outcome_handoff_unverified(1, _log)["adverse"] == 0))
+
+        _log.write_text("not json at all\n")
+        ok.append(("an unparseable row is UNREADABLE, never a pass",
+                   bool(outcome_handoff_unverified(30, _log)["unreadable"])))
 
     failed = [m for m, good in ok if not good]
     for m in failed:

@@ -72,6 +72,20 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
      "(expected if True else hits).append("),
     ("governed-outcomes-check.py", "token_used counted as break-glass",
      'if r.get("event") == "override_used":', "if True:"),
+    # --- added 2026-08-12 with the handoff-artifact consumer (R1). Registering the mutations
+    # in the same commit as the fixtures is the point: a fixture nobody re-proves decays into
+    # decoration, and this file is the only thing that re-proves them on a schedule.
+    ("governed-outcomes-check.py", "handoff adverse detection gutted",
+     '    adverse = sum(1 for r in rows\n                  if ("artifact_verified" in r and r["artifact_verified"] is not True)\n                  or r.get("result") == "attempted")',
+     "    adverse = 0"),
+    ("governed-outcomes-check.py", "handoff post-cutover self-monitor removed",
+     "    if post:", "    if False:"),
+    ("governed-outcomes-check.py", "handoff pre-cutover rows read as CLEAN again",
+     "    if pre:", "    if False:"),
+    ("governed-outcomes-check.py", "unreadable input no longer forces UNKNOWN",
+     '"adverse": None if unreadable else adverse,', '"adverse": adverse,'),
+    ("governed-outcomes-check.py", "handoff log window bound removed",
+     "        if ts.timestamp() >= cutoff:", "        if True:"),
     ("tail-from-record.py", "foreign-session refusal reverted to advisory",
      "    if not own and not args.allow_foreign_session:", "    if False:"),
     ("tail-from-record.py", "dirty-file branch disabled",
