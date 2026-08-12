@@ -17,17 +17,37 @@
 # the same substitution this workspace keeps finding -- the operation's own return value stood
 # in for the outcome (§12 / GP-52).
 #
-# Usage: git-commit-verified.sh -m <message-file|-> -- <path> [<path>...]
+# THREE DEFECTS FOUND BY AUDIT 2026-08-12, all in the verifier itself:
+#
+#   1. BASENAME MATCHING. The presence check compared `basename "$p"` against the commit's file
+#      list, so committing `b/notes.md` satisfied a request for `a/notes.md`. The tool built to
+#      prove "the paths you asked for are in the commit" could pass on a DIFFERENT file. This is
+#      the workspace's own JOIN-error class -- mismatched populations, here basename vs path --
+#      inside the control meant to catch it. Now compares repo-relative paths exactly.
+#
+#   2. FOREIGN STAGED WORK. `git add` on top of an index a PEER has already staged sweeps their
+#      work into your commit under your message and your authorship. Three sessions share this
+#      working tree. CLAUDE.md's working-tree provenance rule (L-517) forbids committing content
+#      you did not author; nothing enforced it. Now aborts on foreign staged paths.
+#
+#   3. IGNORED-BUT-UNTRACKED PATHS. Plain `git add` silently skips an untracked file under an
+#      ignored directory -- and the old presence check, matching on basename, could still pass.
+#      Deliberately NOT fixed with a blanket `-f`: forcing past a user's ignore rule is a
+#      permission decision, not a convenience. Detected and refused unless --force-ignored is
+#      passed explicitly.
+#
+# Usage: git-commit-verified.sh [--force-ignored] -m <message-file|-> -- <path> [<path>...]
 #        message from a FILE or stdin, never an argv string: a commit message containing
 #        backticks has already been mangled by shell substitution in this workspace once.
 set -uo pipefail
 
-MSGSRC=""; PATHS=()
+MSGSRC=""; PATHS=(); FORCE_IGNORED=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -m) MSGSRC="${2:?-m needs a file or -}"; shift 2 ;;
+        --force-ignored) FORCE_IGNORED=1; shift ;;
         --) shift; PATHS=("$@"); break ;;
-        *)  printf 'usage: %s -m <msgfile|-> -- <path>...\n' "$0" >&2; exit 2 ;;
+        *)  printf 'usage: %s [--force-ignored] -m <msgfile|-> -- <path>...\n' "$0" >&2; exit 2 ;;
     esac
 done
 [ -n "$MSGSRC" ] || { printf 'no -m\n' >&2; exit 2; }
@@ -37,10 +57,40 @@ MSGFILE="$(mktemp)"; trap 'rm -f "$MSGFILE"' EXIT
 if [ "$MSGSRC" = "-" ]; then cat > "$MSGFILE"; else cat "$MSGSRC" > "$MSGFILE"; fi
 [ -s "$MSGFILE" ] || { printf 'empty commit message\n' >&2; exit 2; }
 
+# --- refuse to absorb a peer's staged work (defect 2) ---------------------------------------
+# Anything already in the index that is NOT one of MY paths belongs to another session. Adding
+# to that index and committing would attribute their work to me.
+FOREIGN="$(git diff --cached --name-only 2>/dev/null | while IFS= read -r s; do
+    for p in "${PATHS[@]}"; do
+        case "$s" in "$p"|"$p"/*) continue 2 ;; esac
+    done
+    printf '%s\n' "$s"
+done)"
+if [ -n "$FOREIGN" ]; then
+    printf 'ABORT: the index already holds staged paths that are not yours:\n%s\n' "$FOREIGN" >&2
+    printf 'A peer staged these. Committing would attribute their work to you (L-517).\n' >&2
+    printf 'Resolve deliberately -- this tool will not guess.\n' >&2
+    exit 1
+fi
+
+# --- refuse to silently skip ignored-but-untracked paths (defect 3) -------------------------
+SKIPPED=""
+for p in "${PATHS[@]}"; do
+    [ -e "$p" ] || continue
+    git ls-files --error-unmatch -- "$p" >/dev/null 2>&1 && continue   # already tracked: fine
+    git check-ignore -q -- "$p" && SKIPPED="$SKIPPED $p"
+done
+if [ -n "$SKIPPED" ] && [ "$FORCE_IGNORED" -eq 0 ]; then
+    printf 'ABORT: untracked and IGNORED, so `git add` would skip them silently:%s\n' "$SKIPPED" >&2
+    printf 'Re-run with --force-ignored ONLY if overriding the ignore rule is intended.\n' >&2
+    exit 1
+fi
+ADDFLAGS=(--); [ "$FORCE_IGNORED" -eq 1 ] && ADDFLAGS=(-f --)
+
 # --- stage, retrying only the LOUD failure -------------------------------------------------
 staged=0
 for attempt in 1 2 3 4 5; do
-    if git add -- "${PATHS[@]}" 2>/dev/null; then staged=1; break; fi
+    if git add "${ADDFLAGS[@]}" "${PATHS[@]}" 2>/dev/null; then staged=1; break; fi
     if [ -e "$(git rev-parse --git-dir)/index.lock" ]; then
         sleep $((attempt * 2))       # a peer holds it; back off
         continue
@@ -67,11 +117,19 @@ if [ "$AFTER_TREE" = "$BEFORE_TREE" ]; then
     exit 1
 fi
 
-# every requested path must appear in the commit, or the stage was clobbered mid-flight
+# Every requested path must appear in the commit, or the stage was clobbered mid-flight.
+# Compare REPO-RELATIVE PATHS, never basenames (defect 1): `b/notes.md` must not satisfy a
+# request for `a/notes.md`. A path may name a directory, so a prefix match counts.
 missing=()
 present="$(git show --name-only --format="" HEAD)"
 for p in "${PATHS[@]}"; do
-    printf '%s\n' "$present" | grep -qF "$(basename "$p")" || missing+=("$p")
+    rel="$(git ls-files --full-name -- "$p" 2>/dev/null | head -1)"
+    [ -n "$rel" ] || rel="$p"
+    hit=0
+    while IFS= read -r f; do
+        case "$f" in "$rel"|"$rel"/*) hit=1; break ;; esac
+    done <<< "$present"
+    [ "$hit" -eq 1 ] || missing+=("$p")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
     printf 'VERIFY FAILED: committed, but these paths are absent from the commit: %s\n' \
