@@ -269,7 +269,8 @@ def _handoff_rows(path: Path, days: int) -> tuple[list[dict], list[str]]:
 def outcome_handoff_log_artifact_disagreement(days: int, path: Path | None = None) -> dict:
     """THE OUTCOME: do the handoff LOG and the handoff ARTIFACTS disagree, in EITHER direction?
 
-    RENAMED 2026-08-12 (/simplify, grounded MEDIUM). It was `outcome_handoff_log_artifact_disagreement`, which
+    RENAMED 2026-08-12 (/simplify, grounded MEDIUM). It was `outcome_handoff_` + `unverified` (name assembled here so a future rename cannot
+    silently rewrite this explanation the way one already did), which
     described only log->artifact. When the artifact->log direction was added the OUTCOME STRING
     was updated and the FUNCTION NAME was not -- so the name asserted half of what it did.
 
