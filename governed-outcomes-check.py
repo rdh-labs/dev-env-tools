@@ -266,8 +266,12 @@ def _handoff_rows(path: Path, days: int) -> tuple[list[dict], list[str]]:
     return rows, ([f"{bad} unparseable row(s)"] if bad else [])
 
 
-def outcome_handoff_unverified(days: int, path: Path | None = None) -> dict:
-    """THE OUTCOME: did a session log a handoff that does not exist on disk?
+def outcome_handoff_log_artifact_disagreement(days: int, path: Path | None = None) -> dict:
+    """THE OUTCOME: do the handoff LOG and the handoff ARTIFACTS disagree, in EITHER direction?
+
+    RENAMED 2026-08-12 (/simplify, grounded MEDIUM). It was `outcome_handoff_log_artifact_disagreement`, which
+    described only log->artifact. When the artifact->log direction was added the OUTCOME STRING
+    was updated and the FUNCTION NAME was not -- so the name asserted half of what it did.
 
     Consumer for the `artifact_verified` field added to /handoff on 2026-08-12. Before that,
     handoff.jsonl was pure self-report: `result` was computed from knowledge-capture counts and
@@ -406,7 +410,7 @@ def outcome_handoff_misfiled(path: Path | None = None) -> dict:
 def run(days: int) -> dict:
     checks = [outcome_credential_in_history(days), outcome_artifacts_lost(),
               outcome_destructive_overrides(days), outcome_canary_survivors(),
-              outcome_handoff_unverified(days),
+              outcome_handoff_log_artifact_disagreement(days),
               outcome_handoff_misfiled()]
     adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
@@ -480,7 +484,7 @@ def self_check() -> int:
                      return_value={"outcome": "d", "adverse": 0, "unreadable": []}), \
          _mock.patch(__name__ + ".outcome_canary_survivors",
                      return_value={"outcome": "k", "adverse": 0, "unreadable": []}), \
-         _mock.patch(__name__ + ".outcome_handoff_unverified",
+         _mock.patch(__name__ + ".outcome_handoff_log_artifact_disagreement",
                      return_value={"outcome": "h", "adverse": 0, "unreadable": []}), \
          _mock.patch(__name__ + ".outcome_handoff_misfiled",
                      return_value={"outcome": "m", "adverse": 0, "unreadable": []}):
@@ -524,7 +528,7 @@ def self_check() -> int:
     ok.append(("a MISSING canary log is UNKNOWN, never clean",
                _c2["adverse"] is None and bool(_c2["unreadable"])))
 
-    # --- outcome_handoff_unverified: drive the REAL function over a temp log ------------
+    # --- outcome_handoff_log_artifact_disagreement: drive the REAL function over a temp log ------------
     # NOT a mock. The verdict-precedence fixture above mocks this check to a canned value;
     # if that were the only coverage, gutting the function would leave every check green --
     # the exact vacuous-fixture defect this file's canary exists to catch.
@@ -537,35 +541,35 @@ def self_check() -> int:
             _log.write_text("".join(json.dumps(r) + "\n" for r in rows))
 
         _write({"timestamp": _now, "result": "success", "artifact_verified": True})
-        r = outcome_handoff_unverified(30, _log)
+        r = outcome_handoff_log_artifact_disagreement(30, _log)
         ok.append(("a verified handoff is not adverse", r["adverse"] == 0 and not r["unreadable"]))
 
         # artifact_verified TRUE, so ONLY the result=attempted clause can make this adverse.
         # The original fixture set it False and passed via the other clause -- vacuous.
         _write({"timestamp": _now, "result": "attempted", "artifact_verified": True})
         ok.append(("result=attempted is ADVERSE on its own clause",
-                   outcome_handoff_unverified(30, _log)["adverse"] == 1))
+                   outcome_handoff_log_artifact_disagreement(30, _log)["adverse"] == 1))
         # H1 regression guard: a real adverse count must SURVIVE an unreadable row.
         _write({"timestamp": _now, "result": "success", "artifact_verified": False},
                {"timestamp": "2026-01-02T03:04:05", "result": "success"})
-        _r = outcome_handoff_unverified(3650, _log)
+        _r = outcome_handoff_log_artifact_disagreement(3650, _log)
         ok.append(("a real adverse count survives unreadable rows (ADVERSE > UNKNOWN)",
                    _r["adverse"] == 1 and _r["unreadable"]))
         # H3: a valid-JSON non-object line must not crash.
         _log.write_text("[]\n" + json.dumps({"timestamp": _now, "result": "attempted",
                                              "artifact_verified": True}) + "\n")
-        _r = outcome_handoff_unverified(30, _log)
+        _r = outcome_handoff_log_artifact_disagreement(30, _log)
         ok.append(("a non-object JSON line is counted bad, not fatal",
                    _r["adverse"] == 1 and any("unparseable" in u for u in _r["unreadable"])))
 
         # The incident: success claimed, artifact absent. Must not read as clean.
         _write({"timestamp": _now, "result": "success", "artifact_verified": False})
         ok.append(("success + artifact_verified False is ADVERSE",
-                   outcome_handoff_unverified(30, _log)["adverse"] == 1))
+                   outcome_handoff_log_artifact_disagreement(30, _log)["adverse"] == 1))
 
         # Self-monitoring: a post-cutover row with NO field means /handoff stopped reading back.
         _write({"timestamp": _now, "result": "success"})
-        r = outcome_handoff_unverified(30, _log)
+        r = outcome_handoff_log_artifact_disagreement(30, _log)
         ok.append(("post-cutover row missing the field is UNKNOWN, never clean",
                    r["adverse"] is None and any("read-back is not running" in u for u in r["unreadable"])))
 
@@ -573,30 +577,30 @@ def self_check() -> int:
         # the 4ac72061 incident is exactly such a row. UNKNOWN, never clean. These age out of the
         # 7-day window, so this does not scream forever.
         _write({"timestamp": "2026-01-02T03:04:05", "result": "success"})
-        r = outcome_handoff_unverified(3650, _log)
+        r = outcome_handoff_log_artifact_disagreement(3650, _log)
         ok.append(("pre-cutover legacy row is UNKNOWN, not clean",
                    r["adverse"] is None and any("predate the read-back field" in u for u in r["unreadable"])))
 
         # An explicit null must NOT pass as verified (only `is True` counts).
         _write({"timestamp": _now, "result": "success", "artifact_verified": None})
         ok.append(("artifact_verified: null is ADVERSE, not clean",
-                   outcome_handoff_unverified(30, _log)["adverse"] == 1))
+                   outcome_handoff_log_artifact_disagreement(30, _log)["adverse"] == 1))
 
         # Timezone offsets must not be compared lexically: this is UTC 2026-08-12T00:30 (POST),
         # but the string "2026-08-11T23:30:00-01:00" sorts BEFORE the cutover.
         _write({"timestamp": "2026-08-11T23:30:00-01:00", "result": "success"})
-        r = outcome_handoff_unverified(3650, _log)
+        r = outcome_handoff_log_artifact_disagreement(3650, _log)
         ok.append(("tz-offset row is classified by NORMALIZED time, not string order",
                    any("read-back is not running" in u for u in r["unreadable"])))
 
         # Window must actually bound: an old adverse row falls out of a 1-day window.
         _write({"timestamp": "2026-01-02T03:04:05", "result": "attempted"})
         ok.append(("out-of-window adverse row is excluded",
-                   outcome_handoff_unverified(1, _log)["adverse"] == 0))
+                   outcome_handoff_log_artifact_disagreement(1, _log)["adverse"] == 0))
 
         _log.write_text("not json at all\n")
         ok.append(("an unparseable row is UNREADABLE, never a pass",
-                   bool(outcome_handoff_unverified(30, _log)["unreadable"])))
+                   bool(outcome_handoff_log_artifact_disagreement(30, _log)["unreadable"])))
 
     # --- outcome_handoff_misfiled: drive the REAL function over a temp handoffs dir --------
     # It had NO fixtures when first written and its first two versions reported adverse=0 on the
