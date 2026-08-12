@@ -35,7 +35,13 @@ printf '%s\n' "$OUT" >> "$LOG"
 
 # ARTIFACT branch: for a tool that always exits 0, ask its OUTPUT, not its code.
 FOUND=0
-if [ "$MARKER" != "-" ] && printf '%s' "$OUT" | grep -qE "$MARKER"; then
+# NO PIPE. `set -o pipefail` + `grep -q` is a documented false-negative: grep exits on first
+# match, printf takes SIGPIPE, and the PIPELINE returns 1 even though the marker WAS found.
+# Past the ~64KB pipe buffer this silently flips adverse -> ok, which is precisely the failure
+# this wrapper exists to prevent. Confirmed on this file: a 2.6MB output with the marker on
+# LINE 1 reported marker_hit=0, status=ok. My four original fixtures all used small outputs and
+# passed. A here-string has no upstream writer to kill. (memory: pipefail-grep-q-sigpipe-false-negative)
+if [ "$MARKER" != "-" ] && grep -qE "$MARKER" <<< "$OUT"; then
     FOUND=1
 fi
 
