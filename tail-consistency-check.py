@@ -67,6 +67,17 @@ DISPOSITION_RE = re.compile(
 IMPERATIVE = re.compile(
     r"\b(run|read|install|decide|confirm|approve|tell me|say the word|paste|check)\b", re.I)
 
+# DECLARATIVE assignment — the recall gap found 2026-08-12 by running this tool on its own
+# author's tail. `You: Nothing — R2 is the only item needing your decision` passed clean:
+# C2 required an IMPERATIVE verb, and a declarative hand-off carries none. The reader is
+# assigned work either way; only the grammar differs. Measured miss, not a hypothesis.
+ASSIGNS_TO_USER = re.compile(
+    r"\b(?:needs?|requires?|await(?:s|ing)?|pending|waiting)\s+(?:on\s+)?"
+    r"(?:your|the user'?s?|user)\b"
+    r"|\byour\s+(?:decision|approval|authoris|authoriz|call|sign-?off|input)"
+    r"|\b(?:up to|down to)\s+you\b"
+    r"|\bfor\s+you\s+to\s+(?:decide|approve|choose)", re.I)
+
 
 def field(text: str, name: str) -> str | None:
     m = re.search(rf"^\s*\**{re.escape(name)}\**\s*:?\s*(.+)$", text, re.I | re.M)
@@ -92,10 +103,12 @@ def check(text: str) -> tuple[list[str], bool]:
 
     # C2 — 'You: Nothing' followed by an instruction is self-contradicting. Occurred 3x in one
     # session before anyone noticed.
-    if you_f and NOTHING.match(you_f) and IMPERATIVE.search(you_f):
+    if you_f and NOTHING.match(you_f) and (IMPERATIVE.search(you_f)
+                                           or ASSIGNS_TO_USER.search(you_f)):
         findings.append(
-            f"CONTRADICTION: 'You: {you_f[:60]}' says nothing is required AND issues an "
-            f"instruction in the same line.")
+            f"CONTRADICTION: 'You: {you_f[:60]}' says nothing is required AND assigns work to "
+            f"the reader in the same line — as an instruction, or as a declarative hand-off "
+            f"('X needs your decision'), which reads as 'nothing' and is not.")
 
     # C5 — a gap stated as incomplete with NO disposition. The dominant miss: 19 of 30
     # user-corrected tails carried this and C1-C4 saw none of them.
@@ -141,9 +154,31 @@ def self_check() -> int:
             "Ensured by: retry scheduled.\nYou: run the installer\n")
     f2, _ = check(good)
     ok.append(("a consistent tail must NOT be flagged", not f2))
+    # Assert on the finding TYPE, never the message prose. The original asserted on the exact
+    # sentence and broke the moment the sentence was improved (2026-08-12) -- a fixture that
+    # penalises clearer wording is a fixture that freezes bad wording.
     f3, _ = check("Done: x\nOpen: Nothing\nYou: Nothing — run the installer\n")
-    ok.append(("'You: Nothing' plus an instruction must be caught",
-               any("says nothing is required AND issues an instruction" in x for x in f3)))
+    ok.append(("'You: Nothing' plus an IMPERATIVE must be caught",
+               any(x.startswith("CONTRADICTION") for x in f3)))
+
+    # The recall gap this tool missed on its own author's tail, 2026-08-12. Declarative
+    # hand-offs assign work exactly as imperatives do; only the grammar differs.
+    for decl in ("You: Nothing — R2 is the only item needing your decision",
+                 "You: Nothing — the remaining work awaits your approval",
+                 "You: Nothing — that one is up to you",
+                 "You: Nothing — pending the user's sign-off"):
+        fd, _ = check(f"Done: x\nOpen: Nothing\n{decl}\n")
+        ok.append((f"declarative hand-off caught: {decl[13:45]!r}",
+                   any(x.startswith("CONTRADICTION") for x in fd)))
+
+    # Must NOT fire when 'Nothing' is honest: no assignment of any kind.
+    fclean, _ = check("Done: x\nOpen: Nothing\nYou: Nothing — complete\n")
+    ok.append(("an honest 'You: Nothing — complete' must NOT be flagged",
+               not any(x.startswith("CONTRADICTION") for x in fclean)))
+    # 'your' alone is not an assignment -- guard against the pattern being too greedy.
+    fnb, _ = check("Done: x\nOpen: Nothing\nYou: Nothing — your earlier fix already covered it\n")
+    ok.append(("'your' without an assignment noun must NOT be flagged",
+               not any(x.startswith("CONTRADICTION") for x in fnb)))
     f4, _ = check("Done: x\nOpen: Nothing\nYou: the design is interesting\n")
     ok.append(("a You: line assigning no action must be flagged as VAGUE",
                any("VAGUE" in x for x in f4)))

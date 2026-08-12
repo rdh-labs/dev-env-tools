@@ -86,6 +86,8 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
      '"adverse": None if unreadable else adverse,', '"adverse": adverse,'),
     ("governed-outcomes-check.py", "handoff log window bound removed",
      "        if ts.timestamp() >= cutoff:", "        if True:"),
+    ("tail-consistency-check.py", "declarative-assignment branch removed (C2 recall gap)",
+     "or ASSIGNS_TO_USER.search(you_f)):", "or False):"),
     ("tail-from-record.py", "foreign-session refusal reverted to advisory",
      "    if not own and not args.allow_foreign_session:", "    if False:"),
     ("tail-from-record.py", "dirty-file branch disabled",
