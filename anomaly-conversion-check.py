@@ -116,6 +116,13 @@ def self_check() -> int:
     ok = []
     ok.append(("an unresolvable SHA is NOT counted as BUILT",
                classify("fixed in deadbeef1", Path("/nonexistent")) != "BUILT"))
+    # The above passed even with sha_resolves BYPASSED, because an untriggered cell falls to
+    # SHIPPED either way — the later SHIPPED verdict made the older fixture vacuous. Found by
+    # the scheduled mutation canary, not by authorship. This pins the resolution check itself:
+    # an unresolvable SHA naming a TRIGGERED file must still not be BUILT.
+    ok.append(("an UNRESOLVABLE SHA naming a triggered file is still NOT BUILT",
+               classify("fixed in deadbeef1, session-artifact-sweep.py",
+                        Path("/nonexistent")) != "BUILT"))
     ok.append(("'none' is PROSE", classify("none", None) == "PROSE"))
     ok.append(("a SHA with NO trigger is SHIPPED, not BUILT — a file nobody runs",
                classify("fixed in 13de4bf, see foo-with-no-trigger.py", None) == "SHIPPED"))

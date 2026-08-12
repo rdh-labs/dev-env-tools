@@ -62,6 +62,22 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
      "    rows, bad = [], 0", "    rows, bad = [], 0\n    return [], 0"),
     ("anomaly-conversion-check.py", "SHA resolution bypassed (any SHA counts as BUILT)",
      "if repo is None or sha_resolves(sha, repo):", "if True:"),
+    # --- added 2026-08-11 after EIGHT fixtures shipped vacuous, every one caught by manual
+    # sabotage and none by authorship. This canary is SCHEDULED weekly, so registering the
+    # mutations converts that discipline into a mechanism that runs whether or not I remember.
+    ("governed-outcomes-check.py", "expected-path hits read as CLEAN again",
+     'else "REVIEW_REQUIRED" if expected_hits else "CLEAN")', 'else "CLEAN")'),
+    ("governed-outcomes-check.py", "credential hit/expected split forced to always-expected",
+     "(expected if EXPECTED_PATH_RE.search(current) else hits).append(",
+     "(expected if True else hits).append("),
+    ("governed-outcomes-check.py", "token_used counted as break-glass",
+     'if r.get("event") == "override_used":', "if True:"),
+    ("tail-from-record.py", "foreign-session refusal reverted to advisory",
+     "    if not own and not args.allow_foreign_session:", "    if False:"),
+    ("tail-from-record.py", "dirty-file branch disabled",
+     "        elif st:", "        elif False:"),
+    ("tail-from-record.py", "UNKNOWN git state treated as clean",
+     "        if st is None:", "        if False:"),
 ]
 
 
