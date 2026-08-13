@@ -125,10 +125,18 @@ for p in "${PATHS[@]}"; do
     BLOBS="$BLOBS$p=$h "
 done
 
-python3 - "$LEDGER" "$REPO" "$HEAD_SHA" "$MODEL" "$RC" "$TRUNC" "$BYTES" "$BLOBS" "${PATHS[@]}" <<'EOP'
+# SESSION ATTRIBUTION. Peer 23a7dfc5 measured that this estate's logs record OCCURRENCE without
+# ATTRIBUTION -- `discovery-enforcement.jsonl` has no session field at all -- so they cannot be
+# asked "did session X skip this?" even in principle. The data exists and the join key does not.
+# This ledger had the identical defect within an hour of being written. Recording it here makes
+# every future row answerable per-session; rows written before this change are not.
+SESSION="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-unknown}}"
+
+python3 - "$LEDGER" "$REPO" "$HEAD_SHA" "$MODEL" "$RC" "$TRUNC" "$BYTES" "$BLOBS" "$SESSION" "${PATHS[@]}" <<'EOP'
 import json, sys, datetime
-led, repo, sha, model, rc, trunc, nbytes, blobs, *paths = sys.argv[1:]
+led, repo, sha, model, rc, trunc, nbytes, blobs, session, *paths = sys.argv[1:]
 row = {"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "session": session,
        "repo": repo, "head": sha, "model": model, "rc": int(rc),
        "truncated": trunc == "true", "diff_bytes": int(nbytes), "paths": paths,
        "blobs": dict(b.split("=", 1) for b in blobs.split() if "=" in b),
