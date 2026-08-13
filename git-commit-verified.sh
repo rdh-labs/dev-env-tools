@@ -41,13 +41,14 @@
 #        backticks has already been mangled by shell substitution in this workspace once.
 set -uo pipefail
 
-MSGSRC=""; PATHS=(); FORCE_IGNORED=0
+MSGSRC=""; PATHS=(); FORCE_IGNORED=0; PRIOR_ART=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -m) MSGSRC="${2:?-m needs a file or -}"; shift 2 ;;
         --force-ignored) FORCE_IGNORED=1; shift ;;
+        --prior-art) PRIOR_ART="${2:?--prior-art needs a value}"; shift 2 ;;
         --) shift; PATHS=("$@"); break ;;
-        *)  printf 'usage: %s [--force-ignored] -m <msgfile|-> -- <path>...\n' "$0" >&2; exit 2 ;;
+        *)  printf 'usage: %s [--force-ignored] [--prior-art <what>] -m <msgfile|-> -- <path>...\n' "$0" >&2; exit 2 ;;
     esac
 done
 [ -n "$MSGSRC" ] || { printf 'no -m\n' >&2; exit 2; }
@@ -73,6 +74,27 @@ SID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-unknown}}"
 if ! grep -q '^Claude-Session:' "$MSGFILE"; then
     git interpret-trailers --in-place --trailer "Claude-Session: $SID" "$MSGFILE" 2>/dev/null \
         || printf '\nClaude-Session: %s\n' "$SID" >> "$MSGFILE"
+fi
+
+# --- PRIOR-ART PROVENANCE ------------------------------------------------------------------
+# WHY. Measured 2026-08-13: eleven build commits landed before ANY prior-art check ran, and the
+# checks that did run were retroactive, prompted by the user rather than by the build. The
+# omission left no artifact, so compliance was unmeasurable until someone hand-joined commit
+# timestamps against a discovery log -- and that join is a heuristic, since the discovery log
+# carries no session key and no link to a commit.
+#
+# A trailer makes it DERIVABLE instead: `git log --grep='^Prior-Art:'` answers "was prior art
+# consulted for this change" from the commit itself, with no heuristic and no second system to
+# keep in sync. SLSA models the same idea as an attestation's `materials`/`resolvedDependencies`
+# -- the inputs a build consumed; this is that idea at commit granularity.
+#
+# DELIBERATELY NOT MANDATORY HERE. Requiring it would raise the cost of the compliant path,
+# which is the pressure that produces the skipping (Reason's GEMS: these are violations, not
+# lapses). It records what was done so the omission becomes VISIBLE and countable. Making it
+# blocking is a separate, user-authorised decision.
+if [ -n "$PRIOR_ART" ] && ! grep -q '^Prior-Art:' "$MSGFILE"; then
+    git interpret-trailers --in-place --trailer "Prior-Art: $PRIOR_ART" "$MSGFILE" 2>/dev/null \
+        || printf 'Prior-Art: %s\n' "$PRIOR_ART" >> "$MSGFILE"
 fi
 
 # --- refuse to absorb a peer's staged work (defect 2) ---------------------------------------
