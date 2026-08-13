@@ -47,9 +47,10 @@ TRANSCRIPT_DIRS = [
 YOU_LINE_RE = re.compile(r"(?im)^\s*(?:\*{2}\s*)?You:\*{0,2}\s*(.+)$")
 
 # --- Explicit no-handback: the documented closures (CLAUDE.md tail convention) ---
-NO_HANDBACK_RE = re.compile(
-    r"(?i)^\s*nothing\b(?:\s*[—\-–]\s*(?:complete|agent handles next))?\s*\.?\s*$"
-)
+# FULL-CORPUS FP CLASS #3 (32,631 responses): "Nothing — safe to exit. If you want X..."
+# The line OPENS by saying nothing is required; trailing prose then tripped AUTHORIZE_RE
+# on words like "self-authorize". Anchor on the OPENING, not the whole line.
+NO_HANDBACK_RE = re.compile(r"(?i)^\s*nothing\b")
 
 # --- Decision shape ----------------------------------------------------------
 # Two families, deliberately separated: an AUTHORIZATION ask and a CHOICE ask.
@@ -86,7 +87,11 @@ CHOICE_RE = re.compile(
 # Byte-identical to shared/recommendation_markers.REC_LABEL_RE. Duplicated rather
 # than imported because this script must run outside the hooks package; a drift test
 # belongs with it if this is ever promoted (see PROMOTION NOTE at the bottom).
-REC_LABEL_RE = re.compile(r"(?i)\(\s*recommended\s*\)")
+# FULL-CORPUS FP CLASS #4: "(recommended, Next1 prompt ready)" — a real recommendation
+# whose parens carry extra text. Requiring the parens to wrap "recommended" ALONE made
+# the detector fire on responses that DID recommend. Match the label anywhere in a
+# parenthetical, and accept the bare participle in prose.
+REC_LABEL_RE = re.compile(r"(?i)\((?=[^)]*\brecommended\b)[^)]*\)|\brecommended\b")
 # A prose recommendation without the literal label still counts as *having thought it
 # through* for the purpose of this check; the label contract is enforced elsewhere
 # (escalation_gate). Firing on a present-but-unlabelled recommendation would duplicate
@@ -109,7 +114,14 @@ def find_handback_decisions(text: str) -> list[dict]:
         out = []
         for m in YOU_LINE_RE.finditer(text):
             you = m.group(1).strip()
-            if NO_HANDBACK_RE.match(you):
+            # A "Nothing..." opener is only a closure if nothing is actually handed over.
+            # "Nothing — safe to exit. ...I didn't self-authorize" is an aside; "Nothing
+            # queued for me. ...the two decisions that are genuinely yours" hands over TWO
+            # DECISIONS while opening with the word for none. Loosening the opener alone
+            # deleted the motivating true positive -- caught by the must-fire suite, not by
+            # the silent one. So: the opener excuses an authorization-shaped aside, never an
+            # explicit assertion that a choice belongs to the user.
+            if NO_HANDBACK_RE.match(you) and not CHOICE_RE.search(you):
                 continue
             if TOOL_PERMISSION_RE.search(you):
                 continue          # clicking a permission dialog is not a decision
@@ -228,6 +240,32 @@ def main() -> int:
 # from this session's own 6th failure) and 5 must-be-silent (permission, tool access,
 # instruction, "Nothing", and a response that DOES carry a recommendation). The silent
 # direction is the one that must be constructed, and both FP classes lived there.
+#
+#   ── FULL CORPUS, 2026-08-13 — THE n=197 "ZERO FP" CLAIM IS RETRACTED ──────
+#   The 1.46% above was a SAMPLING ARTIFACT of the 400 most recent transcripts,
+#   i.e. one agent's own recent style. It did not generalise, and the claim
+#   "zero confirmed false positives" made on it is WITHDRAWN.
+#
+#   v3 @ 32,631 responses / 8,648 You:-lines -> 6.41% fire, ~83% FP (5 of 6).
+#       Two NEW classes, both narrowness in MY matchers, not new phenomena:
+#         - "(recommended, Next1 prompt ready)" -- a real recommendation whose
+#           parens carry extra text; REC_LABEL_RE demanded the parens wrap the
+#           word ALONE, so the detector fired on responses that DID recommend.
+#         - "Nothing — safe to exit. ...I didn't self-authorize" -- a line that
+#           OPENS by saying nothing is needed; trailing prose tripped AUTHORIZE_RE.
+#   v4 @ 32,648 responses / 8,655 You:-lines -> 4.91% fire, ~20% FP (1 of 5
+#       adjudicated: a PRECONDITION statement, "you'd need to exit plan mode",
+#       which is not a choice put to the user).
+#
+#   CONSEQUENCE: advisory tier is defensible; BLOCKING is NOT -- evidence_gate.py
+#   :90-106 requires a zero-confirmed-FP artifact and this artifact no longer is
+#   one. Any future promotion must re-measure on the FULL corpus, never a recent
+#   slice; the slice flatters the measuring agent by construction.
+#
+#   PROCESS NOTE. Repairing the first FP class DELETED the motivating true
+#   positive -- loosening the "Nothing" opener excluded the very You: line the
+#   tool was built for. Caught by the MUST-FIRE half of the suite, not the silent
+#   half. Both halves are load-bearing in both directions.
 #
 # NOT PROMOTED. Wiring a scanner into the Stop hook stack is HIGH_RISK and is the
 # user's authorization to give. This file is the evidence, not the enforcement.
