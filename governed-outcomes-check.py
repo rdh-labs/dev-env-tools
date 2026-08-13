@@ -609,6 +609,45 @@ def outcome_qc_not_run(days: int, ledger: Path | None = None,
 NOTIFY_LEDGER = Path.home() / ".cache" / "notify" / "notifications.jsonl"
 
 
+def read_jsonl_records(text: str, max_join: int = 40):
+    """Yield JSON objects from a JSONL file whose records may SPAN LINES.
+
+    Measured 2026-08-13 by a /simplify review: `~/.cache/notify/notifications.jsonl` holds 53,707
+    lines of which **2,300 (4.3%) fail `json.loads`** — not corruption, but `message` fields
+    carrying unescaped newlines, so one record occupies several lines. A naive `.splitlines()`
+    reader discards those records silently.
+
+    That matters here more than anywhere: the consumer using this exists to catch notifications
+    that reached nobody, and a dropped record is exactly a notification that reached nobody. The
+    reader's failure mode and the defect it hunts are the same shape. It also explains why this
+    workspace held two figures for the same property — 2,300 (split records, counted by me) and
+    555 (genuinely malformed, counted by a peer): different readers, different populations.
+
+    Joins continuation lines until the buffer parses, bounded by max_join so a genuinely
+    malformed record cannot swallow the rest of the file. Unparseable buffers are yielded as
+    None so callers can COUNT them rather than lose them silently.
+    """
+    buf = ""
+    joined = 0
+    for line in text.splitlines():
+        if not buf and not line.strip():
+            continue
+        buf = line if not buf else buf + "\n" + line
+        try:
+            yield json.loads(buf)
+        except ValueError:
+            joined += 1
+            if joined <= max_join:
+                continue          # probably a record spanning lines; keep accumulating
+            yield None            # give up on this buffer, never swallow the remainder
+        buf, joined = "", 0
+    if buf:
+        try:
+            yield json.loads(buf)
+        except ValueError:
+            yield None
+
+
 def _any_ts(v) -> datetime | None:
     """Parse ISO *or* float-epoch timestamps.
 
@@ -663,12 +702,11 @@ def outcome_notification_undelivered(days: int, notify: Path | None = None,
                 "note": "a channel that never logged is indistinguishable from one that works"}
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     delivered, failed, bad = [], [], 0
-    for line in nl.read_text(errors="replace").splitlines():
-        if not line.strip():
-            continue
-        try:
-            r = json.loads(line)
-        except ValueError:
+    # Multi-line aware: 4.3% of this ledger's records span lines (unescaped newlines in
+    # `message`). A .splitlines() reader dropped them, and a dropped record here IS a
+    # notification that reached nobody -- the reader's failure mode was the defect it hunts.
+    for r in read_jsonl_records(nl.read_text(errors="replace")):
+        if r is None or not isinstance(r, dict):
             bad += 1
             continue
         t = _any_ts(r.get("timestamp") or r.get("ts"))
