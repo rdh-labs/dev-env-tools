@@ -606,6 +606,106 @@ def outcome_qc_not_run(days: int, ledger: Path | None = None,
                     "hide by not logging"}
 
 
+NOTIFY_LEDGER = Path.home() / ".cache" / "notify" / "notifications.jsonl"
+
+
+def _any_ts(v) -> datetime | None:
+    """Parse ISO *or* float-epoch timestamps.
+
+    Not defensive padding: `closure-claim-disagreements.jsonl` carries ISO strings on 403 rows
+    and a bare float epoch on its newest one. A consumer that assumes one format silently drops
+    the other, and dropping the NEWEST rows is the direction that makes a stale log look clean.
+    """
+    if isinstance(v, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(v), timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    s = str(v or "")
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromtimestamp(float(s), timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def outcome_notification_undelivered(days: int, notify: Path | None = None,
+                                     heartbeat: Path | None = None) -> dict:
+    """THE OUTCOME: an adverse check fired and NOBODY WAS TOLD.
+
+    The last silent-failure hole in this workspace's alert path, and it was in the alert path
+    itself. `notify.sh` writes a delivery ledger carrying a `success` field, 53,559 rows of it,
+    and NOTHING consumed it. A transmission failure was therefore invisible: the check would run,
+    go adverse, record its heartbeat, attempt to notify, fail, and every artifact would still
+    look correct. "No silent failures" applied to the checks and not to the channel carrying
+    their output.
+
+    TWO CONDITIONS, both ADVERSE, and the second is the one that matters:
+      - a delivery row with success false: the notifier tried and failed;
+      - an ADVERSE heartbeat with NO delivery row near it: the notifier never ran, or ran and
+        wrote nothing. This is the dead-man's-switch shape applied to the alert path -- absence
+        where something was expected, which is the only way to detect a channel that has gone
+        quiet. Verified live 2026-08-13: artifact-sweep went adverse at 02:00:02Z and two
+        delivery rows followed at 02:00:04Z and 02:00:05Z, so the join is known to work on real
+        data rather than only on fixtures.
+
+    Read from `notify.sh`'s ledger, which the CHECKS do not write -- state the reporter does not
+    control.
+    """
+    nl, hb = notify or NOTIFY_LEDGER, heartbeat or HEARTBEAT
+    if not nl.exists():
+        return {"outcome": "notification_undelivered", "adverse": None, "failed": [],
+                "unannounced": [], "unreadable": ["no delivery ledger -- alert path UNKNOWN"],
+                "note": "a channel that never logged is indistinguishable from one that works"}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    delivered, failed, bad = [], [], 0
+    for line in nl.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        t = _any_ts(r.get("timestamp") or r.get("ts"))
+        if t is None or t < cutoff:
+            continue
+        if r.get("success") is False:
+            failed.append(f"{t:%Y-%m-%dT%H:%M:%SZ} {str(r.get('title'))[:60]}")
+        else:
+            delivered.append((t, str(r.get("title") or "")))
+
+    unannounced, considered = [], 0
+    if hb.exists():
+        for line in hb.read_text(errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(r, dict) or r.get("status") in (None, "ok"):
+                continue
+            t = _any_ts(r.get("ts"))
+            if t is None or t < cutoff:
+                continue
+            considered += 1
+            name = str(r.get("check", ""))
+            if not any(name in title and abs((t - dt).total_seconds()) <= 600
+                       for dt, title in delivered):
+                unannounced.append(f"{name} was {r.get('status')} at {t:%Y-%m-%dT%H:%M:%SZ} "
+                                   f"with no delivery row within 10min")
+    return {"outcome": "notification_undelivered", "adverse": len(failed) + len(unannounced),
+            "failed": failed, "unannounced": unannounced, "adverse_firings_checked": considered,
+            "unreadable": ([f"{bad} unparseable delivery row(s)"] if bad else [])
+                          + ([] if hb.exists() else ["no heartbeat -- cannot check for silence"]),
+            "note": "an adverse check nobody heard about is the same as a check that never ran"}
+
+
 CRON_RUNNER = "scheduled-check-runner.sh"
 
 
@@ -712,7 +812,8 @@ def run(days: int) -> dict:
               outcome_handoff_misfiled(),
               outcome_check_not_running(),
               outcome_marker_cannot_fire(),
-              outcome_qc_not_run(days)]
+              outcome_qc_not_run(days),
+              outcome_notification_undelivered(days)]
     adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
     return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
@@ -1108,6 +1209,56 @@ def self_check() -> int:
         ok.append(("zero commits judged is UNKNOWN, never adverse=0",
                    _r["adverse"] is None and _r["considered"] == 0
                    and any("UNMEASURED" in u for u in _r["unreadable"])))
+
+    # --- outcome_notification_undelivered: the alert path's own silence detector -------------
+    import tempfile as _tf6
+    with _tf6.TemporaryDirectory() as td6:
+        _r6 = Path(td6)
+        _n, _h = _r6 / "n.jsonl", _r6 / "h.jsonl"
+        _t0 = datetime.now(timezone.utc)
+        _iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        ok.append(("no delivery ledger is UNKNOWN, never a pass",
+                   outcome_notification_undelivered(7, _r6 / "nope.jsonl", _h)["adverse"] is None))
+
+        _h.write_text(json.dumps({"ts": _iso(_t0), "check": "artifact-sweep",
+                                  "status": "adverse"}) + "\n")
+        _n.write_text(json.dumps({"timestamp": _iso(_t0 + timedelta(seconds=3)),
+                                  "title": "SCHEDULED CHECK: artifact-sweep is adverse",
+                                  "success": True}) + "\n")
+        ok.append(("an adverse firing WITH a delivery row is clean",
+                   outcome_notification_undelivered(7, _n, _h)["adverse"] == 0))
+
+        # THE POINT OF THE CHECK: adverse fired, nothing was sent.
+        _n.write_text(json.dumps({"timestamp": _iso(_t0), "title": "unrelated",
+                                  "success": True}) + "\n")
+        _r = outcome_notification_undelivered(7, _n, _h)
+        ok.append(("an adverse firing with NO delivery row is ADVERSE",
+                   _r["adverse"] == 1 and any("no delivery row" in u for u in _r["unannounced"])))
+
+        # A delivery too late to be this firing's must not count as covering it.
+        _n.write_text(json.dumps({"timestamp": _iso(_t0 + timedelta(minutes=45)),
+                                  "title": "SCHEDULED CHECK: artifact-sweep is adverse",
+                                  "success": True}) + "\n")
+        ok.append(("a delivery 45min later does not cover the firing",
+                   outcome_notification_undelivered(7, _n, _h)["adverse"] == 1))
+
+        _n.write_text(json.dumps({"timestamp": _iso(_t0), "title": "anything",
+                                  "success": False}) + "\n")
+        _r = outcome_notification_undelivered(7, _n, _h)
+        ok.append(("a delivery that FAILED is adverse on its own",
+                   _r["adverse"] == 2 and _r["failed"]))
+
+        # Float-epoch timestamps are live in this estate; dropping them hides the NEWEST rows.
+        _n.write_text(json.dumps({"timestamp": (_t0 + timedelta(seconds=3)).timestamp(),
+                                  "title": "SCHEDULED CHECK: artifact-sweep is adverse",
+                                  "success": True}) + "\n")
+        ok.append(("a float-epoch delivery timestamp is parsed, not dropped",
+                   outcome_notification_undelivered(7, _n, _h)["adverse"] == 0))
+
+        _h.write_text(json.dumps({"ts": _iso(_t0), "check": "x", "status": "ok"}) + "\n")
+        ok.append(("an OK heartbeat needs no notification",
+                   outcome_notification_undelivered(7, _n, _h)["adverse"] == 0))
 
     failed = [m for m, good in ok if not good]
     for m in failed:
