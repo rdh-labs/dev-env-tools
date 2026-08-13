@@ -60,7 +60,21 @@ if [ "$MSGSRC" = "-" ]; then cat > "$MSGFILE"; else cat "$MSGSRC" > "$MSGFILE"; 
 # --- refuse to absorb a peer's staged work (defect 2) ---------------------------------------
 # Anything already in the index that is NOT one of MY paths belongs to another session. Adding
 # to that index and committing would attribute their work to me.
-FOREIGN="$(git diff --cached --name-only 2>/dev/null | while IFS= read -r s; do
+#
+# THIS GUARD MUST FAIL CLOSED. An external review flagged `pipefail` here as a maintainability
+# nit; tracing it found the real defect pointing the other way. If `git diff --cached` fails --
+# and index.lock contention, the very condition this tool exists for, is the likeliest cause --
+# a captured-output check reads back EMPTY, "no foreign paths" is inferred from silence, and the
+# guard evaporates exactly when it is needed. Absence of evidence read as evidence of absence,
+# in the control against absorbing a peer's work. Read the status explicitly and refuse.
+CACHED="$(git diff --cached --name-only 2>/dev/null)"; CACHED_RC=$?
+if [ "$CACHED_RC" -ne 0 ]; then
+    printf 'ABORT: cannot read the index to check for foreign staged work (rc=%s).\n' "$CACHED_RC" >&2
+    printf 'UNKNOWN is never a pass -- refusing rather than committing blind.\n' >&2
+    exit 1
+fi
+FOREIGN="$(printf '%s\n' "$CACHED" | while IFS= read -r s; do
+    [ -n "$s" ] || continue
     for p in "${PATHS[@]}"; do
         case "$s" in "$p"|"$p"/*) continue 2 ;; esac
     done
