@@ -57,6 +57,24 @@ MSGFILE="$(mktemp)"; trap 'rm -f "$MSGFILE"' EXIT
 if [ "$MSGSRC" = "-" ]; then cat > "$MSGFILE"; else cat "$MSGSRC" > "$MSGFILE"; fi
 [ -s "$MSGFILE" ] || { printf 'empty commit message\n' >&2; exit 2; }
 
+# --- SESSION ATTRIBUTION AS A GIT TRAILER --------------------------------------------------
+# The first version of this wrote session attribution ONLY to a ledger under ~/.metrics. That
+# was a dual-write of information belonging to the commit, and it fails exactly where it is
+# needed: outside the repo, so never pushed, never cloned, gone with the machine -- and this
+# session lost its own memory three separate ways today.
+#
+# Git TRAILERS are the established mechanism (and there is prior art specifically for AI session
+# attribution, which one search would have found before I built the ledger). A trailer travels
+# with the commit across forks and mirrors, is readable by any git client with no proprietary
+# tooling, and `git interpret-trailers` parses it. So the trailer is AUTHORITATIVE and the
+# ledger below is a rebuildable cross-repo INDEX -- the same split SLSA draws between an
+# attestation and its distribution. Write one system, derive the other.
+SID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-unknown}}"
+if ! grep -q '^Claude-Session:' "$MSGFILE"; then
+    git interpret-trailers --in-place --trailer "Claude-Session: $SID" "$MSGFILE" 2>/dev/null \
+        || printf '\nClaude-Session: %s\n' "$SID" >> "$MSGFILE"
+fi
+
 # --- refuse to absorb a peer's staged work (defect 2) ---------------------------------------
 # Anything already in the index that is NOT one of MY paths belongs to another session. Adding
 # to that index and committing would attribute their work to me.
@@ -164,7 +182,6 @@ fi
 # without attribution, so they cannot be asked "did session X do this?". Commits could not be
 # either, until now.
 LEDGER="$HOME/.metrics/commits-by-session.jsonl"
-SID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-unknown}}"
 mkdir -p "$(dirname "$LEDGER")" 2>/dev/null || true
 SHORT="$(git rev-parse --short HEAD)"
 python3 - "$LEDGER" "$SID" "$(git rev-parse --show-toplevel)" "$(git rev-parse HEAD)" \
@@ -178,23 +195,14 @@ with open(led, "a") as f:
         "files": int(nfiles), "paths": paths}) + "\n")
 EOP
 
-# IMMEDIATE CONSUMER, not a log for later. A ledger nobody reads is the defect this workspace
-# keeps finding, so surface the running total at the moment it is useful -- every commit.
-PRIOR="$(python3 - "$LEDGER" "$SID" <<'EOP' 2>/dev/null || true
-import json, sys
-led, sid = sys.argv[1:3]
-n = 0
-try:
-    for line in open(led, errors="replace"):
-        try:
-            if json.loads(line).get("session") == sid:
-                n += 1
-        except ValueError:
-            pass
-except OSError:
-    pass
-print(n)
-EOP
-)"
+# IMMEDIATE CONSUMER, not a log for later, and it reads the AUTHORITATIVE source. Counting the
+# ledger would have made the ledger the truth and reintroduced the dual-write; counting the
+# trailers in git means the number cannot disagree with the commits. `--grep` must precede any
+# `--`, or git silently ignores it.
+# NOT `-F`. Fixed-strings makes `^` and `$` literal characters, so the anchored pattern below
+# matches nothing and the counter reports 0 forever -- a consumer that looks alive and is dead,
+# which is this session's whole subject. Caught by a fixture that compared the tool's number
+# against `git log`'s own; it would not have been caught by reading the line.
+PRIOR="$(git log --grep="^Claude-Session: $SID\$" --format=%H 2>/dev/null | grep -c . || echo 0)"
 printf 'verified %s  files=%s  [session commit %s]\n' "$SHORT" \
     "$(printf '%s\n' "$present" | grep -c .)" "${PRIOR:-?}"
