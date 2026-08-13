@@ -177,12 +177,21 @@ fi
 missing=()
 present="$(git show --name-only --format="" HEAD)"
 for p in "${PATHS[@]}"; do
-    rel="$(git ls-files --full-name -- "$p" 2>/dev/null | head -1)"
-    [ -n "$rel" ] || rel="$p"
+    # A DIRECTORY IS PRESENT IF *ANY* FILE UNDER IT IS IN THE COMMIT. The previous version took
+    # `git ls-files -- "$p" | head -1` -- the alphabetically FIRST tracked file under the
+    # directory -- and tested only that one. Committing a directory in which some other file
+    # changed then reported the directory ABSENT. A /simplify review flagged this, and the tool
+    # demonstrated it on the very commit that registered the finding: both files were committed
+    # correctly and it still exited 1. A false alarm on a successful commit is worse than no
+    # check, because it trains the operator to ignore the verifier.
+    mapfile -t rels < <(git ls-files --full-name -- "$p" 2>/dev/null)
+    [ "${#rels[@]}" -gt 0 ] || rels=("$p")
     hit=0
-    while IFS= read -r f; do
-        case "$f" in "$rel"|"$rel"/*) hit=1; break ;; esac
-    done <<< "$present"
+    for rel in "${rels[@]}"; do
+        while IFS= read -r f; do
+            case "$f" in "$rel"|"$rel"/*) hit=1; break 2 ;; esac
+        done <<< "$present"
+    done
     [ "$hit" -eq 1 ] || missing+=("$p")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
