@@ -113,12 +113,25 @@ printf '%s\n' "$OUT"
 # LEDGER ROW. This is the join partner for outcome_qc_not_run, which lists code-change commits
 # with no row here. The omission is derived from git -- state this script does not write -- so a
 # skipped review cannot hide by simply not logging.
-python3 - "$LEDGER" "$REPO" "$HEAD_SHA" "$MODEL" "$RC" "$TRUNC" "$BYTES" "${PATHS[@]}" <<'EOP'
+# CONTENT-ADDRESS WHAT WAS ACTUALLY REVIEWED. A commit-sha join answers "did a review happen at
+# this point in history", which is NOT "was this content reviewed" -- measured immediately: the
+# review of db176e0 ran at its parent, then two more edits landed before the commit, and a
+# sha-join marked it covered. Existence standing in for currency, inside the currency check.
+# `git hash-object` gives the same blob id the commit will carry, so the join becomes exact.
+BLOBS=""
+for p in "${PATHS[@]}"; do
+    [ -f "$p" ] || continue
+    h="$(git hash-object -- "$p" 2>/dev/null)" || continue
+    BLOBS="$BLOBS$p=$h "
+done
+
+python3 - "$LEDGER" "$REPO" "$HEAD_SHA" "$MODEL" "$RC" "$TRUNC" "$BYTES" "$BLOBS" "${PATHS[@]}" <<'EOP'
 import json, sys, datetime
-led, repo, sha, model, rc, trunc, nbytes, *paths = sys.argv[1:]
+led, repo, sha, model, rc, trunc, nbytes, blobs, *paths = sys.argv[1:]
 row = {"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
        "repo": repo, "head": sha, "model": model, "rc": int(rc),
        "truncated": trunc == "true", "diff_bytes": int(nbytes), "paths": paths,
+       "blobs": dict(b.split("=", 1) for b in blobs.split() if "=" in b),
        "result": "reviewed" if int(rc) == 0 else "attempted"}
 with open(led, "a") as f:
     f.write(json.dumps(row) + "\n")

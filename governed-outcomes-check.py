@@ -500,10 +500,17 @@ def outcome_qc_not_run(days: int, ledger: Path | None = None,
     passed. Every available signal read green. The user found it by asking.
 
     THE JOIN IS DERIVED FROM GIT -- state `qc-change.sh` does not write. Asking the skipper to
-    log the skip cannot work: the omission and the failure to record it have the same cause. So
-    a commit is covered only if a ledger row names it, or names its parent (review-then-commit).
+    log the skip cannot work: the omission and the failure to record it have the same cause.
     Absence of a partner IS the finding. This is the one control shape that measures the thing
     rather than the reporter.
+
+    THE JOIN KEY IS THE BLOB, NOT THE COMMIT SHA, and the first version got this wrong. Joining
+    on commit-or-parent sha answers "did a review happen at this point in history" -- which is
+    not "was this content reviewed". Measured on this check's own commit: the review ran, two
+    further edits landed, the commit was made, and the sha join reported COVERED. Existence
+    substituted for currency inside the currency check. `git hash-object` at review time and the
+    committed blob id are the same identifier, so the join is now exact: edit-after-review is
+    ADVERSE, which is what it always should have been.
 
     CUTOVER, honest: commits predating the ledger's first row cannot be judged and are excluded,
     never counted as clean. No ledger at all is UNKNOWN.
@@ -525,8 +532,10 @@ def outcome_qc_not_run(days: int, ledger: Path | None = None,
             continue
         if r.get("result") != "reviewed":
             continue                      # attempted is not reviewed
-        if r.get("head"):
-            seen.add(str(r["head"]))
+        # BLOB ids, not commit shas. See the docstring: a sha join proves a review happened at a
+        # point in history, never that THIS content was reviewed.
+        for _b in (r.get("blobs") or {}).values():
+            seen.add(str(_b))
         first_ts = ts if first_ts is None or ts < first_ts else first_ts
     if first_ts is None:
         return {"outcome": "qc_not_run", "adverse": None, "uncovered": [], "considered": 0,
@@ -554,19 +563,32 @@ def outcome_qc_not_run(days: int, ledger: Path | None = None,
         # `--name-only` emits a BLANK LINE between the header and the filenames, so flushing on
         # a blank discards every block and then reads the first filename as the next commit's
         # sha. Key on the header SHAPE instead; a blank line carries no information here.
-        sha = par = None
-        touched = False
+        def _judge(_sha, _files):
+            nonlocal considered
+            if not _sha or not _files:
+                return
+            considered += 1
+            try:
+                tree = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", _sha, "--",
+                                       *sorted(_files)],
+                                      capture_output=True, text=True, timeout=30).stdout
+            except (OSError, subprocess.SubprocessError):
+                uncovered.append(f"{repo.name} {_sha[:9]} (tree unreadable)")
+                return
+            blobs = [ln.split()[2] for ln in tree.splitlines() if len(ln.split()) > 2]
+            if not blobs or any(b not in seen for b in blobs):
+                uncovered.append(f"{repo.name} {_sha[:9]}")
+
+        sha = None
+        files: set[str] = set()
         for ln in out.splitlines() + ["\x00end"]:
             m = _COMMIT_HDR.match(ln)
             if m or ln == "\x00end":
-                if sha and touched:
-                    considered += 1
-                    if sha not in seen and not (par and par in seen):
-                        uncovered.append(f"{repo.name} {sha[:9]}")
-                sha, par = (m.group(1), m.group(2)) if m else (None, None)
-                touched = False
+                _judge(sha, files)
+                sha = m.group(1) if m else None
+                files = set()
             elif ln.strip().endswith(CODE_SUFFIX):
-                touched = True
+                files.add(ln.strip())
     # ZERO CONSIDERED IS NOT ZERO ADVERSE. Caught on this check's own first live run: it reported
     # `adverse: 0` having judged NO commits, because every commit predated the ledger's cutover.
     # A clean number meaning "nothing was measured" is the exact substitution this file exists to
@@ -1040,31 +1062,43 @@ def self_check() -> int:
         ok.append(("no ledger is UNKNOWN, never a pass",
                    outcome_qc_not_run(7, _root / "absent.jsonl", [_repo])["adverse"] is None))
 
-        _sha = _commit("a.py", "x = 1\n")
-        _att = _ledger([{"ts": _ts, "head": _sha, "result": "attempted"}])
+        _commit("a.py", "x = 1\n")
+        _blob = lambda n: _g("rev-parse", f"HEAD:{n}").stdout.strip()
+        _apy = _blob("a.py")
+
+        _att = _ledger([{"ts": _ts, "blobs": {"a.py": _apy}, "result": "attempted"}])
         ok.append(("an ATTEMPTED review is not a reviewed one",
                    outcome_qc_not_run(7, _att, [_repo])["adverse"] is None))
 
-        _none = _ledger([{"ts": _ts, "head": "0" * 40, "result": "reviewed"}])
+        _none = _ledger([{"ts": _ts, "blobs": {"a.py": "0" * 40}, "result": "reviewed"}])
         _r = outcome_qc_not_run(7, _none, [_repo])
         ok.append(("a code commit with no ledger partner is ADVERSE",
                    _r["adverse"] == 1 and _r["considered"] == 1))
 
-        _hit = _ledger([{"ts": _ts, "head": _sha, "result": "reviewed"}])
-        ok.append(("a code commit named by the ledger is covered",
+        _hit = _ledger([{"ts": _ts, "blobs": {"a.py": _apy}, "result": "reviewed"}])
+        ok.append(("a commit whose BLOB was reviewed is covered",
                    outcome_qc_not_run(7, _hit, [_repo])["adverse"] == 0))
 
-        _par = _g("rev-parse", "HEAD").stdout.strip()
-        _sha2 = _commit("b.sh", "echo hi\n")
-        _pre = _ledger([{"ts": _ts, "head": _par, "result": "reviewed"},
-                        {"ts": _ts, "head": _sha, "result": "reviewed"}])
-        ok.append(("review-then-commit is covered via the PARENT sha",
+        # THE DEFECT THAT MOTIVATED THE BLOB JOIN: reviewed, then edited, then committed.
+        # Under the old commit-sha join this reported COVERED.
+        _commit("a.py", "x = 1\ny = 2   # edited AFTER the review\n")
+        ok.append(("content edited AFTER its review is ADVERSE, not covered",
+                   outcome_qc_not_run(7, _hit, [_repo])["adverse"] == 1))
+
+        _apy2 = _blob("a.py")
+        _commit("b.sh", "echo hi\n")
+        # EVERY version of a.py must be present: each commit is judged against the blob it
+        # actually carries, so reviewing only the latest leaves the earlier commit uncovered.
+        _pre = _ledger([{"ts": _ts, "result": "reviewed", "blobs": {"a.py": _apy}},
+                        {"ts": _ts, "result": "reviewed",
+                         "blobs": {"a.py": _apy2, "b.sh": _blob("b.sh")}}])
+        ok.append(("reviewing every changed blob covers every commit",
                    outcome_qc_not_run(7, _pre, [_repo])["adverse"] == 0))
 
         _commit("notes.md", "prose\n")
         _r = outcome_qc_not_run(7, _pre, [_repo])
         ok.append(("a docs-only commit is not a code change",
-                   _r["considered"] == 2))
+                   _r["considered"] == 3))
 
         # The check's own first live run reported adverse=0 over ZERO judged commits.
         _empty = _root / "e"
