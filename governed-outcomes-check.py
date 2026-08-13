@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -478,6 +479,111 @@ def outcome_check_not_running(path: Path | None = None) -> dict:
                     "without this"}
 
 
+QC_LEDGER = Path.home() / ".metrics" / "qc-change.jsonl"
+QC_REPOS = ([Path(p) for p in os.environ["QC_REPOS"].split(":") if p]
+            if os.environ.get("QC_REPOS") else
+            [Path.home() / "dev" / "infrastructure" / "tools",
+             Path.home() / "dev" / "infrastructure" / "dev-env-config"])
+CODE_SUFFIX = (".py", ".sh", ".mjs", ".ts", ".js")
+_COMMIT_HDR = re.compile(r"^([0-9a-f]{40})(?: ([0-9a-f]{40}))?\s*$")
+
+
+def outcome_qc_not_run(days: int, ledger: Path | None = None,
+                       repos: list[Path] | None = None) -> dict:
+    """THE OUTCOME: did a code change ship WITHOUT its independent review?
+
+    This exists because the estate can measure its compliance and cannot measure its omissions.
+    A QC step that is skipped writes nothing -- no log row, no gate record, no artifact. So every
+    coverage figure in this workspace is computed over the population that RAN, and a skip is
+    invisible to every instrument. Measured 2026-08-12: two code-change commits shipped without
+    the QC Map's review row, while the commit succeeded, six fixtures passed and three gates
+    passed. Every available signal read green. The user found it by asking.
+
+    THE JOIN IS DERIVED FROM GIT -- state `qc-change.sh` does not write. Asking the skipper to
+    log the skip cannot work: the omission and the failure to record it have the same cause. So
+    a commit is covered only if a ledger row names it, or names its parent (review-then-commit).
+    Absence of a partner IS the finding. This is the one control shape that measures the thing
+    rather than the reporter.
+
+    CUTOVER, honest: commits predating the ledger's first row cannot be judged and are excluded,
+    never counted as clean. No ledger at all is UNKNOWN.
+    """
+    led = ledger or QC_LEDGER
+    if not led.exists():
+        return {"outcome": "qc_not_run", "adverse": None, "uncovered": [], "considered": 0,
+                "unreadable": ["no QC ledger yet -- review coverage UNKNOWN, never a pass"],
+                "note": "a skipped review leaves no trace; this ledger is the only join partner"}
+    seen, first_ts, bad = set(), None, 0
+    for line in led.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+            ts = datetime.fromisoformat(str(r["ts"]).replace("Z", "+00:00"))
+        except (ValueError, KeyError, TypeError):
+            bad += 1
+            continue
+        if r.get("result") != "reviewed":
+            continue                      # attempted is not reviewed
+        if r.get("head"):
+            seen.add(str(r["head"]))
+        first_ts = ts if first_ts is None or ts < first_ts else first_ts
+    if first_ts is None:
+        return {"outcome": "qc_not_run", "adverse": None, "uncovered": [], "considered": 0,
+                "unreadable": ([f"{bad} unparseable ledger row(s)"] if bad else [])
+                              + ["ledger holds no completed review -- coverage UNKNOWN"],
+                "note": "attempted is not reviewed"}
+    # Grace on the cutover: a review logged immediately BEFORE its commit shares the same second,
+    # and an exact-equality cutover silently drops exactly the commits this check exists to judge.
+    since = max(first_ts - timedelta(minutes=5),
+                datetime.now(timezone.utc) - timedelta(days=days))
+    uncovered, considered, unread = [], 0, []
+    for repo in (repos or QC_REPOS):
+        if not (repo / ".git").exists():
+            unread.append(f"{repo.name}: not a git repo -- not scanned")
+            continue
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo), "log", "--no-merges",
+                 f"--since={since.strftime('%Y-%m-%dT%H:%M:%S%z')}",
+                 "--format=%H %P", "--name-only"],
+                capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError) as exc:
+            unread.append(f"{repo.name}: git log failed ({exc})")
+            continue
+        # `--name-only` emits a BLANK LINE between the header and the filenames, so flushing on
+        # a blank discards every block and then reads the first filename as the next commit's
+        # sha. Key on the header SHAPE instead; a blank line carries no information here.
+        sha = par = None
+        touched = False
+        for ln in out.splitlines() + ["\x00end"]:
+            m = _COMMIT_HDR.match(ln)
+            if m or ln == "\x00end":
+                if sha and touched:
+                    considered += 1
+                    if sha not in seen and not (par and par in seen):
+                        uncovered.append(f"{repo.name} {sha[:9]}")
+                sha, par = (m.group(1), m.group(2)) if m else (None, None)
+                touched = False
+            elif ln.strip().endswith(CODE_SUFFIX):
+                touched = True
+    # ZERO CONSIDERED IS NOT ZERO ADVERSE. Caught on this check's own first live run: it reported
+    # `adverse: 0` having judged NO commits, because every commit predated the ledger's cutover.
+    # A clean number meaning "nothing was measured" is the exact substitution this file exists to
+    # find, reproduced inside the check written to find it. UNKNOWN, never a pass.
+    if considered == 0:
+        return {"outcome": "qc_not_run", "adverse": None, "uncovered": [], "considered": 0,
+                "unreadable": ([f"{bad} unparseable ledger row(s)"] if bad else []) + unread
+                              + ["no code-change commit falls after the ledger cutover -- "
+                                 "coverage UNMEASURED, which is not coverage"],
+                "note": "zero judged is not zero adverse"}
+    return {"outcome": "qc_not_run", "adverse": len(uncovered), "uncovered": uncovered,
+            "considered": considered,
+            "unreadable": ([f"{bad} unparseable ledger row(s)"] if bad else []) + unread,
+            "note": "coverage derived from git, not from a self-report; a skipped review cannot "
+                    "hide by not logging"}
+
+
 CRON_RUNNER = "scheduled-check-runner.sh"
 
 
@@ -583,7 +689,8 @@ def run(days: int) -> dict:
               outcome_handoff_log_artifact_disagreement(days),
               outcome_handoff_misfiled(),
               outcome_check_not_running(),
-              outcome_marker_cannot_fire()]
+              outcome_marker_cannot_fire(),
+              outcome_qc_not_run(days)]
     adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
     return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
@@ -904,6 +1011,69 @@ def self_check() -> int:
                    not outcome_marker_cannot_fire(
                        "\n".join(_cron(n, "-", str(_log))
                                  for n in EXPECTED_CADENCE_H))["unproven"]))
+
+    # --- outcome_qc_not_run: drive the REAL function over a real throwaway repo --------------
+    import tempfile as _tf5
+    import subprocess as _sp
+    with _tf5.TemporaryDirectory() as td5:
+        _root = Path(td5)
+        _repo = _root / "r"
+        _repo.mkdir()
+        _g = lambda *a: _sp.run(["git", "-C", str(_repo), *a], capture_output=True, text=True)
+        _g("init", "-q")
+        _g("config", "user.email", "t@t")
+        _g("config", "user.name", "t")
+
+        def _commit(name, text):
+            (_repo / name).write_text(text)
+            _g("add", name)
+            _g("commit", "-qm", f"add {name}")
+            return _g("rev-parse", "HEAD").stdout.strip()
+
+        _ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def _ledger(rows):
+            p = _root / f"l{len(list(_root.glob('l*.jsonl')))}.jsonl"
+            p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+            return p
+
+        ok.append(("no ledger is UNKNOWN, never a pass",
+                   outcome_qc_not_run(7, _root / "absent.jsonl", [_repo])["adverse"] is None))
+
+        _sha = _commit("a.py", "x = 1\n")
+        _att = _ledger([{"ts": _ts, "head": _sha, "result": "attempted"}])
+        ok.append(("an ATTEMPTED review is not a reviewed one",
+                   outcome_qc_not_run(7, _att, [_repo])["adverse"] is None))
+
+        _none = _ledger([{"ts": _ts, "head": "0" * 40, "result": "reviewed"}])
+        _r = outcome_qc_not_run(7, _none, [_repo])
+        ok.append(("a code commit with no ledger partner is ADVERSE",
+                   _r["adverse"] == 1 and _r["considered"] == 1))
+
+        _hit = _ledger([{"ts": _ts, "head": _sha, "result": "reviewed"}])
+        ok.append(("a code commit named by the ledger is covered",
+                   outcome_qc_not_run(7, _hit, [_repo])["adverse"] == 0))
+
+        _par = _g("rev-parse", "HEAD").stdout.strip()
+        _sha2 = _commit("b.sh", "echo hi\n")
+        _pre = _ledger([{"ts": _ts, "head": _par, "result": "reviewed"},
+                        {"ts": _ts, "head": _sha, "result": "reviewed"}])
+        ok.append(("review-then-commit is covered via the PARENT sha",
+                   outcome_qc_not_run(7, _pre, [_repo])["adverse"] == 0))
+
+        _commit("notes.md", "prose\n")
+        _r = outcome_qc_not_run(7, _pre, [_repo])
+        ok.append(("a docs-only commit is not a code change",
+                   _r["considered"] == 2))
+
+        # The check's own first live run reported adverse=0 over ZERO judged commits.
+        _empty = _root / "e"
+        _empty.mkdir()
+        _sp.run(["git", "-C", str(_empty), "init", "-q"], capture_output=True)
+        _r = outcome_qc_not_run(7, _hit, [_empty])
+        ok.append(("zero commits judged is UNKNOWN, never adverse=0",
+                   _r["adverse"] is None and _r["considered"] == 0
+                   and any("UNMEASURED" in u for u in _r["unreadable"])))
 
     failed = [m for m, good in ok if not good]
     for m in failed:
