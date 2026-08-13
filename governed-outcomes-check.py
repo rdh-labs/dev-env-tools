@@ -712,6 +712,16 @@ def outcome_notification_undelivered(days: int, notify: Path | None = None,
         t = _any_ts(r.get("timestamp") or r.get("ts"))
         if t is None or t < cutoff:
             continue
+        # DRY-RUN CONTRACT (peer fd4a8afd, `970c615`). Until 2026-08-13 a rehearsal and a real
+        # send were BYTE-IDENTICAL in this ledger: same `success: true`, no marker. A verifier
+        # reading it would confirm sends that never happened -- and a real high-priority push
+        # reached the user's phone during what looked like a clean dry run, because the flag did
+        # not exist and its own verifier returned OK. A guard that does not exist is
+        # indistinguishable from a guard that passed.
+        # Rows PREDATING the flag carry no `dry_run` field: treat MISSING as REAL, never as
+        # unknown-so-ignore -- a delivery that predates the flag cannot have been a rehearsal.
+        if r.get("dry_run") is True:
+            continue                      # rehearsal: neither a delivery nor a failure
         if r.get("success") is False:
             failed.append(f"{t:%Y-%m-%dT%H:%M:%SZ} {str(r.get('title'))[:60]}")
         else:
