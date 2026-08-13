@@ -151,5 +151,50 @@ if [ "${#missing[@]}" -gt 0 ]; then
     exit 1
 fi
 
-printf 'verified %s  files=%s\n' "$(git rev-parse --short HEAD)" \
-    "$(printf '%s\n' "$present" | grep -c .)"
+# --- SESSION-ATTRIBUTED OUTPUT LEDGER ------------------------------------------------------
+# WHY. Compaction dropped this session's knowledge that it had BUILT `~/bin/discovery-audit`.
+# I learned of it from a peer whose weekly cron had come to depend on it, and had to verify my
+# own authorship from git. A conversation summary is a lossy dual-write of what a session
+# produced; git is the durable record and it is not session-attributed. This closes that:
+# "what did this session build" becomes a question answered by READING, not by remembering, and
+# it survives compaction, restart, and an unexpected termination -- all three of which happened
+# today.
+#
+# It also supplies the join key a peer measured as missing estate-wide: logs record occurrence
+# without attribution, so they cannot be asked "did session X do this?". Commits could not be
+# either, until now.
+LEDGER="$HOME/.metrics/commits-by-session.jsonl"
+SID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-unknown}}"
+mkdir -p "$(dirname "$LEDGER")" 2>/dev/null || true
+SHORT="$(git rev-parse --short HEAD)"
+python3 - "$LEDGER" "$SID" "$(git rev-parse --show-toplevel)" "$(git rev-parse HEAD)" \
+         "$(printf '%s\n' "$present" | grep -c .)" "${PATHS[@]}" <<'EOP' 2>/dev/null || true
+import json, sys, datetime
+led, sid, repo, sha, nfiles, *paths = sys.argv[1:]
+with open(led, "a") as f:
+    f.write(json.dumps({
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "session": sid, "repo": repo, "sha": sha,
+        "files": int(nfiles), "paths": paths}) + "\n")
+EOP
+
+# IMMEDIATE CONSUMER, not a log for later. A ledger nobody reads is the defect this workspace
+# keeps finding, so surface the running total at the moment it is useful -- every commit.
+PRIOR="$(python3 - "$LEDGER" "$SID" <<'EOP' 2>/dev/null || true
+import json, sys
+led, sid = sys.argv[1:3]
+n = 0
+try:
+    for line in open(led, errors="replace"):
+        try:
+            if json.loads(line).get("session") == sid:
+                n += 1
+        except ValueError:
+            pass
+except OSError:
+    pass
+print(n)
+EOP
+)"
+printf 'verified %s  files=%s  [session commit %s]\n' "$SHORT" \
+    "$(printf '%s\n' "$present" | grep -c .)" "${PRIOR:-?}"
