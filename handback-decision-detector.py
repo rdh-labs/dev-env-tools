@@ -267,6 +267,31 @@ def main() -> int:
 #   tool was built for. Caught by the MUST-FIRE half of the suite, not the silent
 #   half. Both halves are load-bearing in both directions.
 #
+#   ── RECALL, 2026-08-13 — THE MISSING EXPERIMENT, AND IT IS DISQUALIFYING ──
+#   An independent Opus review (tool-verified) named the gap: every version measured
+#   FIRE RATE and adjudicated HITS; nothing ever measured MISSES -- for a detector
+#   whose entire justification is a recall failure.
+#
+#   Run on the motivating session itself (1,355 assistant messages, 268 You:-lines):
+#   fires 19; a crude heuristic flags 81 further candidates. **Do not quote a recall
+#   percentage from this**: the heuristic also flags lines that DID carry a
+#   recommendation, which are correct suppressions. So 19 is a floor and 81 an
+#   inflated ceiling. **The probe cannot separate them -- the same frame defect as
+#   the detector it was measuring.** Recall is UNMEASURED and this instrument cannot
+#   measure it.
+#
+#   The reviewer also quantified the cause: `has_rec` is a WHOLE-RESPONSE OR, so one
+#   recommendation anywhere suppresses every You: hit -- 733 of 1,158 decision-shaped
+#   lines (63.3%), INCLUDING the canonical multi-item case (recommend on A, hand back
+#   B bare) that motivated the tool. And 62 of 425 fires are the literal
+#   "Approve plan to proceed" tail that CLAUDE.md MANDATES: it would nag compliance.
+#
+#   VERDICT: do not ship as built. The superior design is to stop inferring and start
+#   DECLARING -- a closed You: vocabulary ([decision]/[action]/[approval]/Nothing)
+#   makes this an exact string match, precision and recall 1.0, no FP artifact needed.
+#   Every defect above is downstream of choosing inference over declaration.
+#   Reviews persisted: share/session-4ac72061-artifacts/reviews-2026-08-13/.
+#
 # NOT PROMOTED. Wiring a scanner into the Stop hook stack is HIGH_RISK and is the
 # user's authorization to give. This file is the evidence, not the enforcement.
 # PROMOTION NOTE. Before this becomes advisory or blocking:
