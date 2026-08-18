@@ -35,6 +35,7 @@ import json
 import os
 import re
 import sys
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -401,6 +402,16 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
             f"match (2026-08-18 head-excerpt defect). Registered: "
             f"{sorted(EVIDENCE_EXTRACTORS)}")
     extractor, kind = EVIDENCE_EXTRACTORS[scanner_id]
+    # PREFILTER AS A COMPILED CASE-INSENSITIVE REGEX, not `prefilter not in raw.lower()`.
+    # MEASURED 2026-08-18 on the largest real corpus file (77.5 MB): `.lower()` peaked at
+    # 1.24-1.54 GB TRANSIENT, because it materialises a full second copy of the string that
+    # stays alive alongside `raw`. The compiled IGNORECASE search adds 0.00 MB — it never
+    # materialises a copy. Full-corpus read+lower+substring measured 188.9s over 8,447 files
+    # / 6.64 GB. This box is 16 GB with an 8 GB WSL2 cap and was at 2 GB/4 GB swap with 80 MB
+    # free during the measurement, and ~80 corpus files exceed 10 MB — so this was a live
+    # swap-thrash risk, not a hypothetical. Identical semantics: same necessary condition,
+    # same case-insensitivity. Compiled ONCE here, outside the per-file loop.
+    prefilter_re = re.compile(re.escape(prefilter), re.IGNORECASE) if prefilter else None
     # corpus_glob may carry SEVERAL patterns joined by os.pathsep (see CORPUS_GLOBS). A single
     # pattern still works, so an explicit --corpus is unaffected.
     files = sorted({f for pat in str(corpus_glob).split(os.pathsep) if pat
@@ -415,7 +426,7 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
                 raw = fh.read()
         except OSError:
             continue
-        if prefilter is not None and prefilter not in raw.lower():
+        if prefilter_re is not None and not prefilter_re.search(raw):
             continue   # necessary-condition skip (case-insensitive substring) — no JSON parse
         files_scanned += 1
         texts, failed = _assistant_texts_from_raw(raw)
@@ -527,7 +538,11 @@ def _carry_labels(new_art: dict, path: Path) -> dict:
         old_schema = 1
     source_auditable = old_schema >= 2 and old.get("evidence_kind") in EVIDENCE_KIND_VALUES
 
-    index: dict[tuple, list[dict]] = {}
+    # deque, not list: `pop(0)` on a list is O(n), so duplicate-key buckets degrade to O(n^2)
+    # (MEASURED: 10k same-key items 122ms, 20k 369ms — clearly quadratic). popleft() is O(1)
+    # and behaviourally identical. Free fix; today's max bucket is tiny, but the cost of
+    # leaving it is unbounded and the cost of fixing it is one import.
+    index: dict[tuple, deque] = {}
     for f in old.get("fires", []):
         if not isinstance(f, dict):
             continue
@@ -535,14 +550,14 @@ def _carry_labels(new_art: dict, path: Path) -> dict:
             stats["prior_labeled"] += 1
         # Old artifacts key on the head excerpt; new ones retain it as legacy_key.
         k = (f.get("source"), (f.get("legacy_key") or f.get("excerpt") or "")[:200])
-        index.setdefault(k, []).append(f)
+        index.setdefault(k, deque()).append(f)
     for f in new_art.get("fires", []):
         k = (f.get("source"), (f.get("legacy_key") or "")[:200])
         bucket = index.get(k)
         # Positional pop keeps duplicate-key fires (the same response text twice in one
         # session) deterministic rather than all inheriting the first label.
         if bucket:
-            prior = bucket.pop(0)
+            prior = bucket.popleft()
             if prior.get("label") in ("TP", "FP"):
                 if source_auditable:
                     # v2 -> v2: the prior label was formed on evidence that CONTAINED the
@@ -706,6 +721,10 @@ def finalize(scanner_id: str) -> dict:
         raise ValueError(
             f"{path}: fires_total={declared} but len(fires)={len(fires)} — artifact malformed")
     was_ready = _artifact_admits(art)  # prior state (before overwrite) for transition detection
+    # Computed ONCE. `_artifact_auditable` is an O(fires) scan and was being recomputed up to
+    # four times per finalize() on a clean artifact (twice inside _artifact_admits, twice
+    # directly) — ~4x the per-fire cost in exactly the ready-to-promote case that matters most.
+    _auditable_now = _artifact_auditable(art)
     # A label key absent OR non-string (e.g. JSON null) is "unlabeled", not an unknown label.
     labels = [lab if isinstance((lab := f.get("label")), str) else "unlabeled" for f in fires]
     total = len(fires)
@@ -719,7 +738,7 @@ def finalize(scanner_id: str) -> dict:
     # confirmed_fp is an int ONLY when every fire is resolved; None otherwise keeps the gate
     # held (evidence_gate requires confirmed_fp == int 0 AND fires_labeled == fires_total).
     art["confirmed_fp"] = fp_count if complete else None
-    if complete and fp_count == 0 and not _artifact_auditable(art):
+    if complete and fp_count == 0 and not _auditable_now:
         # Self-contradiction guard: "ready-for-promotion" next to "[UNAUDITABLE]" told the
         # reader two opposite things on one line.
         art["decision"] = ("hold: confirmed_fp==0 and fully labeled, but the artifact is "
@@ -747,7 +766,7 @@ def finalize(scanner_id: str) -> dict:
         # prints "hold: confirmed_fp=16" for an artifact whose 95 labels were formed on
         # evidence that could not show the match — a number that looks like a measurement
         # and is not one. Measured 2026-08-18: 4 of 5 artifacts, 155 labels.
-        "auditable": _artifact_auditable(art),
+        "auditable": _auditable_now,
     }
 
 
