@@ -41,7 +41,7 @@ from pathlib import Path
 
 CORPUS_GLOB = str(Path.home() / ".claude/projects/-home-ichardart-dev/*.jsonl")
 ARTIFACT_DIR = Path.home() / ".claude/logs/fp-gate"
-SCHEMA_V = 1
+SCHEMA_V = 2   # v2: fires carry matched-span evidence (was: head excerpt)
 
 # For A101: import the real evidence_gate compiled regexes/function rather than hand-
 # reproducing them (avoids the exact kind of drift risk the A101 implementation itself
@@ -161,6 +161,116 @@ def _a14c_fires(text: str) -> bool:
     return False
 
 
+# ── Evidence extraction (2026-08-18, session 2783153d) ───────────────────────
+# DEFECT THIS FIXES. The artifact stored ``text.strip()[:600]`` -- a HEAD excerpt -- while
+# every registered scanner matches on the response TAIL (CLAUDE.md makes `You:` the LAST
+# line by contract) or on a mid-body section. The stored evidence therefore provably could
+# not contain the thing that fired, so NO label in the artifact was verifiable FROM the
+# artifact. Measured at the moment of discovery: a101 held 95 reviewer labels of which only
+# 3 excerpts contained a `You:` line at all, and its live `decision: hold` (confirmed_fp=16)
+# rested on them.
+#
+# This defeated the tool's OWN advertised property (see module docstring): "it is re-runnable
+# by any auditor, so fabricating it costs strictly more than measuring honestly." An auditor
+# cannot re-verify a label from evidence that omits the match. The claim was aspirational,
+# not implemented.
+#
+# It also PROPAGATED downstream: qc_label_audit/rater_driver.py:87, verdict.py:93 and
+# deterministic_anchor.py:41,56 all read ``fires[].excerpt`` -- so the multi-rater agreement
+# machinery showed raters head excerpts as the text they were adjudicating.
+#
+# DESIGN. Each scanner registers an extractor returning the span(s) its predicate actually
+# adjudicated. ``evidence_kind`` records WHICH guarantee the stored evidence carries, so an
+# auditor never has to infer it:
+#     "matched-span"    the precise value(s) that fired (strongest)
+#     "scanned-region"  the region the predicate examined; the fired value is within it
+# There is deliberately NO head-excerpt fallback. A scanner with no registered extractor
+# RAISES rather than writing evidence-free fires -- fail-loud at the PRODUCER is what makes
+# this structural rather than advisory, and it needs no change to evidence_gate.py.
+
+
+def _norm(s: str) -> str:
+    """Collapse all whitespace. Used identically when BUILDING an excerpt and when CHECKING
+    the containment invariant, so the two can never disagree about newlines.
+
+    Edge case that forced this: A97's evidence is a multi-line `## Anomaly Analysis` section.
+    A naive ``.replace("\n", " ")`` on one side and a raw ``in`` test on the other made the
+    invariant fail on valid input -- the check, not the data, was wrong."""
+    return " ".join(s.split())
+
+
+def _a14c_evidence(text: str) -> list[str]:
+    """The exact `You:` value(s) that tripped TOKEN-PLUS-NOTHING, via the SHIPPED checker."""
+    out = []
+    for raw_val in evidence_gate.YOU_FIELD_VALUE_RE.findall(text):
+        if any(f[0] == "TOKEN-PLUS-NOTHING" for f in _ytc.check_line(raw_val)):
+            out.append(raw_val.strip())
+    return out
+
+
+def _a101_evidence(text: str) -> list[str]:
+    """Every `You:` value in the TAIL region A101 scans.
+
+    Deliberately the scanned REGION, not a re-implementation of A101's nine-clause exclusion
+    chain. Reproducing that filter here would recreate precisely the drift this file's own
+    a101 NOTE warns against -- and which actually bit a14c on 2026-08-18, when a hand-copied
+    predicate silently diverged from the tool it was copied from. The fired value is
+    guaranteed to be among these, which is what an auditor needs to adjudicate."""
+    lines = text.splitlines()
+    n = evidence_gate.TAIL_LINES
+    tail = lines[-n:] if len(lines) > n else lines
+    return [m.strip() for m in evidence_gate.YOU_FIELD_VALUE_RE.findall("\n".join(tail))]
+
+
+def _a97_evidence(text: str) -> list[str]:
+    """The `## Anomaly Analysis` section A97 adjudicated -- fences stripped, exactly as the
+    predicate does, so the auditor sees the same text the predicate saw."""
+    sec = _a97_section(_A97_FENCE_RE.sub("", text))
+    return [sec.strip()] if sec and sec.strip() else []
+
+
+# scanner_id -> (extractor, evidence_kind). A scanner absent here CANNOT be measured.
+EVIDENCE_EXTRACTORS: dict[str, tuple[Callable[[str], list[str]], str]] = {
+    "a14c": (_a14c_evidence, "matched-span"),
+    "a101": (_a101_evidence, "scanned-region"),
+    "A97": (_a97_evidence, "matched-span"),
+}
+
+EXCERPT_CAP = 600
+
+
+def _excerpt_with_evidence(matched: list[str], cap: int = EXCERPT_CAP) -> str:
+    """Build the backward-compatible ``excerpt`` -- but one that CONTAINS the match.
+
+    Kept under the original key because three live consumers read it:
+    qc_label_audit/rater_driver.py:87 and verdict.py:93 show this text to the RATERS (so it
+    is the text a label is actually formed on), and deterministic_anchor.py:41,56 hashes it.
+    Changing the key would have broken all three; changing the CONTENT fixes all three."""
+    return _norm(" || ".join(matched))[:cap]
+
+
+def _assert_evidence_invariant(art: dict) -> None:
+    """Every fire's stored excerpt must contain at least one of its own matched spans.
+
+    This is the FALSIFIABLE form of the property the module docstring claims. It runs at
+    write time -- not as a comment -- so a future refactor that reintroduces a head excerpt
+    fails loudly here instead of silently resuming production of unauditable labels."""
+    for i, f in enumerate(art.get("fires", [])):
+        matched = [m for m in (f.get("matched") or []) if m and m.strip()]
+        if not matched:
+            raise RuntimeError(
+                f"fire {i} ({f.get('source')}): no matched evidence stored -- refusing to "
+                f"write an unauditable fire")
+        exc = f.get("excerpt", "")
+        # Compare on a PREFIX: the excerpt is capped, so a span longer than the cap is
+        # legitimately truncated. The prefix is what survives, and it is what proves the
+        # excerpt is built from the match rather than from the head of the response.
+        if not any(_norm(m)[:120] in exc for m in matched):
+            raise RuntimeError(
+                f"fire {i} ({f.get('source')}): excerpt contains none of its matched spans "
+                f"-- the head-excerpt defect has REGRESSED")
+
+
 SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], str | None]] = {
     # lowercase key — see the a101 NOTE below; _fp_streams / _fp_artifact_path use lowercase ids.
     "a14c": (
@@ -256,6 +366,16 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
             f"(import its regexes from evidence_gate). Registered: {sorted(SCANNER_PREDICATES)}"
         )
     predicate, fingerprint_patterns, prefilter = SCANNER_PREDICATES[scanner_id]
+    if scanner_id not in EVIDENCE_EXTRACTORS:
+        # No silent head-excerpt fallback. An artifact whose evidence cannot show the match
+        # is worse than no artifact: it LOOKS like substance and admits promotion through a
+        # gate that only counts labels. Refuse at the producer.
+        raise ValueError(
+            f"{scanner_id}: no evidence extractor registered. Add one to EVIDENCE_EXTRACTORS "
+            f"-- fp_measure will not write fires whose stored evidence cannot contain the "
+            f"match (2026-08-18 head-excerpt defect). Registered: "
+            f"{sorted(EVIDENCE_EXTRACTORS)}")
+    extractor, kind = EVIDENCE_EXTRACTORS[scanner_id]
     files = sorted(glob.glob(corpus_glob))
     total_scanned = 0
     files_scanned = 0
@@ -277,14 +397,27 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
                 continue
             total_scanned += 1
             if predicate(text):
-                excerpt = text.strip()[:600].replace("\n", " ")
+                matched = [m for m in extractor(text) if m and m.strip()]
+                if not matched:
+                    # Predicate fired, extractor found nothing: the two DISAGREE. That is a
+                    # bug in one of them and exactly the silent-drift class that produced
+                    # this defect. Never store an evidence-free fire; fail the whole run.
+                    raise RuntimeError(
+                        f"{scanner_id}: predicate fired but the evidence extractor returned "
+                        f"nothing for a response in {os.path.basename(fp)} -- extractor and "
+                        f"predicate have DRIFTED. Refusing to write unauditable evidence.")
                 fires.append({
-                    "excerpt": excerpt,
+                    "matched": matched,
+                    "evidence_kind": kind,
+                    "excerpt": _excerpt_with_evidence(matched),
+                    # Pre-fix head excerpt, retained ONLY as the join key that carries
+                    # reviewer labels across this schema change (see _carry_labels).
+                    "legacy_key": text.strip()[:600].replace("\n", " ")[:200],
                     "source": os.path.basename(fp),
                     "label": "unlabeled",   # reviewer sets TP / FP
                     "rationale": "",
                 })
-    return {
+    art = {
         "scanner_id": scanner_id,
         "schema_v": SCHEMA_V,
         "measured_at": datetime.now(timezone.utc).isoformat(),
@@ -299,9 +432,76 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
         "confirmed_fp": None,         # None = not yet derived; set to count of FP labels once every fire is labeled (must be 0 to promote)
         "decision": "pending-labeling",
         "harness": "fp_measure.py",
+        "evidence_kind": kind,
+        "evidence_contract": (
+            "every fires[].excerpt contains at least one of that fire's matched spans; "
+            "enforced by _assert_evidence_invariant at write time"),
         "falsifier": "a fire labeled TP that is actually a legitimate (non-violating) response",
         "fires": fires,
     }
+    # Checked HERE, before any caller can persist it: a measurement that cannot evidence its
+    # own fires must not become a file that a promotion gate reads.
+    _assert_evidence_invariant(art)
+    return art
+
+
+def _carry_labels(new_art: dict, path: Path) -> dict:
+    """Preserve reviewer labels across a re-measure. Returns a stats dict.
+
+    WHY THIS EXISTS. ``main()``'s write path was a bare ``out.write_text(json.dumps(art))``,
+    which DESTROYS every label in an existing artifact. a101 currently holds 95 hand-assigned
+    labels and 16 confirmed FPs; re-running the tool would have silently erased them and
+    reset the artifact to `pending-labeling`. Nothing warned. That is a second instance of
+    the same family as the head-excerpt defect: an operation whose failure is invisible.
+
+    Labels are re-attached by ``(source, legacy_key)`` -- the PRE-FIX head excerpt, which is
+    still deterministically reproducible from the response text, and is therefore a valid
+    join key across exactly this one schema change.
+
+    Carried labels are stamped ``label_provenance="pre-evidence-fix"``: they were assigned
+    when the artifact could NOT display the matched span, so they are not audit-clean even
+    though they are probably correct. An auditor must be able to tell the two populations
+    apart -- collapsing them would relaunder the very defect this change fixes.
+    """
+    stats = {"carried": 0, "fresh": 0, "orphaned": 0, "prior_labeled": 0}
+    if not path.exists():
+        stats["fresh"] = len(new_art.get("fires", []))
+        return stats
+    try:
+        old = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        # Fail LOUD. Silently proceeding would overwrite an unreadable-but-present artifact
+        # and destroy labels we could not enumerate.
+        raise RuntimeError(
+            f"{path}: existing artifact unreadable ({type(e).__name__}: {e}) -- refusing to "
+            f"overwrite it, because that would destroy reviewer labels that cannot be read "
+            f"back first. Move it aside deliberately if you intend to discard it.") from e
+    index: dict[tuple, list[dict]] = {}
+    for f in old.get("fires", []):
+        if not isinstance(f, dict):
+            continue
+        if f.get("label") in ("TP", "FP"):
+            stats["prior_labeled"] += 1
+        # Old artifacts key on the head excerpt; new ones retain it as legacy_key.
+        k = (f.get("source"), (f.get("legacy_key") or f.get("excerpt") or "")[:200])
+        index.setdefault(k, []).append(f)
+    for f in new_art.get("fires", []):
+        k = (f.get("source"), (f.get("legacy_key") or "")[:200])
+        bucket = index.get(k)
+        # Positional pop keeps duplicate-key fires (the same response text twice in one
+        # session) deterministic rather than all inheriting the first label.
+        if bucket:
+            prior = bucket.pop(0)
+            if prior.get("label") in ("TP", "FP"):
+                f["label"] = prior["label"]
+                f["rationale"] = prior.get("rationale", "")
+                f["label_provenance"] = "pre-evidence-fix"
+                stats["carried"] += 1
+                continue
+        stats["fresh"] += 1
+    stats["orphaned"] = sum(
+        1 for b in index.values() for f in b if f.get("label") in ("TP", "FP"))
+    return stats
 
 
 def _summarize(art: dict) -> str:
@@ -576,8 +776,27 @@ def main() -> int:
     if args.write_artifact:
         ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
         out = ARTIFACT_DIR / f"{args.scanner_id}.json"
-        out.write_text(json.dumps(art, indent=2))
-        print(f"\nArtifact written: {out}\n  → label each fire TP/FP, set rationale, then re-derive confirmed_fp.")
+        try:
+            stats = _carry_labels(art, out)
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        art["label_carry"] = stats
+        # Atomic, matching finalize(): a reader landing mid-write on a large artifact must
+        # not get a JSONDecodeError, and nothing in this chain retries.
+        tmp = out.with_name(f"{out.name}.tmp{os.getpid()}")
+        tmp.write_text(json.dumps(art, indent=2))
+        os.replace(tmp, out)
+        print(f"\nArtifact written: {out}")
+        print(f"  labels: {stats['carried']} carried forward (of {stats['prior_labeled']} "
+              f"prior), {stats['fresh']} unlabeled, {stats['orphaned']} ORPHANED")
+        if stats["orphaned"]:
+            # Loud: an orphan means a previously-labeled fire no longer reproduces, i.e. the
+            # predicate changed or the corpus lost a file. Either is a real event.
+            print(f"  WARNING {stats['orphaned']} previously-labeled fire(s) did not "
+                  f"reproduce — predicate change or corpus drift; investigate before "
+                  f"trusting this measurement.", file=sys.stderr)
+        print("  → label each fire TP/FP, set rationale, then --finalize to re-derive confirmed_fp.")
     return 0
 
 
