@@ -693,3 +693,71 @@ def test_sidechain_policy_is_ENFORCED_not_merely_declared(tmp_path):
 def test_is_sidechain_path_both_polarities():
     assert fp._is_sidechain_path("/home/x/.claude/projects/slug/subagents/agent-a1.jsonl") is True
     assert fp._is_sidechain_path("/home/x/.claude/projects/slug/session.jsonl") is False
+
+
+# ── the head-excerpt join key COLLIDES; the digest does not ──────────────────
+# Flagged by two independent reviews as the highest-risk area: the old key was the first 200
+# chars of the response, and responses routinely share an opening. Two colliding fires would
+# have their labels silently SWAPPED by positional pairing — a mis-assigned TP/FP driving a
+# promotion decision, undetectable after the fact.
+
+_SHARED_OPENING = "Let me check the current state before deciding. " * 6   # >200 chars
+
+def _fire(full_text, label=None, digest=True):
+    import hashlib
+    f = {"source": "s.jsonl", "matched": ["[action] Nothing"], "excerpt": "[action] Nothing",
+         "legacy_key": full_text.strip()[:600].replace("\n", " ")[:200]}
+    if digest:
+        f["record_digest"] = hashlib.sha256(full_text.encode("utf-8")).hexdigest()
+    if label:
+        f["label"], f["rationale"] = label, f"rationale for {label}"
+    return f
+
+
+def test_identical_openings_do_not_collide_under_the_digest_key():
+    """THE defect. Both responses share the first 200 chars; only the tails differ."""
+    a, b = _SHARED_OPENING + "TAIL A", _SHARED_OPENING + "TAIL B"
+    fa, fb = _fire(a), _fire(b)
+    assert fa["legacy_key"] == fb["legacy_key"], "fixture invalid — the legacy keys must collide"
+    assert fp._join_key(fa) != fp._join_key(fb), "digest key collided on distinct responses"
+
+
+def test_colliding_openings_would_swap_labels_under_the_legacy_key(tmp_path):
+    """NEGATIVE CONTROL showing the defect is real, not theoretical: with digests REMOVED the
+    two fires share a key, so the labels pair positionally rather than by identity."""
+    a, b = _SHARED_OPENING + "TAIL A", _SHARED_OPENING + "TAIL B"
+    fa, fb = _fire(a, digest=False), _fire(b, digest=False)
+    assert fp._join_key(fa) == fp._join_key(fb), "without a digest these MUST collide"
+
+
+def test_labels_follow_the_response_not_the_position(tmp_path):
+    """END TO END: prior artifact has A=TP and B=FP; the re-measure presents them in the
+    OPPOSITE order. Each label must follow its own response."""
+    a, b = _SHARED_OPENING + "TAIL A", _SHARED_OPENING + "TAIL B"
+    prior = {"schema_v": 2, "evidence_kind": "matched-span",
+             "fires": [_fire(a, "TP"), _fire(b, "FP")]}
+    path = tmp_path / "a.json"
+    path.write_text(json.dumps(prior))
+    new = {"fires": [_fire(b), _fire(a)]}          # deliberately reversed
+    stats = fp._carry_labels(new, path)
+    assert stats["carried"] == 2
+    assert new["fires"][0]["label"] == "FP", "label followed POSITION, not the response"
+    assert new["fires"][1]["label"] == "TP"
+
+
+def test_legacy_artifacts_without_a_digest_still_join(tmp_path):
+    """Back-compat: artifacts written before record_digest existed must still carry labels."""
+    a = _SHARED_OPENING + "ONLY ONE"
+    prior = {"schema_v": 2, "evidence_kind": "matched-span", "fires": [_fire(a, "TP", digest=False)]}
+    path = tmp_path / "a.json"
+    path.write_text(json.dumps(prior))
+    new = {"fires": [_fire(a, digest=False)]}
+    stats = fp._carry_labels(new, path)
+    assert stats["carried"] == 1 and new["fires"][0]["label"] == "TP"
+
+
+def test_measure_writes_a_record_digest(tmp_path):
+    _jsonl(tmp_path, "s.jsonl", _HEAD + _TAIL_FIRES)
+    art = fp.measure("a14c", str(tmp_path / "*.jsonl"))
+    d = art["fires"][0].get("record_digest")
+    assert isinstance(d, str) and len(d) == 64, "no sha256 record_digest written"

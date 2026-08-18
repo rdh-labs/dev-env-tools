@@ -473,8 +473,16 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
                     "matched": matched,
                     "evidence_kind": kind,
                     "excerpt": _excerpt_with_evidence(matched),
-                    # Pre-fix head excerpt, retained ONLY as the join key that carries
-                    # reviewer labels across this schema change (see _carry_labels).
+                    # PRIMARY join key: a digest of the FULL response text. The previous key
+                    # was the first 200 chars of the pre-fix head excerpt, which COLLIDES —
+                    # responses routinely share an opening, and two colliding fires would
+                    # silently swap reviewer labels. External prior art (in-toto attestation
+                    # v1): bind a label to a digest of the exact record, "otherwise a rule
+                    # edit silently invalidates every prior label with no detectable break".
+                    "record_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    # Pre-fix head excerpt, retained ONLY so labels on v1/v2 artifacts written
+                    # BEFORE record_digest existed can still be joined. Remove once no
+                    # artifact predating this field remains.
                     "legacy_key": text.strip()[:600].replace("\n", " ")[:200],
                     "source": os.path.basename(fp),
                     "label": "unlabeled",   # reviewer sets TP / FP
@@ -576,12 +584,9 @@ def _carry_labels(new_art: dict, path: Path) -> dict:
             continue
         if f.get("label") in ("TP", "FP"):
             stats["prior_labeled"] += 1
-        # Old artifacts key on the head excerpt; new ones retain it as legacy_key.
-        k = (f.get("source"), (f.get("legacy_key") or f.get("excerpt") or "")[:200])
-        index.setdefault(k, deque()).append(f)
+        index.setdefault(_join_key(f), deque()).append(f)
     for f in new_art.get("fires", []):
-        k = (f.get("source"), (f.get("legacy_key") or "")[:200])
-        bucket = index.get(k)
+        bucket = index.get(_join_key(f))
         # Positional pop keeps duplicate-key fires (the same response text twice in one
         # session) deterministic rather than all inheriting the first label.
         if bucket:
@@ -892,6 +897,28 @@ def _atomic_write_text(path: Path, text: str) -> None:
         except OSError:
             pass          # best-effort cleanup; the original file is intact either way
         raise
+
+
+def _join_key(fire: dict) -> tuple:
+    """Key used to carry a reviewer label from an old artifact onto a re-measured fire.
+
+    PREFERS `record_digest` — a sha256 of the full response text. Falls back to the pre-fix
+    head-excerpt prefix ONLY for artifacts written before that field existed.
+
+    Why the digest is primary: the head-excerpt key is the first 200 characters of the
+    response, and responses routinely share an opening ("Let me check...", a tool preamble).
+    Two colliding fires would have their labels silently swapped by the positional pairing
+    below — a mis-assigned TP/FP on a promotion decision, with nothing to detect it. Flagged
+    as the highest-risk area by two independent reviews. External prior art (in-toto
+    attestation v1) states the general rule: bind a label to a digest of the exact record.
+
+    The digest is namespaced so a digest-keyed fire can never collide with a legacy-keyed one
+    that happens to hash to the same string."""
+    d = fire.get("record_digest")
+    if isinstance(d, str) and d:
+        return (fire.get("source"), "sha256", d)
+    return (fire.get("source"), "legacy",
+            (fire.get("legacy_key") or fire.get("excerpt") or "")[:200])
 
 
 def _at_risk_ids(rows: list[dict]) -> set[str]:
