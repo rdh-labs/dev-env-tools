@@ -643,3 +643,30 @@ def test_notify_ready_never_raises(monkeypatch, tmp_path):
                         lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
     n, status = fp._notify_ready(["zz"])
     assert (n, status) == (1, "send-failed")
+
+
+# ── the corpus must be the RUNTIME-REACHABLE population (architecture review, W2) ──
+def test_corpus_covers_all_slugs_not_just_one():
+    """The original glob was single-slug (1,428 of 2,908 top-level transcripts = 49.1%),
+    which is how a NEGATIVE claim became unfalsifiable by construction."""
+    assert any("projects/*/" in g for g in fp.CORPUS_GLOBS), \
+        "corpus is slug-scoped again — a single-slug denominator cannot support a negative claim"
+
+
+def test_corpus_excludes_sidechains_because_the_hook_never_sees_them():
+    """evidence_gate is wired to `Stop` ONLY — no SubagentStop — so subagent (isSidechain)
+    transcripts are not runtime-reachable. Including them makes confirmed_fp answer a
+    different question than the promotion decision asks."""
+    assert fp.SIDECHAIN_POLICY == "exclude"
+    assert not any("subagents" in g for g in fp.CORPUS_GLOBS), \
+        "sidechain transcripts are back in the corpus — confirmed_fp would mix two populations"
+
+
+def test_artifact_records_which_population_produced_it(tmp_path):
+    """The denominator must be IN the artifact. Not recording it is how '14.5% coverage' got
+    read as 'the corpus'."""
+    _jsonl(tmp_path, "s.jsonl", _HEAD + _TAIL_FIRES)
+    art = fp.measure("a14c", str(tmp_path / "*.jsonl"))
+    assert art["sidechain_policy"] == "exclude"
+    assert art["corpus_globs"] and isinstance(art["corpus_globs"], list)
+    assert art["corpus_files_total"] >= art["corpus_files_scanned"] >= 0

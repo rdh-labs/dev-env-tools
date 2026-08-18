@@ -40,20 +40,26 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-# CORPUS. Was `.../-home-ichardart-dev/*.jsonl` — NON-RECURSIVE, which silently excluded every
-# SUBAGENT transcript. Measured 2026-08-18: 1,428 of 9,828 transcript files reachable (14.5%);
-# 8,400 subagent transcripts invisible. That is not a coverage detail — it made a NEGATIVE
-# CLAIM unfalsifiable by construction: a14c.json asserted "zero out-of-sample instances", and
-# re-running the same predicate over the excluded files found FOUR, in a session that did NOT
-# author the rule. The measurement could not have returned them. (Found by an independent
-# review of the REASONING, not of the code — the code was self-consistent.)
-# Both patterns are needed: `*.jsonl` for session transcripts, `*/subagents/*.jsonl` for
-# subagent ones. glob's `**` would also match, but only with recursive=True, which
-# glob.glob() does not enable by default — an easy way to reintroduce this exact bug.
-CORPUS_GLOBS = [
-    str(Path.home() / ".claude/projects/-home-ichardart-dev/*.jsonl"),
-    str(Path.home() / ".claude/projects/-home-ichardart-dev/*/subagents/*.jsonl"),
-]
+# CORPUS = THE RUNTIME-REACHABLE POPULATION. Two corrections, both measured.
+#
+# (1) It was `.../-home-ichardart-dev/*.jsonl` — NON-RECURSIVE and single-slug. That made a
+#     NEGATIVE CLAIM unfalsifiable: a14c.json asserted "zero out-of-sample instances" and the
+#     query could not have returned them.
+# (2) The first fix over-corrected: it added `*/subagents/*.jsonl`. But evidence_gate.py is
+#     wired ONLY to the `Stop` hook in settings.json — there is NO `SubagentStop` entry
+#     (verified by parsing settings.json). Subagent transcripts are isSidechain=true and the
+#     scanner NEVER evaluates them, so including them measures fires that cannot occur in
+#     production, while STILL missing half the population that can: 1,428 of 2,908 top-level
+#     transcripts = 49.1%, the largest omission being the `-home-ichardart` slug (1,390 files).
+#
+# So: ALL SLUGS, TOP-LEVEL ONLY. `confirmed_fp` then means "the FP rate this scanner will
+# produce in production" — the only reading on which a promotion decision is sound.
+# The sidechain population is a DIFFERENT question (how often the rule is wrong about agent
+# output anywhere) and must be measured and labelled separately, not silently mixed in.
+# Every artifact records `corpus_globs` and `sidechain_policy`, so which population produced
+# a number is never again something a reader has to infer.
+CORPUS_GLOBS = [str(Path.home() / ".claude/projects/*/*.jsonl")]
+SIDECHAIN_POLICY = "exclude"   # runtime-reachable only; see above. "include" = behaviour study.
 CORPUS_GLOB = os.pathsep.join(CORPUS_GLOBS)   # CLI default; split on os.pathsep when globbing
 ARTIFACT_DIR = Path.home() / ".claude/logs/fp-gate"
 SCHEMA_V = 2   # v2: fires carry matched-span evidence (was: head excerpt)
@@ -466,6 +472,10 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
         # non-recursive glob that excluded 8,400 subagent transcripts; nothing in them said so,
         # which is how "zero out-of-sample instances" got published as a finding.
         "corpus_globs": [pat for pat in str(corpus_glob).split(os.pathsep) if pat],
+        # WHICH POPULATION produced this number. evidence_gate runs on `Stop` only, so
+        # sidechain (subagent) transcripts are not runtime-reachable; mixing them into
+        # confirmed_fp makes a promotion threshold answer a question nobody asked.
+        "sidechain_policy": SIDECHAIN_POLICY,
         "corpus_files_total": len(files),
         "corpus_files_scanned": files_scanned,
         "corpus_parse_failures": parse_failures,
