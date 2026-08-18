@@ -131,18 +131,33 @@ def _a101_fires(text: str) -> bool:
 # The companion fuzzy check (a low-obligation token on a decision-shaped line) measured ~30%
 # FP on the same corpus and is DELIBERATELY NOT REGISTERED HERE — only the exact match is a
 # promotion candidate.
-_A14C_TOKENS = ("[decision]", "[approval]", "[question]", "[action]")
-_A14C_STRIP_RE = re.compile(r"^(?:\*\*|__)*[`*_\s]*")
+# IMPORT the live predicate from ~/bin/you-token-check rather than hand-reproducing it.
+# 2026-08-18: I hand-copied it, then changed the tool (added "none"/"no action" with a word
+# boundary) and NOT this copy — so the artifact measured a predicate the tool no longer
+# implemented, and the sha256 fingerprint could not detect it because the fingerprint binds
+# the regexes LISTED here, not the tool's semantics. This file's own a101 note warns against
+# exactly this ("import the real compiled regexes ... avoids the exact kind of drift risk").
+import importlib.machinery as _imach
+import importlib.util as _ilu
+
+_YTC_PATH = Path.home() / "bin" / "you-token-check"
+if not _YTC_PATH.is_file():
+    raise SystemExit(f"fp_measure: a14c predicate source missing: {_YTC_PATH}")
+_spec = _ilu.spec_from_loader(
+    "you_token_check", _imach.SourceFileLoader("you_token_check", str(_YTC_PATH))
+)
+_ytc = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_ytc)
 
 
 def _a14c_fires(text: str) -> bool:
+    """True iff any You: value opens with a token and is immediately negated.
+
+    Delegates to the SHIPPED checker so the two can never diverge again.
+    """
     for raw_val in evidence_gate.YOU_FIELD_VALUE_RE.findall(text):
-        val = _A14C_STRIP_RE.sub("", raw_val).replace("`", "").replace("*", "").strip()
-        for tok in _A14C_TOKENS:
-            if val.startswith(tok):
-                if val[len(tok):].strip().lower().startswith("nothing"):
-                    return True
-                break
+        if any(f[0] == "TOKEN-PLUS-NOTHING" for f in _ytc.check_line(raw_val)):
+            return True
     return False
 
 
@@ -150,7 +165,8 @@ SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], str
     # lowercase key — see the a101 NOTE below; _fp_streams / _fp_artifact_path use lowercase ids.
     "a14c": (
         _a14c_fires,
-        [evidence_gate.YOU_FIELD_VALUE_RE, _A14C_STRIP_RE],
+        # Fingerprint binds the LIVE tool's regexes, so editing the tool voids the artifact.
+        [evidence_gate.YOU_FIELD_VALUE_RE, _ytc._NEGATION_RE, _ytc.YOU_RE],
         "you:",  # a You: field is a NECESSARY condition of firing
     ),
     "A97": (
