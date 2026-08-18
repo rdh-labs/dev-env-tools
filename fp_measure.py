@@ -237,6 +237,9 @@ EVIDENCE_EXTRACTORS: dict[str, tuple[Callable[[str], list[str]], str]] = {
 }
 
 EXCERPT_CAP = 600
+# Mirrors evidence_gate.FP_EVIDENCE_KINDS. Kept as a literal rather than imported so this
+# tool stays runnable if the hook is absent; test_fp_evidence.py asserts the two agree.
+EVIDENCE_KIND_VALUES = frozenset({"matched-span", "scanned-region"})
 
 
 def _excerpt_with_evidence(matched: list[str], cap: int = EXCERPT_CAP) -> str:
@@ -463,7 +466,7 @@ def _carry_labels(new_art: dict, path: Path) -> dict:
     though they are probably correct. An auditor must be able to tell the two populations
     apart -- collapsing them would relaunder the very defect this change fixes.
     """
-    stats = {"carried": 0, "fresh": 0, "orphaned": 0, "prior_labeled": 0}
+    stats = {"carried": 0, "fresh": 0, "orphaned": 0, "prior_labeled": 0, "downgraded": 0}
     if not path.exists():
         stats["fresh"] = len(new_art.get("fires", []))
         return stats
@@ -476,6 +479,15 @@ def _carry_labels(new_art: dict, path: Path) -> dict:
             f"{path}: existing artifact unreadable ({type(e).__name__}: {e}) -- refusing to "
             f"overwrite it, because that would destroy reviewer labels that cannot be read "
             f"back first. Move it aside deliberately if you intend to discard it.") from e
+    # Is the SOURCE artifact audit-clean? Derived from the source's own schema_v, NOT from
+    # the code path — a cross-family review (2026-08-18) found that stamping provenance by
+    # code path mislabels genuinely clean v2 labels as "pre-evidence-fix" on every re-measure.
+    try:
+        old_schema = int(old.get("schema_v", 1))
+    except (TypeError, ValueError):
+        old_schema = 1
+    source_auditable = old_schema >= 2 and old.get("evidence_kind") in EVIDENCE_KIND_VALUES
+
     index: dict[tuple, list[dict]] = {}
     for f in old.get("fires", []):
         if not isinstance(f, dict):
@@ -493,10 +505,27 @@ def _carry_labels(new_art: dict, path: Path) -> dict:
         if bucket:
             prior = bucket.pop(0)
             if prior.get("label") in ("TP", "FP"):
-                f["label"] = prior["label"]
-                f["rationale"] = prior.get("rationale", "")
-                f["label_provenance"] = "pre-evidence-fix"
-                stats["carried"] += 1
+                if source_auditable:
+                    # v2 -> v2: the prior label was formed on evidence that CONTAINED the
+                    # match. Carry it intact; it is audit-clean.
+                    f["label"] = prior["label"]
+                    f["rationale"] = prior.get("rationale", "")
+                    f["label_provenance"] = "carried-auditable"
+                    stats["carried"] += 1
+                else:
+                    # v1 -> v2: the prior label was formed on a HEAD EXCERPT that provably
+                    # could not show the match. Carrying it would LAUNDER exactly what the
+                    # consumer gate rejects: the artifact would end up schema_v=2 with
+                    # evidence_kind set, and admit promotion on pre-fix labels. (Found by
+                    # adversarial review 2026-08-18, reproduced with positive AND negative
+                    # control.) The reviewer's WORK is preserved as prior_rationale so
+                    # nothing is lost, but the LABEL resets — it must be re-confirmed
+                    # against evidence that can actually be seen.
+                    f["label"] = "unlabeled"
+                    f["prior_label"] = prior["label"]
+                    f["prior_rationale"] = prior.get("rationale", "")
+                    f["label_provenance"] = "reset-was-pre-evidence-fix"
+                    stats["downgraded"] += 1
                 continue
         stats["fresh"] += 1
     stats["orphaned"] = sum(
@@ -789,7 +818,14 @@ def main() -> int:
         os.replace(tmp, out)
         print(f"\nArtifact written: {out}")
         print(f"  labels: {stats['carried']} carried forward (of {stats['prior_labeled']} "
-              f"prior), {stats['fresh']} unlabeled, {stats['orphaned']} ORPHANED")
+              f"prior), {stats['fresh']} unlabeled, {stats['orphaned']} ORPHANED, "
+              f"{stats['downgraded']} RESET (pre-evidence-fix)")
+        if stats["downgraded"]:
+            print(f"  NOTE {stats['downgraded']} label(s) were formed on pre-fix HEAD "
+                  f"excerpts and have been RESET to unlabeled. Their prior label and "
+                  f"rationale are preserved per-fire as prior_label / prior_rationale. "
+                  f"Promotion stays held until they are re-confirmed against evidence that "
+                  f"contains the match.", file=sys.stderr)
         if stats["orphaned"]:
             # Loud: an orphan means a previously-labeled fire no longer reproduces, i.e. the
             # predicate changed or the corpus lost a file. Either is a real event.

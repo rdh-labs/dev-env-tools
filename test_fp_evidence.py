@@ -176,10 +176,14 @@ def test_labels_carry_across_remeasure(tmp_path):
     art2 = fp.measure("a14c", str(corpus / "*.jsonl"))
     stats = fp._carry_labels(art2, path)
     assert stats["carried"] == 1 and stats["prior_labeled"] == 1 and stats["orphaned"] == 0
+    assert stats["downgraded"] == 0, "a v2 source is auditable — nothing should be reset"
     assert art2["fires"][0]["label"] == "TP"
     assert art2["fires"][0]["rationale"] == "adjudicated by hand"
-    assert art2["fires"][0]["label_provenance"] == "pre-evidence-fix", \
-        "carried labels must be distinguishable from audit-clean ones"
+    # The source here was written by fp.measure(), so it IS schema_v=2 with matched-span
+    # evidence — audit-clean. (Before 2026-08-18 this asserted "pre-evidence-fix", which
+    # encoded the laundering bug: it stamped EVERY carried label as pre-fix regardless of
+    # the source, and nothing read the stamp anyway.)
+    assert art2["fires"][0]["label_provenance"] == "carried-auditable"
 
 
 def test_orphaned_label_is_counted_not_silent(tmp_path):
@@ -208,12 +212,14 @@ def test_unreadable_artifact_refuses_overwrite(tmp_path):
 
 def test_missing_artifact_is_all_fresh(tmp_path):
     stats = fp._carry_labels({"fires": [{"source": "a", "legacy_key": "k"}]}, tmp_path / "absent.json")
-    assert stats == {"carried": 0, "fresh": 1, "orphaned": 0, "prior_labeled": 0}
+    assert stats == {"carried": 0, "fresh": 1, "orphaned": 0, "prior_labeled": 0, "downgraded": 0}
 
 
 def test_duplicate_keys_are_positional_not_broadcast(tmp_path):
     """Two identical responses in one session must not both inherit the FIRST label."""
-    old = {"fires": [
+    # Source must be AUDITABLE (v2), else the labels are correctly reset before pairing can
+    # even be observed — the property under test here is pairing, not provenance.
+    old = {"schema_v": 2, "evidence_kind": "matched-span", "fires": [
         {"source": "s.jsonl", "legacy_key": "same", "label": "TP", "rationale": "first"},
         {"source": "s.jsonl", "legacy_key": "same", "label": "FP", "rationale": "second"},
     ]}
@@ -227,9 +233,87 @@ def test_duplicate_keys_are_positional_not_broadcast(tmp_path):
 
 
 def test_unlabeled_prior_does_not_count_as_carried(tmp_path):
-    old = {"fires": [{"source": "s.jsonl", "legacy_key": "k", "label": "unlabeled"}]}
+    old = {"schema_v": 2, "evidence_kind": "matched-span",
+           "fires": [{"source": "s.jsonl", "legacy_key": "k", "label": "unlabeled"}]}
     path = tmp_path / "a.json"
     path.write_text(json.dumps(old))
     new = {"fires": [{"source": "s.jsonl", "legacy_key": "k"}]}
     stats = fp._carry_labels(new, path)
-    assert stats == {"carried": 0, "fresh": 1, "orphaned": 0, "prior_labeled": 0}
+    assert stats == {"carried": 0, "fresh": 1, "orphaned": 0, "prior_labeled": 0, "downgraded": 0}
+
+
+# ── label laundering: the CRITICAL an adversarial review found (2026-08-18) ──
+# _carry_labels originally carried v1 labels forward stamped "pre-evidence-fix" — and
+# NOTHING read that field. So `re-measure v1 -> carry -> finalize` produced a schema_v=2
+# artifact with evidence_kind set, and the gate ADMITTED on labels every one of which was
+# formed on a head excerpt. The migration walked around the consumer check it was paired
+# with. These tests exist so that hole cannot silently reopen.
+
+def _prior(schema_v, kind, label="TP"):
+    a = {"schema_v": schema_v, "fires": [{"matched": ["[action] Nothing"],
+         "excerpt": "[action] Nothing", "legacy_key": "K", "source": "s.jsonl",
+         "label": label, "rationale": "hand-adjudicated"}]}
+    if kind is not None:
+        a["evidence_kind"] = kind
+    return a
+
+
+def _fresh():
+    return {"fires": [{"matched": ["[action] Nothing"], "excerpt": "[action] Nothing",
+                       "legacy_key": "K", "source": "s.jsonl"}]}
+
+
+@pytest.mark.parametrize("schema_v,kind", [
+    (1, None), (1, "matched-span"), (2, "head-excerpt"), (2, None), ("two", "matched-span"),
+])
+def test_prefix_labels_are_reset_not_carried(tmp_path, schema_v, kind):
+    """A label formed on evidence that could not show the match must NOT survive into a v2
+    artifact — that is laundering. The reviewer's WORK is preserved; the LABEL resets."""
+    path = tmp_path / "a.json"
+    path.write_text(json.dumps(_prior(schema_v, kind)))
+    new = _fresh()
+    stats = fp._carry_labels(new, path)
+    f = new["fires"][0]
+    assert f["label"] == "unlabeled", "a pre-fix label was carried into a v2 artifact"
+    assert f["label_provenance"] == "reset-was-pre-evidence-fix"
+    assert f["prior_label"] == "TP" and f["prior_rationale"] == "hand-adjudicated", \
+        "reviewer work must be preserved, not discarded"
+    assert stats["downgraded"] == 1 and stats["carried"] == 0
+
+
+@pytest.mark.parametrize("kind", ["matched-span", "scanned-region"])
+def test_auditable_labels_still_carry(tmp_path, kind):
+    """NEGATIVE CONTROL for the test above: without this, a _carry_labels that reset
+    EVERYTHING would pass. A v2 source's labels are audit-clean and must survive."""
+    path = tmp_path / "a.json"
+    path.write_text(json.dumps(_prior(2, kind)))
+    new = _fresh()
+    stats = fp._carry_labels(new, path)
+    assert new["fires"][0]["label"] == "TP"
+    assert new["fires"][0]["label_provenance"] == "carried-auditable"
+    assert stats["carried"] == 1 and stats["downgraded"] == 0
+
+
+def test_provenance_comes_from_source_not_code_path(tmp_path):
+    """Re-measuring an ALREADY-v2 artifact must not stamp its clean labels 'pre-evidence-fix'.
+    Provenance is a property of the SOURCE artifact, not of which function ran."""
+    path = tmp_path / "a.json"
+    path.write_text(json.dumps(_prior(2, "matched-span")))
+    new = _fresh()
+    fp._carry_labels(new, path)
+    assert "pre-evidence-fix" not in new["fires"][0]["label_provenance"]
+
+
+def test_evidence_kind_allowlist_matches_the_gate():
+    """fp_measure's EVIDENCE_KIND_VALUES mirrors evidence_gate.FP_EVIDENCE_KINDS by hand
+    (deliberately not imported, so this tool runs without the hook). Pin the agreement — a
+    silent divergence would make the producer emit a kind the consumer rejects."""
+    import importlib.util as _i, pathlib as _p, os as _o
+    _o.environ["EVIDENCE_GATE_NO_LOG"] = "1"
+    egp = _p.Path.home()/".claude/hooks/stop/evidence_gate.py"
+    if not egp.exists():
+        pytest.skip("evidence_gate.py not deployed")
+    _s = _i.spec_from_file_location("eg_check", egp)
+    eg = _i.module_from_spec(_s); _s.loader.exec_module(eg)
+    assert fp.EVIDENCE_KIND_VALUES == eg.FP_EVIDENCE_KINDS, \
+        "producer and consumer disagree on which evidence kinds are valid"
