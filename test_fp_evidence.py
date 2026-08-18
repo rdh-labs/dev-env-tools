@@ -599,3 +599,47 @@ def test_seen_state_write_is_atomic(monkeypatch, tmp_path):
     assert state.read_bytes() == before, \
         "a failed rename destroyed the existing state — the write was not atomic"
     assert not list(state.parent.glob(f"{state.name}.tmp*")), "temp file left behind"
+
+
+# ── the READY push had no delivery guarantee (architecture review, HIGH) ──────
+# `newly_ready` is a ONE-SHOT transition: finalize() reads was_ready BEFORE overwriting the
+# artifact, so the not-ready -> ready edge happens once and is consumed. _notify_ready
+# returned None, its caller ignored the outcome, and the non-zero-exit clause covered only
+# the unauditable path — so a failed push on that single run vanished and the job exited 0.
+# The PRIMARY signal of the promotion system was the one without a guarantee.
+
+def test_notify_ready_reports_a_status(monkeypatch, tmp_path):
+    _notify_env(monkeypatch, tmp_path)
+    assert fp._notify_ready(["zz"]) == (1, "ok")
+
+
+def test_notify_ready_reports_absent_notifier(monkeypatch, tmp_path, capsys):
+    _notify_env(monkeypatch, tmp_path, notifier_exists=False)
+    n, status = fp._notify_ready(["zz"])
+    assert (n, status) == (1, "notifier-absent")
+    assert "NOT pushed" in capsys.readouterr().err
+
+
+def test_notify_ready_reports_send_failure(monkeypatch, tmp_path):
+    _notify_env(monkeypatch, tmp_path)
+    import subprocess
+    class _Fail:
+        returncode = 1
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Fail())
+    assert fp._notify_ready(["zz"]) == (1, "send-failed")
+
+
+def test_notify_ready_empty_is_not_a_failure(monkeypatch, tmp_path):
+    """NEGATIVE CONTROL: nothing owed must NOT look like a failed delivery, or every clean
+    run would exit non-zero and the cron alert would fire daily."""
+    _notify_env(monkeypatch, tmp_path)
+    assert fp._notify_ready([]) == (0, "no-new")
+
+
+def test_notify_ready_never_raises(monkeypatch, tmp_path):
+    _notify_env(monkeypatch, tmp_path)
+    import subprocess
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
+    n, status = fp._notify_ready(["zz"])
+    assert (n, status) == (1, "send-failed")

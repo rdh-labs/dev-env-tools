@@ -790,16 +790,27 @@ def finalize_all() -> list[dict]:
     return results
 
 
-def _notify_ready(ready_ids: list[str]) -> None:
-    """Best-effort push when scanner(s) become promotion-ready. Never raises (a notify
-    failure must not abort finalize); the failure is PRINTED (not silent)."""
+def _notify_ready(ready_ids: list[str]) -> tuple[int, str]:
+    """Push when scanner(s) become promotion-ready. Returns (n_owed, status).
+
+    Returns a STATUS rather than None because `newly_ready` is a ONE-SHOT transition:
+    `finalize()` computes `was_ready` from the artifact BEFORE overwriting it, so the
+    not-ready -> ready edge occurs exactly once and is then consumed forever. A push that
+    failed on that single run used to be lost with no retry and no effect on the exit code —
+    the PRIMARY signal of the whole promotion system was the one without a delivery
+    guarantee, while the secondary unauditable alert had one. Found by an architecture
+    review, 2026-08-18; it is the same defect as the unauditable path's, sitting one
+    function above the fix for it.
+
+    Never raises — a notify failure must not abort finalize — and the failure is PRINTED,
+    returned as a status, and (via the caller) reflected in the exit code."""
     if not ready_ids:
-        return
+        return 0, "no-new"
     import subprocess
     notify = Path.home() / "bin" / "notify.sh"
     if not notify.exists():
         print(f"[finalize] notify.sh absent — ready scanners NOT pushed: {ready_ids}", file=sys.stderr)
-        return
+        return len(ready_ids), "notifier-absent"
     try:
         result = subprocess.run(
             [str(notify), "Scanner FP-gate",
@@ -809,8 +820,11 @@ def _notify_ready(ready_ids: list[str]) -> None:
         if result.returncode != 0:
             print(f"[finalize] notify.sh exited {result.returncode} — push NOT confirmed for "
                   f"ready scanners: {ready_ids}", file=sys.stderr)
+            return len(ready_ids), "send-failed"
     except (OSError, subprocess.SubprocessError) as e:
         print(f"[finalize] notify failed ({e}) — ready scanners: {ready_ids}", file=sys.stderr)
+        return len(ready_ids), "send-failed"
+    return len(ready_ids), "ok"
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -943,7 +957,9 @@ def _run_finalize_all() -> int:
                          "re-verified from it; re-run fp_measure.py <id> --write-artifact]"
             print(f"  {r['scanner_id']}: {r['fires_labeled']}/{r['fires_total']} resolved, "
                   f"confirmed_fp={r['confirmed_fp']} — {r['decision']}{extra}")
-    _notify_ready(ready)
+    n_ready, ready_status = _notify_ready(ready)
+    print(f"[finalize-all] READY-NOTIFY owed={n_ready} status={ready_status} "
+          f"at={datetime.now(timezone.utc).isoformat()}", flush=True)
     # Machine-readable, single line, every run — counts by category so a zero exit still
     # carries the numbers and silence is never the success signal. Distinct prefix (not
     # `tail -1`) because stderr is unbuffered while stdout is block-buffered, so ERROR/UNRECOGNIZED
@@ -977,6 +993,14 @@ def _run_finalize_all() -> int:
     # wrapper's `|| notify.sh` fires on non-zero exit and is the only consumed signal, so a
     # best-effort push whose failure left the exit code at 0 guaranteed nothing (review HIGH,
     # 2026-08-18). An owed-but-unconfirmed push now surfaces.
+    # An OWED-but-unconfirmed push is a failure of this job: the cron wrapper's `||` is the
+    # only consumed signal. Covers BOTH pushes now — the ready transition is one-shot, so a
+    # silently-dropped ready alert can never be retried.
+    if ready_status in ("send-failed", "notifier-absent") and n_ready:
+        print(f"[finalize-all] exiting non-zero: {n_ready} scanner(s) became promotion-READY "
+              f"but the push could not be confirmed (status={ready_status}) — this transition "
+              f"is one-shot and will NOT recur", file=sys.stderr)
+        return 1
     if notify_status in ("send-failed", "notifier-absent") and n_new:
         print(f"[finalize-all] exiting non-zero: {n_new} at-risk artifact(s) were owed a push "
               f"that could not be confirmed (status={notify_status})", file=sys.stderr)
@@ -1018,7 +1042,11 @@ def main() -> int:
         if summary["unknown_labels"]:
             print(f"  WARNING unknown labels present (treated as unresolved): "
                   f"{summary['unknown_labels']}", file=sys.stderr)
-        _notify_ready([summary["scanner_id"]] if summary["newly_ready"] else [])
+        _n, _st = _notify_ready([summary["scanner_id"]] if summary["newly_ready"] else [])
+        if _st in ("send-failed", "notifier-absent") and _n:
+            print(f"[finalize] exiting non-zero: promotion-READY push not confirmed "
+                  f"(status={_st}) — one-shot transition", file=sys.stderr)
+            return 2
         return 0
     if not args.scanner_id:
         ap.error("scanner_id is required (or use --list)")
