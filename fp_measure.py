@@ -120,7 +120,39 @@ def _a101_fires(text: str) -> bool:
     return bool(evidence_gate.check_you_generic_deferred_action(text))
 
 
+# ── A14c (session 2783153d, 2026-08-18) ──────────────────────────────────────
+# CLAUDE.md's `You:` table defines `Nothing …` as its OWN category, not a value that may
+# follow a token. So `[action] Nothing` asserts both that a concrete step is required of the
+# user and that none is. This is an exact string match on a mutually-exclusive-category
+# violation defined in the workspace's own documentation — a logical invariant, not a
+# heuristic. Measured on one session (134 You: lines): 15 fires, 0 FP by hand-label.
+# This corpus replay is what tests whether that 0 holds at scale.
+#
+# The companion fuzzy check (a low-obligation token on a decision-shaped line) measured ~30%
+# FP on the same corpus and is DELIBERATELY NOT REGISTERED HERE — only the exact match is a
+# promotion candidate.
+_A14C_TOKENS = ("[decision]", "[approval]", "[question]", "[action]")
+_A14C_STRIP_RE = re.compile(r"^(?:\*\*|__)*[`*_\s]*")
+
+
+def _a14c_fires(text: str) -> bool:
+    for raw_val in evidence_gate.YOU_FIELD_VALUE_RE.findall(text):
+        val = _A14C_STRIP_RE.sub("", raw_val).replace("`", "").replace("*", "").strip()
+        for tok in _A14C_TOKENS:
+            if val.startswith(tok):
+                if val[len(tok):].strip().lower().startswith("nothing"):
+                    return True
+                break
+    return False
+
+
 SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], str | None]] = {
+    # lowercase key — see the a101 NOTE below; _fp_streams / _fp_artifact_path use lowercase ids.
+    "a14c": (
+        _a14c_fires,
+        [evidence_gate.YOU_FIELD_VALUE_RE, _A14C_STRIP_RE],
+        "you:",  # a You: field is a NECESSARY condition of firing
+    ),
     "A97": (
         _a97_fires,
         # Every regex whose source+flags determine firing — sha256'd into the artifact fingerprint.
