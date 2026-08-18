@@ -466,3 +466,62 @@ def test_auditable_predicate_survives_unicode_digit(monkeypatch):
     """`"²".isdigit()` is True but `int("²")` RAISES. This crashed _artifact_auditable, which
     the daily cron calls. Found by cross-family review; reproduced before fixing."""
     assert fp._artifact_auditable({"schema_v": "²", "evidence_kind": "matched-span"}) is False
+
+
+# ── the false "ready for promotion" push (CRITICAL, independent review 2026-08-18) ──
+# `finalize()` computed newly_ready from _artifact_admits(), which did NOT consult
+# auditability, and `_notify_ready` pushes on newly_ready alone. Relabelling a101's 16 FPs to
+# TP — the DOCUMENTED NEXT STEP — therefore produced newly_ready=True on an artifact the real
+# gate declines, printing "ready-for-promotion ... [UNAUDITABLE]" on one line and firing a
+# high-priority push pointing the wrong way. The SUMMARY display marker had been added; the
+# two ACTIONS it should have gated had not.
+
+def _v1_ready_shaped(tmp_path):
+    """A v1 artifact whose LABELS clear every OLD bar, but which is UNFINALIZED.
+
+    `fires_labeled=0 / confirmed_fp=None` is load-bearing, not incidental. `newly_ready` is
+    the not-ready -> ready TRANSITION: if the fixture is written already-final, `was_ready`
+    is True and the transition never evaluates, so the test passes whether or not
+    auditability gates it. The first version of this test did exactly that and a mutation
+    run proved it VACUOUS — reverting the fix it exists to guard passed the whole suite."""
+    art = {"scanner_id": "zz", "schema_v": 1, "fires_total": 2, "fires_labeled": 0,
+           "confirmed_fp": None, "decision": "pending-labeling",
+           "fires": [{"excerpt": "head only", "label": "TP", "rationale": "r"},
+                     {"excerpt": "head only", "label": "TP", "rationale": "r"}]}
+    (tmp_path / "zz.json").write_text(json.dumps(art))
+    return art
+
+
+def test_unauditable_artifact_never_reports_newly_ready(tmp_path, monkeypatch):
+    monkeypatch.setattr(fp, "ARTIFACT_DIR", tmp_path)
+    _v1_ready_shaped(tmp_path)
+    r = fp.finalize("zz")
+    assert r["newly_ready"] is False, "would fire a 'Ready for blocking promotion' push"
+    assert r["auditable"] is False
+
+
+def test_unauditable_artifact_decision_is_not_self_contradictory(tmp_path, monkeypatch):
+    monkeypatch.setattr(fp, "ARTIFACT_DIR", tmp_path)
+    _v1_ready_shaped(tmp_path)
+    fp.finalize("zz")
+    decision = json.loads((tmp_path / "zz.json").read_text())["decision"]
+    assert "ready-for-promotion" not in decision
+    assert "PRE-EVIDENCE-FIX" in decision
+
+
+def test_auditable_artifact_STILL_reports_newly_ready(tmp_path, monkeypatch):
+    """NEGATIVE CONTROL: without this, gating newly_ready on auditability could simply have
+    disabled the ready path entirely and both tests above would still pass."""
+    monkeypatch.setattr(fp, "ARTIFACT_DIR", tmp_path)
+    # `newly_ready` is the not-ready -> ready TRANSITION, not the steady state. Start from
+    # UNFINALIZED counts (fires_labeled=0, confirmed_fp=None) so finalize() produces the
+    # transition. My first version of this test set them already-final and asserted True —
+    # a wrong expectation baked into the probe, caught by this control failing.
+    art = {"scanner_id": "zz", "schema_v": 2, "evidence_kind": "matched-span",
+           "fires_total": 2, "fires_labeled": 0, "confirmed_fp": None, "decision": "x",
+           "fires": [{"matched": ["[action] Nothing"], "excerpt": "[action] Nothing",
+                      "label": "TP", "rationale": "r"} for _ in range(2)]}
+    (tmp_path / "zz.json").write_text(json.dumps(art))
+    r = fp.finalize("zz")
+    assert r["newly_ready"] is True and r["auditable"] is True
+    assert "ready-for-promotion" in json.loads((tmp_path / "zz.json").read_text())["decision"]

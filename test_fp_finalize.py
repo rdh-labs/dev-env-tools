@@ -28,14 +28,31 @@ def _gate_admits(art: dict) -> bool:
         return False
     if not isinstance(cfp, int) or isinstance(cfp, bool) or cfp != 0:
         return False
-    return True
+    # AUDITABILITY (2026-08-18). The real gate additionally requires schema_v>=2, an
+    # allowlisted evidence_kind, len(fires)==fires_total, and a non-blank `matched` span on
+    # EVERY fire — a v1 artifact's labels were formed on head excerpts and cannot be
+    # re-verified from the artifact. This mirror had drifted; a mirror that silently lags the
+    # thing it mirrors asserts a contract that no longer exists.
+    if int(art.get("schema_v", 1)) < 2 or art.get("evidence_kind") not in (
+            "matched-span", "scanned-region"):
+        return False
+    fires = art.get("fires")
+    if not isinstance(fires, list) or len(fires) != total:
+        return False
+    return all(isinstance(f, dict) and any(
+        isinstance(m, str) and m.strip() for m in (f.get("matched") or [])) for f in fires)
 
 
 def _artifact(fires_labels: list[str]) -> dict:
     return {
-        "scanner_id": "A99001", "schema_v": 1, "fires_total": len(fires_labels),
+        # schema_v 1 -> 2 with matched-span evidence: the current contract. A v1 fixture
+        # asserted "fully labeled + zero FP => ready + gate admits", which stopped being
+        # true when auditability joined the bar.
+        "scanner_id": "A99001", "schema_v": 2, "evidence_kind": "matched-span",
+        "fires_total": len(fires_labels),
         "fires_labeled": 0, "confirmed_fp": None, "decision": "pending-labeling",
-        "fires": [{"excerpt": f"fire {i}", "source": "x.jsonl", "label": lab, "rationale": ""}
+        "fires": [{"matched": [f"[action] Nothing — fire {i}"], "excerpt": f"fire {i}",
+                   "source": "x.jsonl", "label": lab, "rationale": ""}
                   for i, lab in enumerate(fires_labels)],
     }
 

@@ -634,7 +634,16 @@ def _artifact_admits(art: dict) -> bool:
     total, labeled, cfp = art.get("fires_total"), art.get("fires_labeled"), art.get("confirmed_fp")
     return bool(isinstance(total, int) and isinstance(labeled, int) and total > 0
                 and labeled == total
-                and isinstance(cfp, int) and not isinstance(cfp, bool) and cfp == 0)
+                and isinstance(cfp, int) and not isinstance(cfp, bool) and cfp == 0
+                # AUDITABILITY IS PART OF THE BAR, not a display annotation. Without this,
+                # relabelling a101's 16 FPs to TP — the documented next step — produced
+                # newly_ready=True on an artifact the real gate DECLINES, printing
+                # "ready-for-promotion ... [UNAUDITABLE]" in one line and firing a
+                # high-priority "Ready for blocking promotion" push pointing the wrong way.
+                # Reproduced live by an independent code review, 2026-08-18. The SUMMARY
+                # marker was added for this in an earlier commit; the two ACTIONS it should
+                # have gated — this predicate and _notify_ready — were missed.
+                and _artifact_auditable(art))
 
 
 def finalize(scanner_id: str) -> dict:
@@ -684,7 +693,13 @@ def finalize(scanner_id: str) -> dict:
     # confirmed_fp is an int ONLY when every fire is resolved; None otherwise keeps the gate
     # held (evidence_gate requires confirmed_fp == int 0 AND fires_labeled == fires_total).
     art["confirmed_fp"] = fp_count if complete else None
-    if complete and fp_count == 0:
+    if complete and fp_count == 0 and not _artifact_auditable(art):
+        # Self-contradiction guard: "ready-for-promotion" next to "[UNAUDITABLE]" told the
+        # reader two opposite things on one line.
+        art["decision"] = ("hold: confirmed_fp==0 and fully labeled, but the artifact is "
+                           "PRE-EVIDENCE-FIX — its labels cannot be re-verified from it. "
+                           "Re-run fp_measure.py <id> --write-artifact, then re-label.")
+    elif complete and fp_count == 0:
         art["decision"] = "ready-for-promotion (confirmed_fp==0, fully labeled)"
     elif complete:
         art["decision"] = f"hold: confirmed_fp={fp_count} (FP present in fire set)"
