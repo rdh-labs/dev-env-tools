@@ -304,10 +304,12 @@ def test_provenance_comes_from_source_not_code_path(tmp_path):
     assert "pre-evidence-fix" not in new["fires"][0]["label_provenance"]
 
 
-def test_evidence_kind_allowlist_matches_the_gate():
-    """fp_measure's EVIDENCE_KIND_VALUES mirrors evidence_gate.FP_EVIDENCE_KINDS by hand
-    (deliberately not imported, so this tool runs without the hook). Pin the agreement — a
-    silent divergence would make the producer emit a kind the consumer rejects."""
+def test_evidence_kind_allowlist_is_the_gates_own_object():
+    """EVIDENCE_KIND_VALUES is now IMPORTED from evidence_gate, not hand-mirrored, so identity
+    is the assertion — not equality. (It was a literal, justified as "so this tool runs
+    without the hook"; that was false — the module hard-imports evidence_gate at top level.)
+    This test now guards the IMPORT: if the gate renames FP_EVIDENCE_KINDS, this fails loudly
+    rather than the producer silently emitting a kind the consumer rejects."""
     import importlib.util as _i, pathlib as _p, os as _o
     _o.environ["EVIDENCE_GATE_NO_LOG"] = "1"
     egp = _p.Path.home()/".claude/hooks/stop/evidence_gate.py"
@@ -315,8 +317,16 @@ def test_evidence_kind_allowlist_matches_the_gate():
         pytest.skip("evidence_gate.py not deployed")
     _s = _i.spec_from_file_location("eg_check", egp)
     eg = _i.module_from_spec(_s); _s.loader.exec_module(eg)
-    assert fp.EVIDENCE_KIND_VALUES == eg.FP_EVIDENCE_KINDS, \
-        "producer and consumer disagree on which evidence kinds are valid"
+    # IDENTITY against fp_measure's OWN imported module — that is what proves the value came
+    # from the gate rather than from a re-introduced literal. (A first version compared against
+    # the freshly-loaded `eg` below and failed: a separate module load creates a separate
+    # frozenset object, so `is` was the wrong relation across instances. Wrong expectation in
+    # the probe, not a defect in the code — caught by the test failing.)
+    assert fp.EVIDENCE_KIND_VALUES is fp.evidence_gate.FP_EVIDENCE_KINDS, \
+        "producer no longer shares the consumer's allowlist object — a hand-copy has returned"
+    # VALUE equality against an independently-loaded gate: catches a stale bytecode/rename skew.
+    assert fp.EVIDENCE_KIND_VALUES == eg.FP_EVIDENCE_KINDS
+    assert "matched-span" in fp.EVIDENCE_KIND_VALUES
 
 
 # ── self-healing: the MONITORING path must report the real health signal ─────
@@ -525,3 +535,67 @@ def test_auditable_artifact_STILL_reports_newly_ready(tmp_path, monkeypatch):
     r = fp.finalize("zz")
     assert r["newly_ready"] is True and r["auditable"] is True
     assert "ready-for-promotion" in json.loads((tmp_path / "zz.json").read_text())["decision"]
+
+
+# ── the vacuous-truth guard that had gone MISSING from the mirror (/simplify, 2 legs) ──
+@pytest.mark.parametrize("declared,actual", [(95, 0), (5, 1), (2, 5)])
+def test_auditable_predicate_rejects_fire_count_mismatch(declared, actual):
+    """`fires: []` with `fires_total: 95` passed the per-fire loop VACUOUSLY and returned
+    True, while evidence_gate declined the same artifact. The monitor disagreed with the gate
+    it claims to mirror. Masked in production (finalize() normalises counts first) but live
+    for any direct caller — which the tests themselves are."""
+    art = {"schema_v": 2, "evidence_kind": "matched-span", "fires_total": declared,
+           "fires": [{"matched": ["[action] Nothing"], "label": "TP"} for _ in range(actual)]}
+    assert fp._artifact_auditable(art) is False
+
+
+def test_auditable_predicate_accepts_consistent_counts():
+    """NEGATIVE CONTROL: the guard must not become a blanket deny."""
+    art = {"schema_v": 2, "evidence_kind": "matched-span", "fires_total": 3,
+           "fires": [{"matched": ["[action] Nothing"], "label": "TP"} for _ in range(3)]}
+    assert fp._artifact_auditable(art) is True
+
+
+def test_auditable_predicate_tolerates_absent_fires_total():
+    """Direct callers (tests, ad-hoc audits) often pass a dict with no counts. Absent is not
+    a mismatch — only a PRESENT-and-wrong count rejects."""
+    art = {"schema_v": 2, "evidence_kind": "matched-span",
+           "fires": [{"matched": ["[action] Nothing"], "label": "TP"}]}
+    assert fp._artifact_auditable(art) is True
+
+
+def test_at_risk_ids_is_one_source_of_truth():
+    """The notifier and the SUMMARY count both derive from this helper; they were duplicated
+    predicates before, with nothing enforcing agreement."""
+    rows = [{"scanner_id": "a", "auditable": False, "fires_labeled": 5},   # at risk
+            {"scanner_id": "b", "auditable": False, "fires_labeled": 0},   # no labels yet
+            {"scanner_id": "c", "auditable": True,  "fires_labeled": 5},   # auditable
+            "not-a-dict", None, {}]                                        # malformed
+    assert fp._at_risk_ids(rows) == {"a"}
+
+
+def test_seen_state_write_is_atomic(monkeypatch, tmp_path):
+    """The dedup-state write must go to a temp file and be os.replace'd into position.
+
+    BEHAVIOURAL, not structural: make os.replace fail, then assert the ORIGINAL file is
+    byte-for-byte unchanged. That can only hold if the payload was written somewhere else
+    first. A plain `write_text` truncates in place, so the original would be destroyed.
+
+    A mutation run flagged this path as the one surviving mutant — a plain write_text passed
+    the whole suite. Every other write in fp_measure.py already uses temp+rename; this one had
+    been left out of that discipline, and nothing noticed because nothing tested it."""
+    calls = _notify_env(monkeypatch, tmp_path)
+    state = fp._unauditable_state_path()
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps(["pre-existing"]))
+    before = state.read_bytes()
+
+    import os as _os
+    monkeypatch.setattr(_os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
+    # Must not raise — the whole notifier is cron-safe — and must not corrupt the state file.
+    n, status = fp._notify_unauditable(
+        [{"scanner_id": "zz", "auditable": False, "fires_total": 1, "fires_labeled": 1}])
+    assert isinstance(n, int) and isinstance(status, str)
+    assert state.read_bytes() == before, \
+        "a failed rename destroyed the existing state — the write was not atomic"
+    assert not list(state.parent.glob(f"{state.name}.tmp*")), "temp file left behind"

@@ -251,9 +251,12 @@ EVIDENCE_EXTRACTORS: dict[str, tuple[Callable[[str], list[str]], str]] = {
 }
 
 EXCERPT_CAP = 600
-# Mirrors evidence_gate.FP_EVIDENCE_KINDS. Kept as a literal rather than imported so this
-# tool stays runnable if the hook is absent; test_fp_evidence.py asserts the two agree.
-EVIDENCE_KIND_VALUES = frozenset({"matched-span", "scanned-region"})
+# IMPORTED, not mirrored. An earlier version kept this as a literal "so this tool stays
+# runnable if the hook is absent" — that justification was FALSE: this module does a bare
+# top-level `import evidence_gate` with no try/except, so fp_measure already cannot run
+# without the hook on disk. Hand-copying bought nothing and cost a real drift (the
+# vacuous-truth guard below went missing from the copy). Found by /simplify.
+EVIDENCE_KIND_VALUES = evidence_gate.FP_EVIDENCE_KINDS
 
 
 def _excerpt_with_evidence(matched: list[str], cap: int = EXCERPT_CAP) -> str:
@@ -267,7 +270,12 @@ def _excerpt_with_evidence(matched: list[str], cap: int = EXCERPT_CAP) -> str:
 
 
 def _assert_evidence_invariant(art: dict) -> None:
-    """Every fire's stored excerpt must contain at least one of its own matched spans.
+    """Every fire's excerpt must contain the first 120 normalised chars of a matched span.
+
+    NOT full-span containment — the excerpt is capped, so a longer span is legitimately
+    truncated and only its prefix can be verified. The earlier wording ("contains at least one
+    of its own matched spans") overclaimed, and that overclaim had also leaked into the
+    artifact's own evidence_contract field, which human auditors read while labelling.
 
     This is the FALSIFIABLE form of the property the module docstring claims. It runs at
     write time -- not as a comment -- so a future refactor that reintroduces a head excerpt
@@ -458,8 +466,11 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
         "harness": "fp_measure.py",
         "evidence_kind": kind,
         "evidence_contract": (
-            "every fires[].excerpt contains at least one of that fire's matched spans; "
-            "enforced by _assert_evidence_invariant at write time"),
+            "every fires[].excerpt contains the first 120 normalised characters of at least "
+            "one of that fire's matched spans; enforced by _assert_evidence_invariant at "
+            f"write time. NOTE THE BOUND: the excerpt is capped at {EXCERPT_CAP} chars, so a "
+            "span longer than 120 chars is verified by PREFIX, not in full. The complete "
+            "span is always present verbatim in fires[].matched."),
         "falsifier": "a fire labeled TP that is actually a legitimate (non-violating) response",
         "fires": fires,
     }
@@ -482,10 +493,17 @@ def _carry_labels(new_art: dict, path: Path) -> dict:
     still deterministically reproducible from the response text, and is therefore a valid
     join key across exactly this one schema change.
 
-    Carried labels are stamped ``label_provenance="pre-evidence-fix"``: they were assigned
-    when the artifact could NOT display the matched span, so they are not audit-clean even
-    though they are probably correct. An auditor must be able to tell the two populations
-    apart -- collapsing them would relaunder the very defect this change fixes.
+    Behaviour BRANCHES on whether the SOURCE artifact was auditable:
+      v2 auditable source -> label carried intact, stamped ``label_provenance="carried-auditable"``
+      anything else       -> label RESET to "unlabeled", stamped
+                             ``label_provenance="reset-was-pre-evidence-fix"``, with the
+                             reviewer's work preserved as ``prior_label``/``prior_rationale``
+
+    Carrying a pre-fix label forward would relaunder the very defect this change fixes: the
+    artifact would end up schema_v=2 with evidence_kind set, and admit promotion on labels
+    formed against head excerpts. (This docstring previously described that REJECTED design —
+    an unconditional carry stamped "pre-evidence-fix", a value no code path writes. Caught by
+    /simplify: a reader trusting the docstring would believe something the code does not do.)
     """
     stats = {"carried": 0, "fresh": 0, "orphaned": 0, "prior_labeled": 0, "downgraded": 0}
     if not path.exists():
@@ -618,6 +636,14 @@ def _artifact_auditable(art: dict) -> bool:
     fires = art.get("fires")
     if not isinstance(fires, list):
         return False
+    # VACUOUS-TRUTH GUARD — mirrors evidence_gate.py. This was MISSING from the copy: an
+    # artifact with `fires: []` and `fires_total: 95` passed the per-fire loop vacuously and
+    # returned True while the real gate declined it. Masked in production because finalize()
+    # normalises counts first, but the unit tests call this directly on raw dicts, and a
+    # predicate whose docstring claims parity must actually have it. Found twice, independently.
+    total = art.get("fires_total")
+    if isinstance(total, int) and len(fires) != total:
+        return False
     for f in fires:
         if not isinstance(f, dict):
             return False
@@ -712,9 +738,7 @@ def finalize(scanner_id: str) -> dict:
     # it writes, so a reader landing mid-write on the 808KB artifact gets a JSONDecodeError,
     # and nothing in this call chain retries. os.replace is atomic within one filesystem.
     # The .json.tmp<pid> suffix cannot be picked up by finalize_all()'s "*.json" glob.
-    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
-    tmp.write_text(json.dumps(art, indent=2))
-    os.replace(tmp, path)
+    _atomic_write_text(path, json.dumps(art, indent=2))
     return {
         "scanner_id": scanner_id, "fires_total": total, "fires_labeled": resolved,
         "confirmed_fp": art["confirmed_fp"], "decision": art["decision"],
@@ -789,6 +813,38 @@ def _notify_ready(ready_ids: list[str]) -> None:
         print(f"[finalize] notify failed ({e}) — ready scanners: {ready_ids}", file=sys.stderr)
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via a sibling temp + os.replace, removing the temp if the rename fails.
+
+    Three sites in this file hand-rolled temp+rename and none of them cleaned up: a failed
+    os.replace left a `.tmp<pid>` sibling behind forever. Found by the atomicity test written
+    for ONE of those sites — fixing only that site would have been the instance-not-invariant
+    error this session already made once. os.replace is atomic within one filesystem, which is
+    what makes a mid-write reader see either the old file or the new one, never a truncation."""
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass          # best-effort cleanup; the original file is intact either way
+        raise
+
+
+def _at_risk_ids(rows: list[dict]) -> set[str]:
+    """Scanner ids that are UNAUDITABLE and already carry labels — the integrity-incident set.
+
+    One source of truth. This predicate was written twice — inside the notifier and again for
+    the SUMMARY count — with nothing enforcing that they agree. `_norm`'s docstring in this
+    same file states exactly that principle for the excerpt/invariant pair; it had not been
+    applied here."""
+    return {str(r.get("scanner_id")) for r in rows
+            if isinstance(r, dict) and not r.get("auditable", True)
+            and isinstance(r.get("fires_labeled"), int) and r["fires_labeled"] > 0}
+
+
 def _unauditable_state_path() -> Path:
     return Path.home() / ".claude" / "state" / "fp-gate-unauditable-seen.json"
 
@@ -811,9 +867,7 @@ def _notify_unauditable(rows: list[dict]) -> tuple[int, str]:
 
     Whole body is guarded: this runs inside cron and must never raise."""
     try:
-        at_risk = sorted({str(r.get("scanner_id")) for r in rows
-                          if isinstance(r, dict) and not r.get("auditable", True)
-                          and isinstance(r.get("fires_labeled"), int) and r["fires_labeled"] > 0})
+        at_risk = sorted(_at_risk_ids(rows))
         sp = _unauditable_state_path()
         try:
             seen = set(json.loads(sp.read_text()))
@@ -832,7 +886,10 @@ def _notify_unauditable(rows: list[dict]) -> tuple[int, str]:
             alerts on THAT rather than the condition being lost."""
             try:
                 sp.parent.mkdir(parents=True, exist_ok=True)
-                sp.write_text(json.dumps(sorted(set(at_risk) | seen)))
+                # Atomic, matching finalize() and the artifact write. A crash mid-write here
+                # corrupts the alert-dedup state — the failure class already guarded
+                # everywhere else in this file. This write had been left out of that discipline.
+                _atomic_write_text(sp, json.dumps(sorted(set(at_risk) | seen)))
             except OSError as e:
                 print(f"[finalize-all] could not persist unauditable state ({e}) — "
                       f"alert will repeat next run", file=sys.stderr)
@@ -893,16 +950,14 @@ def _run_finalize_all() -> int:
     # lines can physically precede this one in the cron log. flush=True so a SIGTERM'd run
     # still emits it (block-buffered stdout is otherwise lost when a signal cuts a run).
     unauditable = [r["scanner_id"] for r in finalized if not r.get("auditable", True)]
-    n_owed = len({str(r.get("scanner_id")) for r in finalized
-                  if isinstance(r, dict) and not r.get("auditable", True)
-                  and isinstance(r.get("fires_labeled"), int) and r["fires_labeled"] > 0})
+    n_at_risk = len(_at_risk_ids(finalized))   # name matches the printed `at_risk=` label
     # Machine-readable and emitted EVERY run, so "no unauditable artifacts" is an observed
     # zero rather than an absence of output. Silence must never be the success signal.
     print(f"[finalize-all] SUMMARY finalized={len(finalized)} ready={len(ready)} "
           f"errors={len(errors)} unrecognized={len(unrecognized)} "
           f"unauditable={len(unauditable)}"
           + (f" ({','.join(sorted(unauditable))})" if unauditable else "")
-          + f" at_risk={n_owed}"
+          + f" at_risk={n_at_risk}"
           + f" at={datetime.now(timezone.utc).isoformat()}", flush=True)
     # SUMMARY is emitted and FLUSHED before the notify call, which can block up to 20s: a
     # SIGTERM during that window must not cost the whole run's record. (Moving notify ahead of
@@ -911,7 +966,7 @@ def _run_finalize_all() -> int:
     # therefore rides its own second line; `at_risk=N` above already states an alert was owed,
     # so a missing NOTIFY line is itself readable as "owed but never reported".
     n_new, notify_status = _notify_unauditable(finalized)
-    print(f"[finalize-all] NOTIFY owed={n_owed} new={n_new} status={notify_status} "
+    print(f"[finalize-all] NOTIFY owed={n_at_risk} new={n_new} status={notify_status} "
           f"at={datetime.now(timezone.utc).isoformat()}", flush=True)
     # Exit code means "the tool failed" — the sole meaning a cron `|| notify.sh` wrapper can
     # carry, and what this job's hardcoded alert message already asserts. An unrecognised
@@ -989,9 +1044,7 @@ def main() -> int:
         art["label_carry"] = stats
         # Atomic, matching finalize(): a reader landing mid-write on a large artifact must
         # not get a JSONDecodeError, and nothing in this chain retries.
-        tmp = out.with_name(f"{out.name}.tmp{os.getpid()}")
-        tmp.write_text(json.dumps(art, indent=2))
-        os.replace(tmp, out)
+        _atomic_write_text(out, json.dumps(art, indent=2))
         print(f"\nArtifact written: {out}")
         print(f"  labels: {stats['carried']} carried forward (of {stats['prior_labeled']} "
               f"prior), {stats['fresh']} unlabeled, {stats['orphaned']} ORPHANED, "
