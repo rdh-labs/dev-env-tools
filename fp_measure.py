@@ -60,6 +60,19 @@ from pathlib import Path
 # a number is never again something a reader has to infer.
 CORPUS_GLOBS = [str(Path.home() / ".claude/projects/*/*.jsonl")]
 SIDECHAIN_POLICY = "exclude"   # runtime-reachable only; see above. "include" = behaviour study.
+
+
+def _is_sidechain_path(path: str) -> bool:
+    """True for a subagent transcript. ENFORCEMENT, not a label.
+
+    `SIDECHAIN_POLICY` was originally written into the artifact and read by NOTHING — a
+    mutant that kept the label saying "exclude" while scanning sidechain files anyway
+    SURVIVED the whole suite. The artifact would have asserted a population it did not
+    measure. That is the same "metadata is a CLAIM, not evidence" defect this change set
+    fixed in evidence_gate's per-fire check, committed again here — in the very commit whose
+    message says an instrument must record its own denominator. Recording it is not enough;
+    the policy has to be the thing that actually selects the files."""
+    return "/subagents/" in path.replace("\\", "/")
 CORPUS_GLOB = os.pathsep.join(CORPUS_GLOBS)   # CLI default; split on os.pathsep when globbing
 ARTIFACT_DIR = Path.home() / ".claude/logs/fp-gate"
 SCHEMA_V = 2   # v2: fires carry matched-span evidence (was: head excerpt)
@@ -422,6 +435,11 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
     # pattern still works, so an explicit --corpus is unaffected.
     files = sorted({f for pat in str(corpus_glob).split(os.pathsep) if pat
                     for f in glob.glob(pat)})
+    if SIDECHAIN_POLICY == "exclude":
+        # The policy SELECTS the files. An explicit --corpus that points at sidechains is
+        # filtered here too, so the artifact's sidechain_policy field can never describe a
+        # population the run did not actually measure.
+        files = [f for f in files if not _is_sidechain_path(f)]
     total_scanned = 0
     files_scanned = 0
     parse_failures = 0

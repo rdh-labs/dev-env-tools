@@ -670,3 +670,26 @@ def test_artifact_records_which_population_produced_it(tmp_path):
     assert art["sidechain_policy"] == "exclude"
     assert art["corpus_globs"] and isinstance(art["corpus_globs"], list)
     assert art["corpus_files_total"] >= art["corpus_files_scanned"] >= 0
+
+
+def test_sidechain_policy_is_ENFORCED_not_merely_declared(tmp_path):
+    """BEHAVIOURAL. A mutation run proved the earlier version was a label only: a mutant that
+    kept sidechain_policy="exclude" while scanning sidechain files SURVIVED the whole suite,
+    so the artifact could assert a population it had not measured. This test hands measure()
+    an explicit corpus containing a sidechain path and asserts the fire is NOT counted."""
+    top = tmp_path / "proj"
+    side = top / "subagents"
+    side.mkdir(parents=True)
+    _jsonl(top, "main.jsonl", _HEAD + _TAIL_FIRES)       # reachable  -> counts
+    _jsonl(side, "agent.jsonl", _HEAD + _TAIL_FIRES)     # sidechain  -> must NOT count
+    # Two explicit globs joined by os.pathsep — the top-level one AND the sidechain one, so
+    # the corpus argument genuinely offers the sidechain file and the POLICY must reject it.
+    art = fp.measure("a14c", str(top / "*.jsonl") + os.pathsep + str(side / "*.jsonl"))
+    assert art["fires_total"] == 1, "a sidechain fire was counted despite policy=exclude"
+    assert all("/subagents/" not in f["source"] for f in art["fires"])
+    assert art["sidechain_policy"] == "exclude"
+
+
+def test_is_sidechain_path_both_polarities():
+    assert fp._is_sidechain_path("/home/x/.claude/projects/slug/subagents/agent-a1.jsonl") is True
+    assert fp._is_sidechain_path("/home/x/.claude/projects/slug/session.jsonl") is False
