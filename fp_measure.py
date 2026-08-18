@@ -584,13 +584,26 @@ def _carry_labels(new_art: dict, path: Path) -> dict:
             continue
         if f.get("label") in ("TP", "FP"):
             stats["prior_labeled"] += 1
-        index.setdefault(_join_key(f), deque()).append(f)
+        for k in _join_keys(f):
+            index.setdefault(k, deque()).append(f)
     for f in new_art.get("fires", []):
-        bucket = index.get(_join_key(f))
+        bucket = None
+        for k in _join_keys(f):
+            b = index.get(k)
+            if b:
+                bucket = b
+                break
         # Positional pop keeps duplicate-key fires (the same response text twice in one
         # session) deterministic rather than all inheriting the first label.
         if bucket:
             prior = bucket.popleft()
+            # A fire is indexed under several keys; drop it from the others so it cannot be
+            # consumed twice by a later fire matching on a different key.
+            for k in _join_keys(prior):
+                other = index.get(k)
+                if other is not None and other is not bucket:
+                    try: other.remove(prior)
+                    except ValueError: pass
             if prior.get("label") in ("TP", "FP"):
                 if source_auditable:
                     # v2 -> v2: the prior label was formed on evidence that CONTAINED the
@@ -897,6 +910,26 @@ def _atomic_write_text(path: Path, text: str) -> None:
         except OSError:
             pass          # best-effort cleanup; the original file is intact either way
         raise
+
+
+def _join_keys(fire: dict) -> list[tuple]:
+    """ALL keys this fire can be matched by, most-specific first.
+
+    A single preferred key is WRONG across the v1->v2 boundary and produced a total
+    migration failure: a v1 artifact predates `record_digest`, so its fires only carry the
+    legacy head-excerpt key, while newly-measured fires prefer the sha256 key. The two
+    namespaces can never meet, so every prior label orphaned — 95 of 95 on a101, caught by
+    the orphan warning rather than silently losing them.
+
+    Returning BOTH lets the lookup try the digest (exact, collision-free) and fall back to the
+    legacy key only when the stored side has no digest to offer."""
+    keys = []
+    d = fire.get("record_digest")
+    if isinstance(d, str) and d:
+        keys.append((fire.get("source"), "sha256", d))
+    legacy = (fire.get("legacy_key") or fire.get("excerpt") or "")[:200]
+    keys.append((fire.get("source"), "legacy", legacy))
+    return keys
 
 
 def _join_key(fire: dict) -> tuple:

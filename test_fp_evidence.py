@@ -761,3 +761,39 @@ def test_measure_writes_a_record_digest(tmp_path):
     art = fp.measure("a14c", str(tmp_path / "*.jsonl"))
     d = art["fires"][0].get("record_digest")
     assert isinstance(d, str) and len(d) == 64, "no sha256 record_digest written"
+
+
+# ── v1 -> v2 migration: the case that orphaned 95 of 95 labels ────────────────
+# A v1 artifact predates record_digest, so its fires carry ONLY the legacy head-excerpt key,
+# while newly-measured fires PREFER the sha256 key. With a single preferred key the two
+# namespaces can never meet and every prior label orphans. Caught on a101 by the orphan
+# warning (95 of 95) rather than by any test — this is that test.
+
+def test_v1_prior_without_digest_joins_a_v2_fire_with_one(tmp_path):
+    text = _SHARED_OPENING + "MIGRATION CASE"
+    prior_fire = _fire(text, "TP", digest=False)      # v1: legacy key only
+    prior_fire.pop("record_digest", None)
+    prior = {"schema_v": 2, "evidence_kind": "matched-span", "fires": [prior_fire]}
+    path = tmp_path / "a.json"
+    path.write_text(json.dumps(prior))
+    new = {"fires": [_fire(text)]}                    # v2: digest AND legacy
+    assert "record_digest" in new["fires"][0] and "record_digest" not in prior["fires"][0]
+    stats = fp._carry_labels(new, path)
+    assert stats["orphaned"] == 0, "v1 label orphaned — the join namespaces cannot meet"
+    assert stats["carried"] == 1
+    assert new["fires"][0]["label"] == "TP"
+
+
+def test_a_fire_indexed_under_two_keys_is_consumed_only_once(tmp_path):
+    """A prior fire is indexed under BOTH its digest and its legacy key. If popping it from
+    one bucket left it in the other, a second new fire could inherit the same label twice."""
+    ta, tb = _SHARED_OPENING + "AAA", _SHARED_OPENING + "BBB"
+    prior = {"schema_v": 2, "evidence_kind": "matched-span",
+             "fires": [_fire(ta, "TP")]}
+    path = tmp_path / "a.json"
+    path.write_text(json.dumps(prior))
+    new = {"fires": [_fire(ta), _fire(tb)]}
+    stats = fp._carry_labels(new, path)
+    assert stats["carried"] == 1, "one prior label was consumed more than once"
+    assert new["fires"][0]["label"] == "TP"
+    assert new["fires"][1].get("label") in (None, "unlabeled")
