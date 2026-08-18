@@ -39,7 +39,21 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-CORPUS_GLOB = str(Path.home() / ".claude/projects/-home-ichardart-dev/*.jsonl")
+# CORPUS. Was `.../-home-ichardart-dev/*.jsonl` — NON-RECURSIVE, which silently excluded every
+# SUBAGENT transcript. Measured 2026-08-18: 1,428 of 9,828 transcript files reachable (14.5%);
+# 8,400 subagent transcripts invisible. That is not a coverage detail — it made a NEGATIVE
+# CLAIM unfalsifiable by construction: a14c.json asserted "zero out-of-sample instances", and
+# re-running the same predicate over the excluded files found FOUR, in a session that did NOT
+# author the rule. The measurement could not have returned them. (Found by an independent
+# review of the REASONING, not of the code — the code was self-consistent.)
+# Both patterns are needed: `*.jsonl` for session transcripts, `*/subagents/*.jsonl` for
+# subagent ones. glob's `**` would also match, but only with recursive=True, which
+# glob.glob() does not enable by default — an easy way to reintroduce this exact bug.
+CORPUS_GLOBS = [
+    str(Path.home() / ".claude/projects/-home-ichardart-dev/*.jsonl"),
+    str(Path.home() / ".claude/projects/-home-ichardart-dev/*/subagents/*.jsonl"),
+]
+CORPUS_GLOB = os.pathsep.join(CORPUS_GLOBS)   # CLI default; split on os.pathsep when globbing
 ARTIFACT_DIR = Path.home() / ".claude/logs/fp-gate"
 SCHEMA_V = 2   # v2: fires carry matched-span evidence (was: head excerpt)
 
@@ -379,7 +393,10 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
             f"match (2026-08-18 head-excerpt defect). Registered: "
             f"{sorted(EVIDENCE_EXTRACTORS)}")
     extractor, kind = EVIDENCE_EXTRACTORS[scanner_id]
-    files = sorted(glob.glob(corpus_glob))
+    # corpus_glob may carry SEVERAL patterns joined by os.pathsep (see CORPUS_GLOBS). A single
+    # pattern still works, so an explicit --corpus is unaffected.
+    files = sorted({f for pat in str(corpus_glob).split(os.pathsep) if pat
+                    for f in glob.glob(pat)})
     total_scanned = 0
     files_scanned = 0
     parse_failures = 0
@@ -426,6 +443,10 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
         "measured_at": datetime.now(timezone.utc).isoformat(),
         "regex_fingerprint": _fingerprint(fingerprint_patterns),
         "corpus_ref": "claude-projects-jsonl",
+        # Recorded so a coverage change is DETECTABLE. The v1 artifacts were measured with a
+        # non-recursive glob that excluded 8,400 subagent transcripts; nothing in them said so,
+        # which is how "zero out-of-sample instances" got published as a finding.
+        "corpus_globs": [pat for pat in str(corpus_glob).split(os.pathsep) if pat],
         "corpus_files_total": len(files),
         "corpus_files_scanned": files_scanned,
         "corpus_parse_failures": parse_failures,
@@ -573,6 +594,39 @@ def _is_known_companion(stem: str) -> bool:
     return bool(base) and suffix in _COMPANION_SUFFIXES and bool(_SCANNER_ID_RE.fullmatch(base))
 
 
+def _artifact_auditable(art: dict) -> bool:
+    """Can an auditor re-verify this artifact's labels FROM the artifact?
+
+    Mirrors evidence_gate._fp_artifact_admits_promotion's auditability half. A v1 artifact
+    stored a HEAD excerpt while every scanner matches on the TAIL, so its labels — however
+    carefully assigned — cannot be checked against the thing that fired."""
+    raw = art.get("schema_v", 1)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        # `"²".isdigit()` is True but `int("²")` RAISES — a real uncaught crash in a function
+        # the daily cron calls (cross-family review, gpt-5.6-sol, 2026-08-18; reproduced).
+        # Parse defensively: any unparseable version is "pre-fix", never "new enough".
+        try:
+            raw = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return False
+    if raw < 2 or art.get("evidence_kind") not in EVIDENCE_KIND_VALUES:
+        return False
+    # THIRD check, previously omitted: the gate also validates PER FIRE that a non-blank
+    # `matched` span exists. Mirroring only 2 of its 3 conditions made this monitor report
+    # "auditable" for an artifact the real gate declines — a monitor that disagrees with the
+    # thing it monitors (agent review, HIGH, 2026-08-18; reproduced live).
+    fires = art.get("fires")
+    if not isinstance(fires, list):
+        return False
+    for f in fires:
+        if not isinstance(f, dict):
+            return False
+        m = f.get("matched")
+        if not isinstance(m, list) or not any(isinstance(x, str) and x.strip() for x in m):
+            return False
+    return True
+
+
 def _artifact_admits(art: dict) -> bool:
     """Mirror of evidence_gate._fp_artifact_admits_promotion's admit conditions
     (evidence_gate.py:682-695) — the promotion bar this finalizer feeds. Used to detect the
@@ -650,6 +704,11 @@ def finalize(scanner_id: str) -> dict:
         "scanner_id": scanner_id, "fires_total": total, "fires_labeled": resolved,
         "confirmed_fp": art["confirmed_fp"], "decision": art["decision"],
         "newly_ready": _artifact_admits(art) and not was_ready, "unknown_labels": unknown,
+        # Surfaced so the DAILY job reports the real health signal. Without this the cron
+        # prints "hold: confirmed_fp=16" for an artifact whose 95 labels were formed on
+        # evidence that could not show the match — a number that looks like a measurement
+        # and is not one. Measured 2026-08-18: 4 of 5 artifacts, 155 labels.
+        "auditable": _artifact_auditable(art),
     }
 
 
@@ -715,6 +774,79 @@ def _notify_ready(ready_ids: list[str]) -> None:
         print(f"[finalize] notify failed ({e}) — ready scanners: {ready_ids}", file=sys.stderr)
 
 
+def _unauditable_state_path() -> Path:
+    return Path.home() / ".claude" / "state" / "fp-gate-unauditable-seen.json"
+
+
+def _notify_unauditable(rows: list[dict]) -> tuple[int, str]:
+    """Alert ONCE when an artifact is first observed unauditable WITH labels on it.
+    Returns (n_new, status) where status is one of ok / no-new / send-failed / notifier-absent.
+
+    WHY NOT "only when it would promote" (the first design, rejected by review):
+    that gated the alert on `confirmed_fp > 0` holding the artifact — but confirmed_fp was
+    DERIVED FROM THE VERY LABELS whose integrity is in doubt. Using an unverifiable number to
+    decide the unverifiability is not worth alerting about is CIRCULAR. (gpt-5.6-sol, HIGH,
+    2026-08-18.) So the trigger is now the integrity fact itself: labels exist on evidence
+    that cannot show the match.
+
+    WHY IT IS STILL NOT ALERT-FATIGUE: state-transition, not level. An id is pushed once and
+    recorded; repeats are suppressed until it leaves the set. This workspace measured 4,618
+    advisory fires with ~0 effect — a DAILY push about a known backlog would be that. A
+    one-time push about a newly discovered integrity incident is not.
+
+    Whole body is guarded: this runs inside cron and must never raise."""
+    try:
+        at_risk = sorted({str(r.get("scanner_id")) for r in rows
+                          if isinstance(r, dict) and not r.get("auditable", True)
+                          and isinstance(r.get("fires_labeled"), int) and r["fires_labeled"] > 0})
+        sp = _unauditable_state_path()
+        try:
+            seen = set(json.loads(sp.read_text()))
+        except (OSError, ValueError, TypeError):
+            seen = set()
+        new_ids = [i for i in at_risk if i not in seen]
+        if not new_ids:
+            return 0, "no-new"
+
+        def _persist() -> None:
+            """Record ONLY after a confirmed send. Persisting first (the earlier design)
+            permanently and silently dropped an artifact's one-time alert whenever notify.sh
+            was absent or failed — verified with a two-run repro: no retry on the second run
+            (agent review, MEDIUM, 2026-08-18). Retrying is the safer failure mode: if the
+            notifier is permanently broken the run also exits non-zero, so the cron wrapper
+            alerts on THAT rather than the condition being lost."""
+            try:
+                sp.parent.mkdir(parents=True, exist_ok=True)
+                sp.write_text(json.dumps(sorted(set(at_risk) | seen)))
+            except OSError as e:
+                print(f"[finalize-all] could not persist unauditable state ({e}) — "
+                      f"alert will repeat next run", file=sys.stderr)
+        shown = new_ids[:10]
+        more = f" (+{len(new_ids)-10} more)" if len(new_ids) > 10 else ""
+        msg = (f"{', '.join(shown)}{more} carry reviewer labels on PRE-EVIDENCE-FIX evidence "
+               f"(head excerpts that cannot show what matched). Their confirmed_fp is not "
+               f"re-verifiable. Re-run: fp_measure.py <id> --write-artifact, then re-label.")
+        notify = Path.home() / "bin" / "notify.sh"
+        if not notify.exists():
+            print(f"[finalize-all] notify.sh absent — NOT pushed (will retry next run): {msg}",
+                  file=sys.stderr)
+            return len(new_ids), "notifier-absent"
+        import subprocess
+        r = subprocess.run([str(notify), "FP-gate: unauditable artifacts carry labels",
+                            msg, "--priority", "high", "--channel", "auto"],
+                           timeout=20, check=False)
+        if r.returncode != 0:
+            print(f"[finalize-all] notify.sh exited {r.returncode} — push NOT confirmed: "
+                  f"{new_ids}", file=sys.stderr)
+            return len(new_ids), "send-failed"
+        _persist()          # confirmed delivered — only now suppress repeats
+        return len(new_ids), "ok"
+    except Exception as e:  # noqa: BLE001 — cron safety; the status string carries the failure
+        print(f"[finalize-all] unauditable-notify failed ({type(e).__name__}: {e})",
+              file=sys.stderr)
+        return 0, "send-failed"
+
+
 def _run_finalize_all() -> int:
     """CLI entry for --finalize-all: finalize every artifact, print a summary, notify on
     newly-ready, and exit NON-ZERO if any artifact errored (so a cron wrapper surfaces it —
@@ -734,6 +866,9 @@ def _run_finalize_all() -> int:
             print(f"  UNRECOGNIZED {r['scanner_id']}: {r['reason']}", file=sys.stderr)
         else:
             extra = f"  [unknown labels: {r['unknown_labels']}]" if r["unknown_labels"] else ""
+            if not r.get("auditable", True):
+                extra += "  [UNAUDITABLE: pre-evidence-fix artifact — labels cannot be " \
+                         "re-verified from it; re-run fp_measure.py <id> --write-artifact]"
             print(f"  {r['scanner_id']}: {r['fires_labeled']}/{r['fires_total']} resolved, "
                   f"confirmed_fp={r['confirmed_fp']} — {r['decision']}{extra}")
     _notify_ready(ready)
@@ -742,14 +877,40 @@ def _run_finalize_all() -> int:
     # `tail -1`) because stderr is unbuffered while stdout is block-buffered, so ERROR/UNRECOGNIZED
     # lines can physically precede this one in the cron log. flush=True so a SIGTERM'd run
     # still emits it (block-buffered stdout is otherwise lost when a signal cuts a run).
+    unauditable = [r["scanner_id"] for r in finalized if not r.get("auditable", True)]
+    n_owed = len({str(r.get("scanner_id")) for r in finalized
+                  if isinstance(r, dict) and not r.get("auditable", True)
+                  and isinstance(r.get("fires_labeled"), int) and r["fires_labeled"] > 0})
+    # Machine-readable and emitted EVERY run, so "no unauditable artifacts" is an observed
+    # zero rather than an absence of output. Silence must never be the success signal.
     print(f"[finalize-all] SUMMARY finalized={len(finalized)} ready={len(ready)} "
           f"errors={len(errors)} unrecognized={len(unrecognized)} "
+          f"unauditable={len(unauditable)}"
+          + (f" ({','.join(sorted(unauditable))})" if unauditable else "")
+          + f" at_risk={n_owed}"
+          + f" at={datetime.now(timezone.utc).isoformat()}", flush=True)
+    # SUMMARY is emitted and FLUSHED before the notify call, which can block up to 20s: a
+    # SIGTERM during that window must not cost the whole run's record. (Moving notify ahead of
+    # it — a previous reviewer's suggestion, applied and then caught by the next leg — traded
+    # a lost notify-status for a lost SUMMARY, which is strictly worse.) The notify OUTCOME
+    # therefore rides its own second line; `at_risk=N` above already states an alert was owed,
+    # so a missing NOTIFY line is itself readable as "owed but never reported".
+    n_new, notify_status = _notify_unauditable(finalized)
+    print(f"[finalize-all] NOTIFY owed={n_owed} new={n_new} status={notify_status} "
           f"at={datetime.now(timezone.utc).isoformat()}", flush=True)
     # Exit code means "the tool failed" — the sole meaning a cron `|| notify.sh` wrapper can
     # carry, and what this job's hardcoded alert message already asserts. An unrecognised
     # stem is a real signal but NOT a tool failure, so it rides the summary line, not the
     # exit code: routing it here would make the constant-title cron alert fire on every
     # unrecognised stem, indistinguishable from a genuine tool failure.
+    # A high-priority alert that silently failed to send is a FAILURE of this job: the cron
+    # wrapper's `|| notify.sh` fires on non-zero exit and is the only consumed signal, so a
+    # best-effort push whose failure left the exit code at 0 guaranteed nothing (review HIGH,
+    # 2026-08-18). An owed-but-unconfirmed push now surfaces.
+    if notify_status in ("send-failed", "notifier-absent") and n_new:
+        print(f"[finalize-all] exiting non-zero: {n_new} at-risk artifact(s) were owed a push "
+              f"that could not be confirmed (status={notify_status})", file=sys.stderr)
+        return 1
     return 1 if errors else 0
 
 

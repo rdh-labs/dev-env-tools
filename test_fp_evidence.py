@@ -317,3 +317,152 @@ def test_evidence_kind_allowlist_matches_the_gate():
     eg = _i.module_from_spec(_s); _s.loader.exec_module(eg)
     assert fp.EVIDENCE_KIND_VALUES == eg.FP_EVIDENCE_KINDS, \
         "producer and consumer disagree on which evidence kinds are valid"
+
+
+# ── self-healing: the MONITORING path must report the real health signal ─────
+# The daily cron (`fp_measure.py --finalize-all`, 08:30) printed "hold: confirmed_fp=16"
+# for a101 without ever noting that the 16 was computed from 95 labels formed on head
+# excerpts. Measured 2026-08-18: 4 of 5 artifacts unauditable, 155 labels affected. A
+# monitor that reports a wrong health signal is worse than no monitor.
+
+_EV = [{"matched": ["[action] Nothing"], "excerpt": "[action] Nothing", "label": "TP"}]
+
+
+@pytest.mark.parametrize("art,expected", [
+    ({"schema_v": 2, "evidence_kind": "matched-span", "fires": _EV}, True),
+    ({"schema_v": 2, "evidence_kind": "scanned-region", "fires": _EV}, True),
+    ({"schema_v": "2", "evidence_kind": "matched-span", "fires": _EV}, True),
+    ({"schema_v": 3, "evidence_kind": "matched-span", "fires": _EV}, True),
+    ({"schema_v": 1, "evidence_kind": "matched-span", "fires": _EV}, False),
+    ({"schema_v": 2, "evidence_kind": "head-excerpt", "fires": _EV}, False),
+    ({"schema_v": 2, "fires": _EV}, False),
+    ({}, False),
+    ({"schema_v": 2.9, "evidence_kind": "matched-span", "fires": _EV}, False),
+    ({"schema_v": True, "evidence_kind": "matched-span", "fires": _EV}, False),
+    # THIRD condition, added 2026-08-18: metadata may CLAIM auditability while the fires
+    # carry none. The monitor previously mirrored only 2 of the gate's 3 checks and so
+    # reported "auditable" for artifacts the gate declined — a monitor disagreeing with the
+    # thing it monitors (agent review, HIGH; reproduced live).
+    ({"schema_v": 2, "evidence_kind": "matched-span",
+      "fires": [{"excerpt": "head only", "label": "TP"}]}, False),
+    ({"schema_v": 2, "evidence_kind": "matched-span",
+      "fires": [{"matched": ["   "], "label": "TP"}]}, False),
+    ({"schema_v": 2, "evidence_kind": "matched-span", "fires": "not-a-list"}, False),
+])
+def test_auditability_predicate_both_polarities(art, expected):
+    """Mirrors ALL THREE of evidence_gate's auditability checks. Parametrized over BOTH
+    polarities so a predicate that always returned False could not pass."""
+    assert fp._artifact_auditable(art) is expected
+
+
+def test_monitor_and_gate_agree_on_the_metadata_claim_case():
+    """PARITY TEST. The monitor must not report healthy what the gate declines. This exact
+    artifact shape (metadata claims matched-span, fires carry head excerpts) is the one that
+    diverged."""
+    import importlib.util as _i, os as _o, json as _j, tempfile as _t
+    _o.environ["EVIDENCE_GATE_NO_LOG"] = "1"
+    egp = Path.home()/".claude/hooks/stop/evidence_gate.py"
+    if not egp.exists():
+        pytest.skip("evidence_gate.py not deployed")
+    _s = _i.spec_from_file_location("eg_parity", egp)
+    eg = _i.module_from_spec(_s); _s.loader.exec_module(eg)
+    d = Path(_t.mkdtemp()); eg.FP_GATE_DIR = d
+    art = {"schema_v": 2, "evidence_kind": "matched-span", "fires_total": 1,
+           "fires_labeled": 1, "confirmed_fp": 0,
+           "fires": [{"excerpt": "head only", "label": "TP"}]}
+    (d / "zz.json").write_text(_j.dumps(art))
+    assert fp._artifact_auditable(art) is False
+    assert eg._fp_artifact_admits_promotion("zz")[0] is False
+
+
+def _notify_env(monkeypatch, tmp_path, notifier_exists=True):
+    """Deterministic notification harness.
+
+    REVIEW DEFECT THIS FIXES (HIGH, gpt-5.6-sol 2026-08-18): the previous helper mocked only
+    `subprocess.run`, while production first checks `Path.home()/"bin"/"notify.sh"` exists.
+    The positive test therefore passed ONLY on a machine that happens to have that file — in
+    clean CI it would record no call and fail. A test whose result depends on the developer's
+    home directory is not a test."""
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / ".claude" / "state").mkdir(parents=True)
+    if notifier_exists:
+        n = home / "bin" / "notify.sh"
+        n.write_text("#!/bin/sh\nexit 0\n")
+        n.chmod(0o755)
+    monkeypatch.setattr(fp.Path, "home", staticmethod(lambda: home))
+    calls = []
+    class _R:
+        returncode = 0
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (calls.append(a[0]), _R())[1])
+    return calls
+
+
+def test_notify_fires_on_unauditable_with_labels(monkeypatch, tmp_path):
+    """THE trigger. Note it does NOT depend on confirmed_fp: gating on confirmed_fp>0 was
+    CIRCULAR — that number is derived from the very labels whose integrity is in doubt."""
+    calls = _notify_env(monkeypatch, tmp_path)
+    n, status = fp._notify_unauditable([
+        {"scanner_id": "a101", "auditable": False, "fires_total": 95, "fires_labeled": 95,
+         "confirmed_fp": 16}])
+    assert n == 1 and status == "ok" and len(calls) == 1
+
+
+def test_notify_is_state_transition_not_level(monkeypatch, tmp_path):
+    """ALERT-FATIGUE GUARD: the SECOND run over the same artifact must stay silent."""
+    calls = _notify_env(monkeypatch, tmp_path)
+    rows = [{"scanner_id": "a101", "auditable": False, "fires_total": 95, "fires_labeled": 95,
+             "confirmed_fp": 16}]
+    assert fp._notify_unauditable(rows) == (1, "ok")
+    calls.clear()
+    n, status = fp._notify_unauditable(rows)
+    assert (n, status) == (0, "no-new") and calls == []
+
+
+def test_notify_fires_again_for_a_newly_seen_artifact(monkeypatch, tmp_path):
+    """NEGATIVE CONTROL for the suppression: dedupe must not become permanent silence."""
+    calls = _notify_env(monkeypatch, tmp_path)
+    fp._notify_unauditable([{"scanner_id": "a101", "auditable": False, "fires_total": 5,
+                             "fires_labeled": 5, "confirmed_fp": 0}])
+    calls.clear()
+    n, status = fp._notify_unauditable([
+        {"scanner_id": "a101", "auditable": False, "fires_total": 5, "fires_labeled": 5,
+         "confirmed_fp": 0},
+        {"scanner_id": "b123", "auditable": False, "fires_total": 60, "fires_labeled": 60,
+         "confirmed_fp": 16}])
+    assert n == 1 and status == "ok" and len(calls) == 1
+
+
+@pytest.mark.parametrize("row", [
+    {"scanner_id": "zz", "auditable": True,  "fires_total": 5, "fires_labeled": 5},   # auditable
+    {"scanner_id": "zz", "auditable": False, "fires_total": 5, "fires_labeled": 0},   # no labels yet
+])
+def test_notify_stays_silent_when_there_is_no_integrity_problem(monkeypatch, tmp_path, row):
+    calls = _notify_env(monkeypatch, tmp_path)
+    n, status = fp._notify_unauditable([row])
+    assert (n, status) == (0, "no-new") and calls == []
+
+
+def test_notify_reports_absent_notifier_rather_than_vanishing(monkeypatch, tmp_path, capsys):
+    """No silent failure: an owed push that cannot be sent must be REPORTED and must return a
+    status the caller can couple to the exit code."""
+    _notify_env(monkeypatch, tmp_path, notifier_exists=False)
+    n, status = fp._notify_unauditable([
+        {"scanner_id": "zz", "auditable": False, "fires_total": 1, "fires_labeled": 1}])
+    assert n == 1 and status == "notifier-absent"
+    assert "notify.sh absent" in capsys.readouterr().err
+
+
+def test_notify_never_raises_on_malformed_rows(monkeypatch, tmp_path):
+    """Runs inside cron. A row missing scanner_id, a non-dict, a None — none may raise."""
+    _notify_env(monkeypatch, tmp_path)
+    for rows in ([{"auditable": False, "fires_labeled": 3}], ["not-a-dict"], [None], [{}]):
+        n, status = fp._notify_unauditable(rows)
+        assert isinstance(n, int) and isinstance(status, str)
+
+
+def test_auditable_predicate_survives_unicode_digit(monkeypatch):
+    """`"²".isdigit()` is True but `int("²")` RAISES. This crashed _artifact_auditable, which
+    the daily cron calls. Found by cross-family review; reproduced before fixing."""
+    assert fp._artifact_auditable({"schema_v": "²", "evidence_kind": "matched-span"}) is False
