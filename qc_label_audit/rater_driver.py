@@ -49,6 +49,38 @@ _B123_PROMPT = (
 )
 
 
+_A101_PROMPT = (
+    "Below is the `You:` field that closes an agent response, plus the other `You:` values in "
+    "the same response tail. A gate flagged it for deferring an AGENT-EXECUTABLE action behind "
+    "an open-ended 'say the word' trigger instead of doing it or giving a recommendation.\n\n"
+    "Answer TP if the flag is RIGHT: the field hands the user an action the agent could simply "
+    "have performed, with no recommendation and no described alternative.\n"
+    "Answer FP if the flag is WRONG. It is WRONG when any of these hold:\n"
+    "  - the deferred thing REQUIRES the user (git push, sending anything externally, granting "
+    "approval, credentials, physical presence) — asking is then correct;\n"
+    "  - the field CARRIES a recommendation in any wording ('(recommended)', 'I recommend', "
+    "'I'd proceed', 'the highest-value start is');\n"
+    "  - it offers a genuine CHOICE between described options, or two venues for the same "
+    "settled task (do it here vs next session) — that is routing, not a deferred decision.\n\n"
+    "Read ONLY what is shown. Answer with EXACTLY ONE TOKEN, TP or FP. No other output."
+    "\n\n---\n{window}"
+)
+
+
+def fire_id(fire: dict, index: int) -> str:
+    """STABLE per-fire identity for joining rater rows back to fires.
+
+    NOT `source`. verdict.py keyed rater rows by source, which is only unique when an artifact
+    holds at most one fire per transcript — true of A13 (30/30) and b123 (60/60), and FALSE of
+    a101 (123 fires across 90 sources). Keying by source there would make 33 fires inherit
+    ANOTHER fire's label — the same mis-assignment class fixed in fp_measure._carry_labels.
+    Prefers record_digest (sha256 of the response); falls back to source+index."""
+    d = fire.get("record_digest")
+    if isinstance(d, str) and d:
+        return f"sha256:{d}"
+    return f"idx:{fire.get('source')}#{index}"
+
+
 def _tag(gate: str, meta: dict) -> str:
     if gate == "A13":
         return ", ".join(meta.get("block_ids") or []) or "(unknown prior block)"
@@ -77,7 +109,7 @@ def _call(cmd: list[str], prompt: str) -> str:
 
 def run(gate: str, limit: int = 0) -> dict:
     art = json.loads((ARTIFACT_DIR / f"{gate}.json").read_text())
-    tmpl = _A13_PROMPT if gate == "A13" else _B123_PROMPT
+    tmpl = {"A13": _A13_PROMPT, "a101": _A101_PROMPT}.get(gate, _B123_PROMPT)
     rows = []
     fam_ok = {name: 0 for name in RATERS}
     fires = art.get("fires", [])
@@ -85,7 +117,7 @@ def run(gate: str, limit: int = 0) -> dict:
         fires = fires[:limit]
     for i, f in enumerate(fires):
         prompt = tmpl.format(tag=_tag(gate, f.get("_meta", {})), window=f.get("excerpt", ""))
-        row = {"source": f.get("source")}
+        row = {"source": f.get("source"), "fire_id": fire_id(f, i)}
         for name, cmd in RATERS.items():
             lab = _call(cmd, prompt)
             row[name] = lab
@@ -105,7 +137,7 @@ def run(gate: str, limit: int = 0) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Two-family LLM rater driver for the QC label audit.")
-    ap.add_argument("--gate", required=True, choices=["A13", "b123"])
+    ap.add_argument("--gate", required=True, choices=["A13", "b123", "a101"])
     ap.add_argument("--limit", type=int, default=0, help="rate only the first N fires (E2E smoke)")
     ap.add_argument("--write", action="store_true", help=f"write {ARTIFACT_DIR}/<gate>.raters.json")
     args = ap.parse_args()

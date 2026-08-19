@@ -79,11 +79,14 @@ def run(gate: str, use_tiebreak: bool) -> dict:
     anchor_rows = json.loads(anchor_path.read_text())["rows"] if anchor_path.exists() else []
     anchor_by_src = {r["source"]: r["anchor_label"] for r in anchor_rows}
 
-    rater_by_src = {r["source"]: r for r in raters["rows"]}
+    # JOIN ON fire_id, NOT source. Keying by source silently collapses multiple fires from
+    # one transcript onto a single rater row — 33 of a101's 123 fires would have inherited
+    # another fire's label. A13/b123 are one-fire-per-source so the defect never surfaced.
+    rater_by_id = {r.get("fire_id") or r.get("source"): r for r in raters["rows"]}
     consensus_labels, codex_labels, deepseek_labels, anchor_labels = [], [], [], []
-    for f in art["fires"]:
+    for _i, f in enumerate(art["fires"]):
         src = f.get("source")
-        rr = rater_by_src.get(src, {})
+        rr = rater_by_id.get(rd.fire_id(f, _i), {})
         cx, ds = rr.get("codex", "uncertain"), rr.get("deepseek", "uncertain")
         # tie-break prompt: reuse the rater window (kept minimal — only on genuine disagreement)
         tie_prompt = None
