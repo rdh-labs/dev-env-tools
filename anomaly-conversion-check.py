@@ -107,6 +107,30 @@ def parse_jsonl(text: str, repo: Path | None) -> list[tuple[str, str]]:
     tables: a sha that resolves AND names a triggered artifact is BUILT; a sha that
     resolves without a trigger is SHIPPED. The ledger's own `closure` field is NOT
     trusted — reading it back would be the mirror again.
+
+    DO NOT QUOTE THIS PATH'S HEADLINE NUMBER. Measured on first run, 91 records:
+    BUILT=0 SHIPPED=4 TESTED=5 WAIVED=12 PROSE=70, 18.7%. Both figures below are
+    MATCHER ARTIFACTS, not properties of the ledger, and each was characterised
+    before the number was allowed near a report:
+
+      1. BUILT=0 is guaranteed by construction. has_trigger() searches the CELL for
+         a .py/.sh filename, and a ledger pointer is a SHA. Only 13 of 91 cells
+         contain a filename at all, so 78 records can never reach BUILT however
+         well they are remediated.
+      2. sha_resolves() takes ONE repo, while ledger pointers are repo-QUALIFIED
+         across four (bin:, share:, tools:, dev-env-config:). A bin: sha checked
+         against ~/dev/share does not resolve and grades PROSE. That is why 52 of
+         the 61 pointer-carrying records landed in PROSE.
+
+    Genuinely closed by wiring this: the ledger now HAS an external reader, where
+    before it had none and its `built` count was uncontradictable by anything.
+    NOT closed: this reader cannot yet grade it correctly. The fix for both is to
+    resolve repo:sha per-repo and derive the artifact from the COMMIT'S CHANGED
+    FILES rather than from cell text — the same correction the session register
+    applied to its own grader in PART 9a.
+
+    A wired reader emitting a confident wrong number is worse than no reader: it
+    looks like the falsifier that was missing.
     """
     import json
     out = []
