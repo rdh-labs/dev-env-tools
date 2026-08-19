@@ -27,6 +27,7 @@ import re
 import os
 import shutil
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -108,6 +109,70 @@ def already_durable(path: Path) -> Path | None:
     # is_relative_to, NOT startswith: "/home/u/dev-old" string-prefixes "/home/u/dev" and
     # would have been wrongly excused as durable.
     return target if any(target.is_relative_to(r) for r in DURABLE_ROOTS) else None
+
+
+def unattributed_root_files(durable: Path, root: Path | None = None) -> list[dict]:
+    """LOOSE files sitting directly in TMP_ROOT, belonging to no session subtree.
+
+    THE GAP THIS CLOSES (found 2026-08-19, by the user, in this tool). sweep() resolves
+    /tmp/claude-1001/<project>/<session> and searches only that subtree, so anything written
+    to the TMP ROOT is outside it BY CONSTRUCTION -- structurally the same defect as the
+    original incident, where files created AFTER a rescue were outside it by construction.
+    Measured when found: 19 loose files, including three reusable mutation harnesses and two
+    review-leg outputs. The tool would have printed COMPLETE with all 19 unsaved.
+
+    WHY THE BOUNDARY WAS NEVER PROBED: scoping by session id is what makes attribution
+    SOUND, so the boundary was also the correctness argument, and widening it looks like a
+    regression rather than a fix. The tool's own tests seeded files inside the session dir --
+    a test built from the same assumption as the code cannot falsify that assumption.
+
+    THIS DOES NOT AUTO-RESCUE THEM, deliberately. A loose root file has no session
+    attribution; in a multi-session workspace it may belong to a peer, and blind-copying
+    another session's scratch into a shared repo is a worse failure than reporting it.
+    Reporting is the fix: the caller must not be able to see "clean" while these exist.
+
+    THIS IS ORPHAN RECONCILIATION, which is a solved genre and was NOT invented here. The
+    standard shape (object-storage reconciliation workers; pg_verifybackup's manifest form)
+    is: compare the store against the record on a SCHEDULE, be idempotent, and REPORT
+    orphans rather than delete or auto-claim them. Two things adopted from that prior art
+    that a first draft of this function did not have:
+      1. it is called from all_sessions() -- the SCHEDULED path -- not only on demand.
+         all_sessions() skipped loose files too (`if not proj.is_dir(): continue`), so the
+         blind spot existed in both modes and fixing only the on-demand one would have left
+         the autonomous path blind, which is the worse of the two.
+      2. AGE against the retention deadline. /tmp retention here is ~24-36h, so an orphan is
+         not a flat fact: at 2h it is a note, at 30h it is nearly lost. Reporting age is the
+         RPO idea from backup-coverage tooling and makes the list triageable instead of long.
+    """
+    # SWEEP_ORPHAN_ROOT exists so this is TESTABLE in isolation. Without it the orphan scan
+    # always reads the real /tmp/claude-1001, so a control asserting "clean" would flip the
+    # moment any session left a loose file -- an environment-dependent test, which is not a
+    # test. Caught immediately: adding the orphan check turned this suite's own negative
+    # control red because 22 real orphans were sitting there.
+    root = root or Path(os.environ.get("SWEEP_ORPHAN_ROOT") or TMP_ROOT)
+    if not root.exists():
+        return []
+    dst_hashes = content_index(durable)
+    now = time.time()
+    out = []
+    for p in sorted(root.iterdir()):
+        if not p.is_file():
+            continue
+        d = digest(p)
+        if d is not None and d in dst_hashes:
+            continue                       # already durable, byte-identical
+        try:
+            st = p.stat()
+            size_mb, age_h = st.st_size / 1_048_576, (now - st.st_mtime) / 3600
+        except OSError:
+            size_mb, age_h = 0.0, 0.0
+        out.append({"name": p.name, "path": str(p), "size_mb": round(size_mb, 2),
+                    "age_hours": round(age_h, 1),
+                    # ~24-36h retention: past 20h an orphan is close enough to the deadline
+                    # that "I'll get it next session" is no longer a safe assumption.
+                    "near_deadline": age_h >= 20.0,
+                    "unreadable": d is None})
+    return out
 
 
 def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0, src_override: Path | None = None):
@@ -569,6 +634,25 @@ def main() -> int:
         # Named, never silent: the reader must be able to check this judgement.
         print(f"  {len(result['durable_elsewhere'])} symlink(s) already durable elsewhere "
               f"(e.g. {result['durable_elsewhere'][0]['target']})")
+
+    # ORPHAN RECONCILIATION always prints, including the zero case. A line that appears only
+    # on failure makes silence ambiguous -- the reader cannot tell "no orphans" from "this
+    # build does not check". That ambiguity is the defect this whole tool exists to remove.
+    orphans = unattributed_root_files(args.durable.expanduser())
+    if orphans:
+        near = [o for o in orphans if o["near_deadline"]]
+        print(f"  ORPHAN RECONCILIATION: {len(orphans)} unattributed file(s) loose in "
+              f"{TMP_ROOT} — outside every session subtree, so no sweep covers them"
+              + (f"; {len(near)} PAST 20h and near the ~24-36h retention deadline" if near else ""))
+        for o in sorted(orphans, key=lambda x: -x["age_hours"])[:10]:
+            mark = " [NEAR DEADLINE]" if o["near_deadline"] else ""
+            print(f"    ORPHAN  {o['name']}  ({o['size_mb']}MB, {o['age_hours']}h old){mark}")
+        if len(orphans) > 10:
+            print(f"    ... and {len(orphans) - 10} more")
+        print("    NOT auto-rescued: a loose root file has no session attribution and may "
+              "belong to a peer. Copy deliberately.")
+    else:
+        print(f"  ORPHAN RECONCILIATION: 0 unattributed files in {TMP_ROOT}")
 
     if result["verdict"] == "MISSING":
         for m in result["missing"]:
