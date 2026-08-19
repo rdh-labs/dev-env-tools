@@ -151,8 +151,95 @@ def parse_jsonl(text: str, repo: Path | None) -> list[tuple[str, str]]:
         elif rec.get("closure") == "open" or not cell.strip():
             out.append((rec["what"][:80], "PROSE"))
         else:
-            out.append((rec["what"][:80], classify(cell, repo)))
+            out.append((rec["what"][:80], grade_pointer(rec.get("closure_evidence") or "")))
     return out
+
+
+# ── repo-qualified pointer grading ────────────────────────────────────────────────────
+LEDGER_REPOS = {
+    "bin":            Path.home()/"bin",
+    "share":          Path.home()/"dev/share",
+    "tools":          Path.home()/"dev/infrastructure/tools",
+    "dev-env-config": Path.home()/"dev/infrastructure/dev-env-config",
+}
+HEARTBEAT = Path.home()/".metrics/scheduled-check-heartbeat.jsonl"
+
+
+def _ran_checks() -> set:
+    """Names of scheduled checks that have ACTUALLY EXECUTED at least once.
+
+    THE DISTINCTION THIS EXISTS FOR. An adversarial review of this estate's own
+    self-assessment found its headline rate counted artifacts that were SCHEDULED, and
+    every one of them had been wired the same day: 4 of 5 had never run. Measuring
+    "does it fire" on the day you wire it measures INTENT. The heartbeat file has existed
+    all along and no grader read it.
+    """
+    import json as _j
+    out = set()
+    try:
+        for line in HEARTBEAT.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                out.add(_j.loads(line).get("check"))
+            except (ValueError, TypeError):
+                continue
+    except OSError:
+        pass
+    return {c for c in out if c}
+
+
+def _scheduled_as(basename: str, cron: str):
+    """The scheduled-check NAME that invokes this artifact, or None.
+
+    BOUNDARY CLASS, NOT \b. `re.search(r'\banomaly-log\b', 'anomaly-log.test.sh')` is TRUE
+    because \b matches before a '.', so a word-boundary matcher does NOT separate a tool from
+    its own test. That exact substitution put two false positives into a published rate, and
+    the remedy shipped for it was itself a \b matcher. The correct class excludes '.' and '-'.
+    """
+    if not re.search(rf"(?<![\w.-]){re.escape(basename)}(?![\w.-])", cron):
+        return None
+    for line in cron.splitlines():
+        if not re.search(rf"(?<![\w.-]){re.escape(basename)}(?![\w.-])", line):
+            continue
+        m = re.search(r"scheduled-check-runner\.sh\s+(\S+)", line)
+        return m.group(1) if m else "__direct__"
+    return None
+
+
+def grade_pointer(spec: str) -> str:
+    """repo:sha -> BUILT / SHIPPED / PROSE, graded on the COMMIT'S CHANGED FILES.
+
+    Never on the cell text: a ledger pointer is a sha, and has_trigger() searches for a
+    FILENAME, so cell-text grading can only ever return SHIPPED for a sha-only pointer.
+    """
+    repo, _, sha = spec.partition(":")
+    d = LEDGER_REPOS.get(repo)
+    if not d or not (d/".git").exists() or not re.fullmatch(r"[0-9a-f]{7,40}", sha or ""):
+        return "PROSE"
+    try:
+        r = subprocess.run(["git", "-C", str(d), "show", "--name-only", "--format=", sha],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return "PROSE"
+    if r.returncode != 0:
+        return "PROSE"
+    try:
+        cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        cron = ""
+    ran = _ran_checks()
+    best = "SHIPPED"
+    for f in (l.strip() for l in r.stdout.splitlines() if l.strip()):
+        name = _scheduled_as(Path(f).name, cron)
+        if name is None:
+            continue
+        # SCHEDULED is not FIRED. Only a heartbeat row promotes to BUILT.
+        if name in ran:
+            return "BUILT"
+        best = "SHIPPED"
+    return best
 
 
 def parse(text: str, repo: Path | None) -> list[tuple[str, str]]:
