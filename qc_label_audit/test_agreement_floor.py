@@ -160,5 +160,64 @@ class Floor(unittest.TestCase):
         self.assertIn("MIXED", a["cause"])   # skew 0.385 -- a 2.25:1 lean, not scatter
 
 
+class UncoveredByMutationScore(unittest.TestCase):
+    """wilson_ci and concordance had ZERO coverage until cosmic-ray said so.
+
+    My hand-picked mutation set scored 7/7 on this module. cosmic-ray 8.7.0 over 716
+    generated mutants scored 377 KILLED / 339 SURVIVED = 52.7%, and 256 of the 339 survivors
+    (75%) sat on lines 165-183 — wilson_ci and concordance — where EVERY mutant survived
+    (114/114, 57/57, 35/35, 26/26). The suite never called either function.
+
+    The lesson is not "I missed two functions". It is that I mutation-tested THE DIFF, not
+    the MODULE: I generated mutants only for code I had just written, so the score measured
+    my attention rather than the suite's coverage. A curated mutant set cannot find a
+    function you forgot exists.
+
+    wilson_ci is not incidental — verdict.py prints its output as the Wilson 95%% CI beside
+    friction_rate, so an untested statistical function was feeding a reported interval.
+    Values below are the published Wilson score interval, not this implementation's output:
+    computing expectations FROM the code under test would assert only that it is
+    self-consistent.
+    """
+
+    def test_wilson_ci_matches_published_values(self):
+        lo, hi = ag.wilson_ci(5, 10)
+        self.assertAlmostEqual(lo, 0.2366, places=3)   # published Wilson 95% for 5/10
+        self.assertAlmostEqual(hi, 0.7634, places=3)
+        lo0, hi0 = ag.wilson_ci(0, 10)
+        self.assertAlmostEqual(lo0, 0.0, places=3)     # zero successes: lower bound pinned
+        self.assertAlmostEqual(hi0, 0.2775, places=3)
+
+    def test_wilson_ci_is_bounded_and_ordered(self):
+        """Edge cases: bounds must stay in [0,1] and lo<=hi at the extremes."""
+        for k, n in ((0, 1), (1, 1), (0, 1000), (1000, 1000), (1, 3)):
+            lo, hi = ag.wilson_ci(k, n)
+            self.assertLessEqual(0.0, lo)
+            self.assertLessEqual(lo, hi)
+            self.assertLessEqual(hi, 1.0)
+
+    def test_wilson_ci_zero_n_is_none_not_a_number(self):
+        """n=0 must not yield a CI. Returning one would be an interval over no data."""
+        self.assertIsNone(ag.wilson_ci(0, 0))
+
+    def test_concordance_counts_only_checkable_pairs(self):
+        r = ag.concordance(["TP", "FP", "TP"], ["TP", "FP", "NA"])
+        self.assertEqual(r["n_checkable"], 2)      # the NA pair is excluded
+        self.assertEqual(r["concordant"], 2)
+        self.assertAlmostEqual(r["rate"], 1.0)
+
+    def test_concordance_disagreement_lowers_the_rate(self):
+        """The discriminating half: agreement and disagreement must differ."""
+        r = ag.concordance(["TP", "FP"], ["TP", "TP"])
+        self.assertEqual(r["n_checkable"], 2)
+        self.assertEqual(r["concordant"], 1)
+        self.assertAlmostEqual(r["rate"], 0.5)
+
+    def test_concordance_no_checkable_pairs_is_none_rate(self):
+        r = ag.concordance(["TP", "FP"], ["NA", "NA"])
+        self.assertEqual(r["n_checkable"], 0)
+        self.assertIsNone(r["rate"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
