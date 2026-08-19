@@ -87,6 +87,50 @@ def sha_resolves(sha: str, repo: Path) -> bool:
         return False
 
 
+def parse_jsonl(text: str, repo: Path | None) -> list[tuple[str, str]]:
+    """JSONL ledger records -> (instance, classification).
+
+    WHY THIS EXISTS. Until 2026-08-19 this tool could read only markdown tables, so
+    ~/dev/share/anomaly-instances.jsonl — the estate's machine-readable anomaly ledger,
+    90+ records across three sessions — was UNREADABLE by the one component able to
+    resolve a closure and grade it. Measured: running this tool against the ledger's
+    markdown mirror returned total=0, because the mirror emits headings and paragraphs
+    and `parse()` takes only `|`-rows whose first cell is a digit.
+
+    The consequence was the deepest finding in that ledger's own register: the `built`
+    count was a number NOTHING OUTSIDE ITS WRITER COULD CONTRADICT. Both the writer and
+    every reader trusted the same field, so agreement between them was a mirror, not a
+    check — the exact defect ("a ledger whose authority is its FORMAT") that the ledger
+    was built to replace, reproduced one layer up.
+
+    This gives it an external falsifier. The grading is deliberately the SAME as for
+    tables: a sha that resolves AND names a triggered artifact is BUILT; a sha that
+    resolves without a trigger is SHIPPED. The ledger's own `closure` field is NOT
+    trusted — reading it back would be the mirror again.
+    """
+    import json
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            continue                      # same rule as a malformed table row: skip, do not crash
+        if not isinstance(rec, dict) or not rec.get("what"):
+            continue
+        # `closure_evidence` is the pointer; `closure` is the CLAIM. Grade the pointer.
+        cell = f"{rec.get('closure_evidence') or ''} {rec.get('evidence') or ''}"
+        if rec.get("closure") == "waived":
+            out.append((rec["what"][:80], "WAIVED"))
+        elif rec.get("closure") == "open" or not cell.strip():
+            out.append((rec["what"][:80], "PROSE"))
+        else:
+            out.append((rec["what"][:80], classify(cell, repo)))
+    return out
+
+
 def parse(text: str, repo: Path | None) -> list[tuple[str, str]]:
     """Register table rows -> (instance, classification). Rows only; prose is ignored."""
     out = []
@@ -214,7 +258,12 @@ def main() -> int:
         print(f"ERROR: cannot read {args.register}: {exc}", file=sys.stderr)
         return 2
 
-    rows = parse(text, args.repo if args.repo.exists() else None)
+    # Dispatch on CONTENT, not filename. An artifact is JSONL if its first non-blank line
+    # is an object; extension-sniffing would miss a ledger written to any other suffix.
+    first = next((l for l in text.splitlines() if l.strip()), "")
+    rows = (parse_jsonl(text, args.repo if args.repo.exists() else None)
+            if first.lstrip().startswith("{")
+            else parse(text, args.repo if args.repo.exists() else None))
     counts, total, converted, pct, passed = report(rows, args.threshold)
 
     print(marker_line(counts, total, converted, pct, passed))
