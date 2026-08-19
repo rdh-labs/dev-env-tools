@@ -105,8 +105,30 @@ def run(gate: str, use_tiebreak: bool) -> dict:
     art["fires_labeled"] = sum(1 for l in consensus_labels if l in _BINARY)
     art_path.write_text(json.dumps(art, indent=2))
 
-    # fp_measure.finalize() for bookkeeping (independent of the friction-rate verdict)
-    finalize_note = _finalize_bookkeeping(gate)
+    # ── AGREEMENT FLOOR (Dart xd0RMQQ2fb0M) ───────────────────────────────────────────
+    # Computed BEFORE finalize, deliberately. This module's own comment in evidence_gate.py
+    # prescribes gating "on AGREEMENT (kappa floor across >=2 raters) BEFORE computing
+    # confirmed_fp at all" -- and previously finalize() ran unconditionally, so a
+    # confirmed_fp was produced from chance-level raters and then a kappa was reported
+    # beside it, leaving the reader to notice the contradiction. a101 is the worked case:
+    # kappa 0.106 over n=123. A consensus formed from raters agreeing at that level is a
+    # number with a provenance, not a measurement.
+    #
+    # NOT A BARE THRESHOLD VETO. DEC-320 / Dart qcL10RSMREjW (quoted in this file's header)
+    # rules out "a bare Landis-Koch κ>=0.6 veto"; an admissible bar needs a DIAGNOSED cause.
+    # admissibility() supplies one, and the diagnosis is actionable: DIRECTIONAL disagreement
+    # is a threshold mismatch that rubric work can fix, SYMMETRIC disagreement is not.
+    pairs = list(zip(codex_labels, deepseek_labels))
+    adm = ag.admissibility(pairs)
+    if adm["admissible"]:
+        finalize_note = _finalize_bookkeeping(gate)
+    else:
+        finalize_note = (f"BLOCKED BY AGREEMENT FLOOR: kappa="
+                         f"{'undefined' if adm['kappa'] is None else format(adm['kappa'], '.3f')}"
+                         f" < {adm['floor']} over n={adm['n_resolved']} — confirmed_fp NOT "
+                         f"computed. {adm['cause']}")
+        art["confirmed_fp_blocked"] = adm
+        art_path.write_text(json.dumps(art, indent=2))
 
     fp = sum(1 for l in consensus_labels if l == "FP")
     tp = sum(1 for l in consensus_labels if l == "TP")
@@ -114,12 +136,12 @@ def run(gate: str, use_tiebreak: bool) -> dict:
     uncertain = sum(1 for l in consensus_labels if l not in _BINARY)
     friction_rate = (fp / resolved) if resolved else None
     ci = ag.wilson_ci(fp, resolved) if resolved else None
-    pairs = list(zip(codex_labels, deepseek_labels))
     return {
         "gate": gate, "n": len(consensus_labels), "tp": tp, "fp": fp,
         "resolved": resolved, "uncertain": uncertain,
         "friction_rate": friction_rate, "wilson_ci_95": ci,
         "pct_agreement": ag.pct_agreement(pairs), "cohen_kappa": ag.cohen_kappa(pairs),
+        "admissibility": adm,
         "llm_vs_anchor": ag.concordance(consensus_labels, anchor_labels),
         "finalize": finalize_note,
         "per_concern": _b123_breakdown(art, consensus_labels) if gate == "b123" else None,
@@ -181,18 +203,40 @@ def _print_verdict(r: dict) -> None:
         else:
             verdict = f"INSUFFICIENT-EVIDENCE (FP={fp} in [{A13_KEEP_FP},{A13_SUNSET_FP}] — honest band at n={r['n']})"
         print(f"\n>>> A13 (blocking) pre-registered verdict: {verdict}")
-    else:
+    elif g == "b123":
         print("\n>>> b123 EXPLORATORY — NO sunset verdict (precision-of-flag; upstream-"
               "confounded; recency-biased). Per-concern breakdown:")
         for strat, d in (r["per_concern"] or {}).items():
             print(f"    {strat}: TP={d['TP']} FP={d['FP']} uncertain={d['uncertain']}")
+    else:
+        # a101 and any gate added later. It gets its OWN branch rather than falling into
+        # the b123 one, which hard-prints "b123 EXPLORATORY" and a per-concern table that
+        # is None for every other gate -- i.e. it would have labelled an a101 run as b123.
+        print(f"\n>>> {g}: NO pre-registered decision rule exists for this gate. Rate and "
+              f"agreement are reported; NO sunset/keep verdict is implied.")
+
+    # The admissibility verdict prints LAST and unconditionally, because it governs whether
+    # anything above it may be used. Printing it first would let a reader stop at the
+    # friction_rate; printing it only on failure would make silence ambiguous.
+    adm = r.get("admissibility") or {}
+    if adm:
+        state = "ADMISSIBLE" if adm.get("admissible") else "NOT ADMISSIBLE"
+        kap = adm.get("kappa")
+        print(f"\n>>> AGREEMENT FLOOR: {state} — kappa="
+              f"{'undefined' if kap is None else format(kap, '.4f')} vs floor {adm.get('floor')} "
+              f"over n={adm.get('n_resolved')}")
+        if adm.get("cause"):
+            print(f"    diagnosis: {adm['cause']}")
+        if not adm.get("admissible"):
+            print("    => confirmed_fp was NOT computed. Any rate above is DESCRIPTIVE of "
+                  "these labels only and must not be quoted as a measurement.")
     print(f"\nfp_measure bookkeeping: {r['finalize']}")
     print("=" * 64)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Verdict step for the QC label audit.")
-    ap.add_argument("--gate", required=True, choices=["A13", "b123"])
+    ap.add_argument("--gate", required=True, choices=["A13", "b123", "a101"])
     ap.add_argument("--no-tiebreak", action="store_true", help="skip gemini tie-break (disagreements → uncertain)")
     args = ap.parse_args()
     r = run(args.gate, use_tiebreak=not args.no_tiebreak)

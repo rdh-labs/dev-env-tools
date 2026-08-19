@@ -35,6 +35,74 @@ def cohen_kappa(pairs: list[tuple[str, str]]) -> float | None:
     return (po - pe) / (1 - pe)
 
 
+# Krippendorff's lowest conceivable bound for drawing even TENTATIVE conclusions from
+# labelled data; below it, data is conventionally discarded rather than reported. Chosen
+# over Landis-Koch's 0.61 "substantial" band deliberately -- see admissibility() -- because
+# what is being drawn here IS a conclusion from labelled data, which is exactly the case
+# Krippendorff's bound governs, whereas Landis-Koch is a descriptive vocabulary for kappa.
+KAPPA_FLOOR = 0.667
+
+
+def admissibility(pairs: list[tuple[str, str]], floor: float = KAPPA_FLOOR) -> dict:
+    """Is this rater set reliable enough to compute a rate from -- and if not, WHY?
+
+    WHY A DIAGNOSIS AND NOT JUST A THRESHOLD. verdict.py's own header records DEC-320 /
+    Dart qcL10RSMREjW: admissible reliability requires "a rubric-based κ bar + a DIAGNOSED
+    low-κ cause, not a bare Landis-Koch κ>=0.6 veto". A bare threshold tells you the number
+    is untrustworthy and nothing about what to do next, so it gets overridden or ignored.
+    This returns the cause alongside the verdict.
+
+    THE DIAGNOSIS THAT MATTERS is whether disagreement is SYMMETRIC or DIRECTIONAL:
+      directional -- one rater systematically calls TP where the other calls FP. That is a
+        rubric/anchoring defect: the two raters are applying different thresholds, and
+        sharpening the rubric or fixing the prompt can genuinely fix it.
+      symmetric  -- disagreements scatter both ways. That is noise, and rubric iteration
+        will NOT fix it; it means the task as posed is underdetermined for these raters.
+    Conflating the two is why "sharpen the rubric" keeps getting proposed for corpora where
+    it cannot work.
+
+    THREE bands, not two, and the middle one exists because forcing a binary call
+    over-claimed on the first real corpus tried. Bands by |skew|: >=0.50 DIRECTIONAL (about
+    3:1 or worse one way), 0.25-0.50 MIXED, <0.25 SYMMETRIC. a101 measured on its actual
+    per-fire labels lands at skew 0.385 (16 vs 36 of 52 disagreements, kappa 0.1057, n=123)
+    -- a genuine 2.25:1 lean with a third running the other way. Calling that "symmetric,
+    rubric cannot help" would have been as wrong as calling it cleanly directional. MIXED
+    says what is actually known: rubric work may move it partway, and betting the audit on
+    that alone is unwarranted.
+    """
+    res = [(a, b) for a, b in pairs if a in _BINARY and b in _BINARY]
+    n = len(res)
+    k = cohen_kappa(pairs)
+    disagreements = [(a, b) for a, b in res if a != b]
+    a_tp_b_fp = sum(1 for a, b in disagreements if a == "TP")
+    a_fp_b_tp = sum(1 for a, b in disagreements if a == "FP")
+    d = len(disagreements)
+    # Directionality: 1.0 = every disagreement runs the same way, 0.0 = perfectly balanced.
+    skew = abs(a_tp_b_fp - a_fp_b_tp) / d if d else None
+    if k is None:
+        cause = "kappa undefined (n=0, or one rater used a single label throughout)"
+    elif k >= floor:
+        cause = None
+    elif skew is None:
+        cause = f"kappa {k:.3f} below floor; no disagreements to diagnose"
+    elif skew >= 0.50:                                   # >= 3:1 one way
+        cause = (f"DIRECTIONAL disagreement: {a_tp_b_fp} vs {a_fp_b_tp} of {d} (skew "
+                 f"{skew:.2f}). The raters are applying DIFFERENT THRESHOLDS, not guessing. "
+                 f"Rubric/prompt work can plausibly move this above the floor.")
+    elif skew >= 0.25:                                   # roughly 5:3 .. 3:1
+        cause = (f"MIXED disagreement: {a_tp_b_fp} vs {a_fp_b_tp} of {d} (skew {skew:.2f}). "
+                 f"A real lean, but a substantial minority runs the other way. Rubric work "
+                 f"may move this PARTWAY; do NOT assume it alone clears the floor.")
+    else:
+        cause = (f"SYMMETRIC disagreement: {a_tp_b_fp} vs {a_fp_b_tp} of {d} (skew "
+                 f"{skew:.2f}). Scatter in both directions -- the task as posed is "
+                 f"underdetermined for these raters. Rubric iteration will NOT fix this; "
+                 f"the item definition or the rater set has to change.")
+    return {"admissible": bool(k is not None and k >= floor), "kappa": k, "floor": floor,
+            "n_resolved": n, "n_disagreements": d, "skew": skew,
+            "a_tp_b_fp": a_tp_b_fp, "a_fp_b_tp": a_fp_b_tp, "cause": cause}
+
+
 def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
     """Wilson score 95% CI for a proportion k/n. None if n==0."""
     if n == 0:
