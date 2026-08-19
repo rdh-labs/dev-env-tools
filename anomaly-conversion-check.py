@@ -100,6 +100,31 @@ def parse(text: str, repo: Path | None) -> list[tuple[str, str]]:
     return out
 
 
+def marker_line(counts, total, converted, pct, ok) -> str:
+    """The line the SCHEDULED CONSUMER greps. Kept next to report() on purpose.
+
+    scheduled-check-runner.sh matches the regex `BUILT=0|below` against this tool's stdout.
+    The human-readable block prints `  BUILT   0` (spaces, no equals) and `BELOW THRESHOLD`
+    (uppercase, against a case-sensitive grep -qE), so that regex could never match. From the
+    day it was wired, a run reporting 6.1% against a 25% threshold produced STATUS=ok and sent
+    no notification. The check was silent by construction exactly when it had something to say
+    -- the defect the runner's own header says it exists to prevent.
+
+    Found by an adversarial verifier that RAN the pair. Reading either file alone shows
+    nothing wrong; the mismatch lives between them.
+
+    A marker the consumer cannot match is not a lesser problem than no marker. It is the same
+    false all-clear, with an audit trail that reads as healthy.
+
+    Emitting a matchable line here fixes delivery WITHOUT a scheduler edit, which is
+    gate-blocked to agents (SCHEDULE_PERSIST, denied by default).
+    """
+    return ("CONVERSION-MARKER: "
+            + " ".join(f"{k}={counts[k]}" for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE"))
+            + f" total={total} converted={converted} pct={pct:.1f}"
+            + (" at-or-above threshold" if ok else " below threshold"))
+
+
 def report(rows, threshold=THRESHOLD_PCT):
     counts = {k: 0 for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE")}
     for _, k in rows:
@@ -192,6 +217,7 @@ def main() -> int:
     rows = parse(text, args.repo if args.repo.exists() else None)
     counts, total, converted, pct, passed = report(rows, args.threshold)
 
+    print(marker_line(counts, total, converted, pct, passed))
     print(f"ANOMALY CONVERSION: {pct:.1f}% ({converted}/{total} instances closed by something "
           f"that EXISTS)")
     for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE"):
