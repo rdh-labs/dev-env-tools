@@ -30,6 +30,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path.home() / "dev/infrastructure/tools"))
 from fp_measure import _A97_ANOMALY_RE as _AA_RE  # noqa: E402 — reuse the gate's fingerprinted regex, don't retype (desync risk)
+from fp_measure import evidence_gate as _eg  # noqa: E402 — same rule: import A101's live regexes
+_SAY_WORD_RE = _eg._A101_SAY_THE_WORD_RE
+_REC_RE = _eg._A101_RECOMMENDATION_RE
+_AUTH_RE = _eg._A101_AUTH_REQUIRED_RE
 
 ARTIFACT_DIR = Path.home() / ".claude/logs/fp-gate"
 _MEM_RE = re.compile(r"mem_session_summary|mem_save", re.I)
@@ -60,10 +64,44 @@ def _anchor_b123(fire: dict) -> dict:
                       "has_mem": bool(_MEM_RE.search(text))}}
 
 
+def _anchor_a101(fire: dict) -> dict:
+    """Mechanical anchor for A101 (say-the-word deferral).
+
+    WHAT IS *NOT* CHECKABLE HERE, and why. A101's three exclusions (recommendation present,
+    genuine choice offered, action genuinely requires the user) are ALREADY applied by the
+    predicate before it fires — a fire means the SELECTED `You:` value matched none of them.
+    Re-running those regexes therefore proves nothing about the label; it would only restate
+    the fire condition. Reporting them as an anchor LABEL would be a rubber stamp.
+
+    WHAT *IS* checkable: EVIDENCE INTEGRITY. a101's evidence_kind is "scanned-region" — the
+    stored spans are every `You:` value in the tail the predicate examined, so the value that
+    actually fired MUST be among them, and it must match the gate's own trigger regex. If no
+    span matches, the artifact cannot support its own fire and the LLM raters are judging text
+    that does not contain the trigger. That is a mechanical FP, and it is exactly the class of
+    defect this session found in the artifacts (head excerpts that could not contain the match).
+
+    Everything else is left NA — the ambiguous middle belongs to the raters, per this module's
+    stated design.
+    """
+    spans = [m for m in (fire.get("matched") or []) if isinstance(m, str)]
+    text = fire.get("excerpt", "")
+    hay = spans or [text]
+    trigger = any(_SAY_WORD_RE.search(x) for x in hay)
+    facts = {
+        "n_spans": len(spans),
+        "trigger_in_evidence": trigger,
+        # Reported as FACTS only — never as the label, for the reason in the docstring.
+        "recommendation_somewhere": any(_REC_RE.search(x) for x in hay),
+        "auth_required_somewhere": any(_AUTH_RE.search(x) for x in hay),
+    }
+    # The ONLY mechanically decidable extreme: the evidence does not contain the trigger.
+    return {"anchor_label": ("FP" if not trigger else "NA"), "facts": facts}
+
+
 def run(gate: str) -> dict:
     path = ARTIFACT_DIR / f"{gate}.json"
     art = json.loads(path.read_text())
-    fn = _anchor_a13 if gate == "A13" else _anchor_b123
+    fn = {"A13": _anchor_a13, "a101": _anchor_a101}.get(gate, _anchor_b123)
     rows = [{"source": f.get("source"), **fn(f)} for f in art.get("fires", [])]
     counts: dict[str, int] = {}
     for r in rows:
@@ -73,7 +111,7 @@ def run(gate: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Deterministic mechanical anchor for the QC label audit.")
-    ap.add_argument("--gate", required=True, choices=["A13", "b123"])
+    ap.add_argument("--gate", required=True, choices=["A13", "b123", "a101"])
     ap.add_argument("--write", action="store_true", help=f"write {ARTIFACT_DIR}/<gate>.anchor.json")
     args = ap.parse_args()
     out = run(args.gate)
