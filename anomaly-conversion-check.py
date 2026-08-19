@@ -170,6 +170,7 @@ LEDGER_REPOS = {
     "dev-env-config": Path.home()/"dev/infrastructure/dev-env-config",
 }
 HEARTBEAT = Path.home()/".metrics/scheduled-check-heartbeat.jsonl"
+_PROMOTED_BY: dict = {}   # spec -> the changed file that earned BUILT (audit trail for the over-count above)
 
 
 def _ran_checks() -> set:
@@ -189,9 +190,18 @@ def _ran_checks() -> set:
             if not line.startswith("{"):
                 continue
             try:
-                out.add(_j.loads(line).get("check"))
+                rec = _j.loads(line)
             except (ValueError, TypeError):
                 continue
+            # STATUS MATTERS. scheduled-check-runner writes status=unknown when a check
+            # "could not RUN" — its own comment says "UNKNOWN is never a pass" — and
+            # notify_failed rows carry no rc at all. Counting either as "has executed" means
+            # a cron entry whose target was DELETED writes a heartbeat row every week and
+            # permanently promotes every commit that touches it. `ok` and `adverse` are both
+            # real executions: adverse means the check ran and FOUND something, which is a
+            # detector working, not failing — deliberately not over-corrected past that.
+            if rec.get("status") in ("ok", "adverse") and rec.get("rc") is not None:
+                out.add(rec.get("check"))
     except OSError:
         pass
     return {c for c in out if c}
@@ -268,6 +278,14 @@ def grade_pointer(spec: str) -> str:
         # the schedule invokes the artifact without the runner wrapper, so no heartbeat exists
         # for it and it can never be promoted — SHIPPED is the honest floor, not a bug.
         if any(n in ran for n in names):
+            # KNOWN OVER-COUNT, recorded rather than hidden: a commit touching MANY files is
+            # promoted by whichever ONE of them is scheduled, with nothing checking that it is
+            # the cited remediation. Real case: tools:0fb6004 changes agreement.py (not
+            # scheduled), its test (not scheduled) and session-artifact-sweep.py (scheduled) —
+            # an anomaly remediated by agreement.py grades BUILT. Unresolvable from a sha
+            # alone; the fix is a ledger schema carrying repo:sha:PATH. Until then the
+            # promoting file is emitted so the credit is auditable.
+            _PROMOTED_BY[spec] = f
             return "BUILT"
         best = "SHIPPED"
     return best
