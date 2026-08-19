@@ -163,6 +163,10 @@ def unattributed_root_files(durable: Path, root: Path | None = None) -> list[dic
             continue                       # already durable, byte-identical
         try:
             st = p.stat()
+            # age-only: mtime is used ONLY to rank orphans against the ~24-36h retention
+            # deadline. Attribution is deliberately NOT inferred from it -- a loose root
+            # file has no owner and this code never guesses one; that is why orphans are
+            # reported rather than auto-rescued.
             size_mb, age_h = st.st_size / 1_048_576, (now - st.st_mtime) / 3600
         except OSError:
             size_mb, age_h = 0.0, 0.0
