@@ -72,7 +72,13 @@ def admissibility(pairs: list[tuple[str, str]], floor: float = KAPPA_FLOOR) -> d
     """
     res = [(a, b) for a, b in pairs if a in _BINARY and b in _BINARY]
     n = len(res)
-    k = cohen_kappa(pairs)
+    # GATES ON SCOTT'S PI, not Cohen's kappa: 0.667 is Krippendorff's bound, and for two
+    # raters on nominal data Krippendorff's alpha IS Scott's pi. Cohen credits rater bias as
+    # agreement and is therefore lenient against this threshold (+0.0257 on a101). Cohen is
+    # still REPORTED, because every prior artifact in this repo records kappa and dropping it
+    # would silently break comparability with them.
+    k = scott_pi(pairs)
+    k_cohen = cohen_kappa(pairs)
     disagreements = [(a, b) for a, b in res if a != b]
     a_tp_b_fp = sum(1 for a, b in disagreements if a == "TP")
     a_fp_b_tp = sum(1 for a, b in disagreements if a == "FP")
@@ -114,9 +120,46 @@ def admissibility(pairs: list[tuple[str, str]], floor: float = KAPPA_FLOOR) -> d
     # exist at all -- and all 11 controls stayed green, because none of them touched it.
     # Caught the moment a control was written for it. An addition no test asserts is
     # indistinguishable from an addition that was never made.
-    return {"admissible": bool(k is not None and k >= floor), "kappa": k, "floor": floor,
+    return {"admissible": bool(k is not None and k >= floor),
+            # `kappa` keeps its name for artifact compatibility but now carries SCOTT'S PI,
+            # the statistic the floor is defined for. `cohen_kappa` is reported alongside so
+            # the difference is visible rather than silently swapped under a reader.
+            "kappa": k, "statistic": "scott_pi", "cohen_kappa": k_cohen, "floor": floor,
             "band": band, "n_resolved": n, "n_disagreements": d, "skew": skew,
             "a_tp_b_fp": a_tp_b_fp, "a_fp_b_tp": a_fp_b_tp, "cause": cause}
+
+
+def scott_pi(pairs: list[tuple[str, str]]) -> float | None:
+    """Scott's pi over resolved binary pairs. None if undefined.
+
+    WHY THIS EXISTS ALONGSIDE cohen_kappa, and it is a correctness fix, not a nicety.
+    The 0.667 floor is KRIPPENDORFF'S bound. For two raters on nominal data Krippendorff's
+    alpha is (asymptotically) SCOTT'S PI, not Cohen's kappa. The two differ in how they
+    compute chance agreement: Cohen uses each rater's OWN marginals, Scott uses the POOLED
+    marginals. Cohen therefore treats systematic rater BIAS as if it were agreement, which
+    makes it the more LENIENT statistic -- so gating Krippendorff's threshold on Cohen's
+    kappa lets data through that the threshold was never meant to admit.
+
+    Measured on the a101 corpus (n=123, po=0.5772):
+        Cohen kappa = 0.1057   (pe 0.5273)
+        Scott pi    = 0.0800   (pe 0.5405)   <- what 0.667 actually governs
+        Cohen is +0.0257 more lenient.
+    Not enough to flip a101, which fails either way. Enough to flip a borderline corpus,
+    which is the only place a floor matters. Found by an independent architecture review;
+    the numbers above were reproduced before the change was made.
+    """
+    res = [(a, b) for a, b in pairs if a in _BINARY and b in _BINARY]
+    n = len(res)
+    if n == 0:
+        return None
+    po = sum(1 for a, b in res if a == b) / n
+    # POOLED marginals -- the single distinction from cohen_kappa.
+    pooled = {c: (sum(1 for a, _ in res if a == c) + sum(1 for _, b in res if b == c)) / (2 * n)
+              for c in _BINARY}
+    pe = sum(p * p for p in pooled.values())
+    if abs(1 - pe) < 1e-12:
+        return None
+    return (po - pe) / (1 - pe)
 
 
 def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float] | None:

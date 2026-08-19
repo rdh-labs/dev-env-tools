@@ -142,7 +142,18 @@ class Floor(unittest.TestCase):
         pairs = [(r.get("codex", "uncertain"), r.get("deepseek", "uncertain")) for r in rows]
         a = ag.admissibility(pairs)
         self.assertEqual(a["n_resolved"], 123)
-        self.assertAlmostEqual(a["kappa"], 0.1057, places=4)      # recorded in a101.json
+        # BOTH statistics pinned. The floor gates on Scott's pi because 0.667 is
+        # Krippendorff's bound and alpha ~= pi for two raters on nominal data; Cohen's kappa
+        # is still reported for comparability with every artifact recorded before the switch.
+        # Cohen uses each rater's own marginals and so credits systematic BIAS as agreement,
+        # making it the more lenient statistic against this threshold -- here by +0.0257.
+        # Pinning both is what makes that gap visible instead of a silent swap under a reader.
+        self.assertEqual(a["statistic"], "scott_pi")
+        self.assertAlmostEqual(a["kappa"], 0.0800, places=4)          # Scott's pi — gated on
+        self.assertAlmostEqual(a["cohen_kappa"], 0.1057, places=4)    # as recorded in a101.json
+        self.assertGreater(a["cohen_kappa"], a["kappa"],
+                           "Cohen must be the more lenient statistic here; if not, the "
+                           "pooled-vs-separate marginal distinction has been broken")
         self.assertAlmostEqual(ag.pct_agreement(pairs), 0.5772, places=4)
         self.assertFalse(a["admissible"])
         self.assertEqual(a["n_disagreements"], 52)
