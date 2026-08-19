@@ -484,6 +484,25 @@ def all_sessions(durable_root: Path) -> int:
         print(f"  NO-RESCUE-DIR  {sid}  {n} file(s) live only in /tmp")
     for sid, n in at_risk:
         print(f"  AT RISK  {sid}  {n} file(s) not in its rescue directory")
+
+    # ORPHAN RECONCILIATION on the SCHEDULED path. This call is the reason the loop above
+    # cannot see loose root files at all: it iterates TMP_ROOT with `if not proj.is_dir():
+    # continue`, so a file sitting directly in the root is skipped before any session is
+    # even considered. Reconciliation is defined as PERIODIC, so the scheduled path is the
+    # one that most needs it -- nobody is watching the on-demand path.
+    #
+    # A review leg caught that this function's docstring ALREADY CLAIMED to be called from
+    # here while the only call site was main(). A false statement in documentation about
+    # wiring that does not exist is precisely the defect this whole family detects, written
+    # inside the fix for it. Wiring it was the correct repair; softening the sentence would
+    # have been the failure.
+    orphans = unattributed_root_files(durable_root)
+    if orphans:
+        near = sum(1 for o in orphans if o["near_deadline"])
+        print(f"  ORPHANS  {len(orphans)} unattributed file(s) loose in {TMP_ROOT}"
+              + (f", {near} past 20h" if near else ""))
+        at_risk = at_risk or [("<tmp-root>", len(orphans))]   # force the non-zero exit below
+
     if at_risk and (NOTIFY := Path.home() / "bin" / "notify.sh").exists():
         body = ", ".join(f"{s}:{n}" for s, n in at_risk)
         p = subprocess.run([str(NOTIFY), "Session artifacts unrescued",

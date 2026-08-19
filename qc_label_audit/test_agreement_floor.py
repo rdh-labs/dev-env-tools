@@ -87,6 +87,41 @@ class Floor(unittest.TestCase):
     # --- the DIAGNOSIS, which is what makes this more than a threshold ---------------
     # DEC-320 rules out "a bare Landis-Koch veto"; the cause is the part that makes the
     # block actionable, so each band gets a control.
+    def test_band_is_a_discrete_key_not_only_prose(self):
+        """`band` must be machine-readable and must AGREE with `cause`.
+
+        Added because the suite was green over an addition it never touched: `band` was
+        introduced and 11 controls still passed without asserting it once. Two review legs
+        asked for the key precisely so callers stop substring-matching an English sentence;
+        a key nothing checks would have shipped the stringly-typed problem with extra steps.
+        The agreement assertion is the load-bearing half — two fields that can disagree are
+        worse than one field.
+        """
+        for pairs, expected in (
+            (mk(tp_tp=30, fp_fp=30), "ADMISSIBLE"),
+            (mk(tp_tp=50), "UNDEFINED"),
+            (mk(tp_tp=20, fp_fp=20, tp_fp=30, fp_tp=2), "DIRECTIONAL"),
+            (mk(tp_tp=20, fp_fp=20, tp_fp=16, fp_tp=36), "MIXED"),
+            (mk(tp_tp=20, fp_fp=20, tp_fp=16, fp_tp=16), "SYMMETRIC"),
+        ):
+            a = ag.admissibility(pairs)
+            self.assertEqual(a["band"], expected)
+            # Case-insensitive: the prose reads "kappa undefined ...", the band is
+            # "UNDEFINED". They agree in substance, which is what must not drift. Forcing
+            # the band's casing into the sentence would damage the human-readable half to
+            # satisfy the machine-readable one.
+            if a["cause"]:                       # cause is None only when ADMISSIBLE
+                self.assertIn(expected.lower(), a["cause"].lower(),
+                              f"band {a['band']} disagrees with cause {a['cause']!r}")
+
+    def test_a101_real_labels_carry_the_mixed_band(self):
+        """Ground truth again: the real corpus must land in MIXED, not just say so in prose."""
+        if not A101.exists():
+            self.skipTest("a101.raters.json not present")
+        rows = json.loads(A101.read_text())["rows"]
+        pairs = [(r.get("codex", "uncertain"), r.get("deepseek", "uncertain")) for r in rows]
+        self.assertEqual(ag.admissibility(pairs)["band"], "MIXED")
+
     def test_directional_band(self):
         a = ag.admissibility(mk(tp_tp=20, fp_fp=20, tp_fp=30, fp_tp=2))
         self.assertIn("DIRECTIONAL", a["cause"])

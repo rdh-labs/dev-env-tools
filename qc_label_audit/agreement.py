@@ -79,27 +79,43 @@ def admissibility(pairs: list[tuple[str, str]], floor: float = KAPPA_FLOOR) -> d
     d = len(disagreements)
     # Directionality: 1.0 = every disagreement runs the same way, 0.0 = perfectly balanced.
     skew = abs(a_tp_b_fp - a_fp_b_tp) / d if d else None
+    # `band` is a discrete key, not just a word inside `cause`. Two independent review legs
+    # flagged the prose-only version: a caller wanting to branch on DIRECTIONAL vs SYMMETRIC
+    # had to substring-match an English sentence, which is the stringly-typed pattern this
+    # workspace keeps getting burned by. `cause` stays for humans; `band` is for code.
+    band = None
     if k is None:
         cause = "kappa undefined (n=0, or one rater used a single label throughout)"
+        band = "UNDEFINED"
     elif k >= floor:
         cause = None
+        band = "ADMISSIBLE"
     elif skew is None:
         cause = f"kappa {k:.3f} below floor; no disagreements to diagnose"
+        band = "NO-DISAGREEMENTS"
     elif skew >= 0.50:                                   # >= 3:1 one way
+        band = "DIRECTIONAL"
         cause = (f"DIRECTIONAL disagreement: {a_tp_b_fp} vs {a_fp_b_tp} of {d} (skew "
                  f"{skew:.2f}). The raters are applying DIFFERENT THRESHOLDS, not guessing. "
                  f"Rubric/prompt work can plausibly move this above the floor.")
     elif skew >= 0.25:                                   # roughly 5:3 .. 3:1
+        band = "MIXED"
         cause = (f"MIXED disagreement: {a_tp_b_fp} vs {a_fp_b_tp} of {d} (skew {skew:.2f}). "
                  f"A real lean, but a substantial minority runs the other way. Rubric work "
                  f"may move this PARTWAY; do NOT assume it alone clears the floor.")
     else:
+        band = "SYMMETRIC"
         cause = (f"SYMMETRIC disagreement: {a_tp_b_fp} vs {a_fp_b_tp} of {d} (skew "
                  f"{skew:.2f}). Scatter in both directions -- the task as posed is "
                  f"underdetermined for these raters. Rubric iteration will NOT fix this; "
                  f"the item definition or the rater set has to change.")
+    # `band` is RETURNED, not merely assigned. The first version of this change set the
+    # variable in two of five branches and never added it to this dict, so the key did not
+    # exist at all -- and all 11 controls stayed green, because none of them touched it.
+    # Caught the moment a control was written for it. An addition no test asserts is
+    # indistinguishable from an addition that was never made.
     return {"admissible": bool(k is not None and k >= floor), "kappa": k, "floor": floor,
-            "n_resolved": n, "n_disagreements": d, "skew": skew,
+            "band": band, "n_resolved": n, "n_disagreements": d, "skew": skew,
             "a_tp_b_fp": a_tp_b_fp, "a_fp_b_tp": a_fp_b_tp, "cause": cause}
 
 
