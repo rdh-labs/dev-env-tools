@@ -147,7 +147,14 @@ def parse_jsonl(text: str, repo: Path | None) -> list[tuple[str, str]]:
         # `closure_evidence` is the pointer; `closure` is the CLAIM. Grade the pointer.
         cell = f"{rec.get('closure_evidence') or ''} {rec.get('evidence') or ''}"
         if rec.get("closure") == "waived":
-            out.append((rec["what"][:80], "WAIVED"))
+            # NOT "WAIVED". A waiver read verbatim from the record's own field is the ledger
+            # grading itself, and `report()` counts WAIVED toward `converted` — so 12 of 15
+            # "converted" records were self-asserted, i.e. 80% of the published rate was the
+            # mirror this docstring claims to have removed. Found by an adversarial ship review
+            # that reduced it to one line: {"what":"x","closure":"waived"} -> pct=100.0.
+            # A waiver is a CLAIM. Only a human-auditable one counts, and this tool cannot
+            # audit it, so it is reported in its own bucket and excluded from `converted`.
+            out.append((rec["what"][:80], "SELF-ASSERTED"))
         elif rec.get("closure") == "open" or not cell.strip():
             out.append((rec["what"][:80], "PROSE"))
         else:
@@ -190,6 +197,12 @@ def _ran_checks() -> set:
     return {c for c in out if c}
 
 
+# Generic wrappers appear on MANY schedule lines and are not the artifact being remediated.
+# Measured: scheduled-check-runner.sh is on 14 lines, and _scheduled_as returned the FIRST
+# (artifact-sweep), so any commit touching the wrapper graded BUILT against an unrelated check.
+_NOT_AN_ARTIFACT = {"scheduled-check-runner.sh", "hook-runner.sh", "notify.sh"}
+
+
 def _scheduled_as(basename: str, cron: str):
     """The scheduled-check NAME that invokes this artifact, or None.
 
@@ -198,14 +211,26 @@ def _scheduled_as(basename: str, cron: str):
     its own test. That exact substitution put two false positives into a published rate, and
     the remedy shipped for it was itself a \b matcher. The correct class excludes '.' and '-'.
     """
+    if basename in _NOT_AN_ARTIFACT:
+        return None
     if not re.search(rf"(?<![\w.-]){re.escape(basename)}(?![\w.-])", cron):
         return None
+    hits = []
     for line in cron.splitlines():
+        if line.lstrip().startswith("#"):
+            continue                      # a commented-out entry does not run (CLI review)
         if not re.search(rf"(?<![\w.-]){re.escape(basename)}(?![\w.-])", line):
             continue
+        hits.append(line)
+    # MULTIPLE LINES IS NOT AMBIGUITY. A first attempt refused on >1 hit, which broke
+    # session-artifact-sweep.py — it is scheduled TWICE (--all-sessions at 07:00/19:00 and
+    # --archive-gate-ledgers hourly). An artifact scheduled twice is more scheduled, not less.
+    # Return every check name; the caller promotes if ANY of them has actually run.
+    names = []
+    for line in hits:
         m = re.search(r"scheduled-check-runner\.sh\s+(\S+)", line)
-        return m.group(1) if m else "__direct__"
-    return None
+        names.append(m.group(1) if m else "__direct__")
+    return names or None
 
 
 def grade_pointer(spec: str) -> str:
@@ -232,11 +257,17 @@ def grade_pointer(spec: str) -> str:
     ran = _ran_checks()
     best = "SHIPPED"
     for f in (l.strip() for l in r.stdout.splitlines() if l.strip()):
-        name = _scheduled_as(Path(f).name, cron)
-        if name is None:
+        # --name-only lists DELETED files too. A commit that removes a scheduled artifact is
+        # the opposite of a remediation that fires (CLI review).
+        if not (d/f).exists():
             continue
-        # SCHEDULED is not FIRED. Only a heartbeat row promotes to BUILT.
-        if name in ran:
+        names = _scheduled_as(Path(f).name, cron)
+        if not names:
+            continue
+        # SCHEDULED is not FIRED. Only a heartbeat row promotes to BUILT. "__direct__" means
+        # the schedule invokes the artifact without the runner wrapper, so no heartbeat exists
+        # for it and it can never be promoted — SHIPPED is the honest floor, not a bug.
+        if any(n in ran for n in names):
             return "BUILT"
         best = "SHIPPED"
     return best
@@ -281,9 +312,9 @@ def marker_line(counts, total, converted, pct, ok) -> str:
 
 
 def report(rows, threshold=THRESHOLD_PCT):
-    counts = {k: 0 for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE")}
+    counts = {k: 0 for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE", "SELF-ASSERTED")}
     for _, k in rows:
-        counts[k] += 1
+        counts[k] = counts.get(k, 0) + 1
     total = len(rows)
     # SHIPPED is NOT converted. A file nobody runs remediates nothing.
     converted = counts["BUILT"] + counts["TESTED"] + counts["WAIVED"]
@@ -294,6 +325,39 @@ def report(rows, threshold=THRESHOLD_PCT):
 def self_check() -> int:
     """Fixtures with known answers. A measurement nobody can falsify is a number, not evidence."""
     ok = []
+    # ── JSONL path fixtures (added 2026-08-19 after an adversarial ship review) ──────────
+    # THE DEFECT THESE CLOSE: stubbing grade_pointer -> "BUILT" moved the headline to 80.2%
+    # and BOTH suites stayed green, because none of the 15 fixtures called any new function
+    # and the contract suite only exercises the markdown path. That is the file's own ACC-3
+    # defect ("gutting parse() to return [] left 8/8 PASSING") reproduced one function over.
+    ok.append(("a waived record is SELF-ASSERTED, never WAIVED — the field is a claim",
+               parse_jsonl('{"what":"x","closure":"waived"}', None) == [("x", "SELF-ASSERTED")]))
+    ok.append(("a self-asserted record does NOT count toward conversion",
+               report([("a", "SELF-ASSERTED"), ("b", "SELF-ASSERTED")], 25.0)[3] == 0.0))
+    ok.append(("parse_jsonl returning nothing is NOT a pass — a gutted parser must be visible",
+               len(parse_jsonl('{"what":"y","closure":"built","closure_evidence":"bin:0000000"}',
+                               None)) == 1))
+    ok.append(("an open record is PROSE, not converted",
+               parse_jsonl('{"what":"z","closure":"open"}', None) == [("z", "PROSE")]))
+    ok.append(("a malformed line is skipped, not crashed on",
+               parse_jsonl('not json\n{"what":"q","closure":"open"}', None) == [("q", "PROSE")]))
+    ok.append(("grade_pointer refuses a mutable ref",
+               grade_pointer("bin:HEAD") == "PROSE"))
+    ok.append(("grade_pointer refuses an unknown repo qualifier",
+               grade_pointer("nosuchrepo:0000000") == "PROSE"))
+    ok.append(("grade_pointer refuses an unresolvable sha",
+               grade_pointer("bin:deadbee") == "PROSE"))
+    _cron_fixture = ("0 7 * * * /x/scheduled-check-runner.sh artifact-sweep /l - -- /y/foo.py\n"
+                     "#0 9 * * * /x/scheduled-check-runner.sh dead /l - -- /y/bar.py\n")
+    ok.append(("_scheduled_as does not match a tool inside its own test filename",
+               _scheduled_as("foo", _cron_fixture) is None))
+    ok.append(("_scheduled_as finds a genuinely scheduled artifact",
+               _scheduled_as("foo.py", _cron_fixture) == ["artifact-sweep"]))
+    ok.append(("_scheduled_as ignores a COMMENTED-OUT schedule line",
+               _scheduled_as("bar.py", _cron_fixture) is None))
+    ok.append(("_scheduled_as refuses a generic wrapper that appears on many lines",
+               _scheduled_as("scheduled-check-runner.sh", _cron_fixture) is None))
+
     ok.append(("an unresolvable SHA is NOT counted as BUILT",
                classify("fixed in deadbeef1", Path("/nonexistent")) != "BUILT"))
     # The above passed even with sha_resolves BYPASSED, because an untriggered cell falls to
