@@ -66,15 +66,30 @@ def classify(cell: str, repo: Path | None) -> str:
     exists regardless of how the prose hedges. A SHA that does not RESOLVE is not BUILT --
     that is the difference between citing a commit and having made one.
     """
+    # A FREE-TEXT WAIVER IS A CLAIM, NOT A CLOSURE — and until 2026-08-20 only the JSONL path
+    # said so. parse_jsonl routes `closure=waived` to SELF-ASSERTED and excludes it from
+    # `converted`; classify() returned WAIVED and report() COUNTED it. Same semantics, opposite
+    # verdict, decided by file extension — and `--register` defaults to a MARKDOWN file, so the
+    # unfixed path was the DEFAULT path. Demonstrated: 4 markdown rows reading "no mechanism
+    # warranted" scored pct=100.0 PASS, while 4 identical JSONL records scored 0.0 BELOW.
+    # Fixing the reachable half and leaving the default is the instance-not-class error this
+    # register catalogues at P4.
     if WAIVED_RE.search(cell):
-        return "WAIVED"
+        return "SELF-ASSERTED"
     for sha in SHA_RE.findall(cell):
         if repo is None or sha_resolves(sha, repo):
             # A SHA proves a file exists. A TRIGGER proves it runs. They are different claims
             # and conflating them is exactly the defect this tool exists to measure.
             return "BUILT" if has_trigger(cell) else "SHIPPED"
+    # TESTED likewise: TESTED_RE is a free-text grep for words like "verified"/"tested". A
+    # named test artifact that EXISTS on disk is evidence; the word is not. Anything else is
+    # the author grading their own paper, which is what SELF-ASSERTED means.
     if TESTED_RE.search(cell):
-        return "TESTED"
+        import re as _re
+        for cand in _re.findall(r"[\w./~-]+\.(?:sh|py)\b", cell):
+            if Path(cand.replace("~", str(Path.home()))).exists():
+                return "TESTED"
+        return "SELF-ASSERTED"
     return "PROSE"
 
 
@@ -431,10 +446,13 @@ def self_check() -> int:
     ok.append(("SHIPPED must NOT count toward conversion",
                report([("a", "SHIPPED"), ("b", "SHIPPED")], 25.0)[3] == 0.0))
     ok.append(("'ACKs only; unbuilt' is PROSE", classify("ACKs only; unbuilt", None) == "PROSE"))
-    ok.append(("an explicit waiver is WAIVED, not PROSE",
-               classify("no mechanism warranted -- one-off", None) == "WAIVED"))
-    ok.append(("a sabotage-proven fixture counts as TESTED",
-               classify("sabotage-proven fixture added", None) == "TESTED"))
+    ok.append(("a free-text waiver is SELF-ASSERTED, not WAIVED — inverted 2026-08-20; the "
+               "old assertion PINNED the markdown path's self-grading as intended behaviour",
+               classify("no mechanism warranted -- one-off", None) == "SELF-ASSERTED"))
+    ok.append(("the WORD tested, with no artifact on disk, is SELF-ASSERTED",
+               classify("sabotage-proven fixture added", None) == "SELF-ASSERTED"))
+    ok.append(("a named test artifact that EXISTS on disk counts as TESTED",
+               classify("verified by ~/bin/tests/deferral-check.test.sh", None) == "TESTED"))
     ok.append(("a SHA outranks hedging prose in the same cell (SHIPPED: no trigger named)",
                classify("mostly documented, none really, 13de4bf", None) == "SHIPPED"))
     ok.append(("a SHA naming a TRIGGERED file is BUILT",
@@ -458,8 +476,13 @@ def self_check() -> int:
         parsed = parse(reg.read_text(), None)
         ok.append(("parse() must actually READ table rows (not silently return [])",
                    len(parsed) == 2))
+        # WAIVED -> SELF-ASSERTED, 2026-08-20. Updating a test to match changed code is how a
+        # defect gets enshrined, so the distinction matters: this fixture was PINNING the
+        # markdown path's self-grading, which a review identified as the defect. The old
+        # expectation asserted the bug. Same shape as closure-verify's test 8, which asserted
+        # rc=0 for "no claims found" while the docstring promised 2.
         ok.append(("parse() must classify the rows it read",
-                   sorted(k for _, k in parsed) == ["PROSE", "WAIVED"]))
+                   sorted(k for _, k in parsed) == ["PROSE", "SELF-ASSERTED"]))
         _, total, _, _, _ = report(parsed)
         ok.append(("an empty parse must not masquerade as a measured result", total == 2))
 
