@@ -65,6 +65,20 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
      "    rows, bad = [], 0", "    rows, bad = [], 0\n    return [], 0"),
     ("anomaly-conversion-check.py", "SHA resolution bypassed (any SHA counts as BUILT)",
      "if repo is None or sha_resolves(sha, repo):", "if True:"),
+    # --- added 2026-08-20. The mutation ABOVE targets the MARKDOWN path. The tool now grades
+    # the JSONL anomaly ledger through grade_pointer / parse_jsonl / _scheduled_as /
+    # _ran_checks, and this canary touched NONE of them — so it ran weekly, passed, wrote an ok
+    # heartbeat, and could not detect a mutation in the code that actually produces the
+    # estate's conversion figure. A canary that cannot fail is worse than no canary: it emits a
+    # green signal nobody re-examines. Found by an adversarial ship review, not by authorship.
+    ("anomaly-conversion-check.py", "JSONL pointer grading stubbed (every closure reads BUILT)",
+     'def grade_pointer(spec: str) -> str:',
+     'def grade_pointer(spec: str) -> str:\n    return "BUILT"'),
+    ("anomaly-conversion-check.py", "JSONL parser gutted (ledger reads as empty)",
+     "    import json\n    out = []", "    import json\n    out = []\n    return out"),
+    ("anomaly-conversion-check.py", "heartbeat status gate removed (never-run counts as run)",
+     "    return rec.get(\"status\") in (\"ok\", \"adverse\") and rec.get(\"rc\") is not None",
+     "    return True"),
     # --- added 2026-08-11 after EIGHT fixtures shipped vacuous, every one caught by manual
     # sabotage and none by authorship. This canary is SCHEDULED weekly, so registering the
     # mutations converts that discipline into a mechanism that runs whether or not I remember.

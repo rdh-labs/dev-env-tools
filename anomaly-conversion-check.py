@@ -173,6 +173,21 @@ HEARTBEAT = Path.home()/".metrics/scheduled-check-heartbeat.jsonl"
 _PROMOTED_BY: dict = {}   # spec -> the changed file that earned BUILT (audit trail for the over-count above)
 
 
+def hb_row_counts_as_run(rec: dict) -> bool:
+    """Does this heartbeat row prove the check EXECUTED?
+
+    Extracted as a pure predicate 2026-08-20 because the scheduled mutation canary registered
+    `status gate removed -> if True:` and the mutant SURVIVED: not one fixture asserted that a
+    never-run check fails to promote. The gate was correct and untested, which is the same
+    condition as absent — a later edit could have removed it silently.
+
+    `ok` and `adverse` are BOTH real executions: adverse means the check ran and FOUND
+    something, which is a detector working. `unknown` is the runner's own word for "could not
+    RUN" and its comment says "UNKNOWN is never a pass"; notify_failed rows carry no rc at all.
+    """
+    return rec.get("status") in ("ok", "adverse") and rec.get("rc") is not None
+
+
 def _ran_checks() -> set:
     """Names of scheduled checks that have ACTUALLY EXECUTED at least once.
 
@@ -200,7 +215,7 @@ def _ran_checks() -> set:
             # permanently promotes every commit that touches it. `ok` and `adverse` are both
             # real executions: adverse means the check ran and FOUND something, which is a
             # detector working, not failing — deliberately not over-corrected past that.
-            if rec.get("status") in ("ok", "adverse") and rec.get("rc") is not None:
+            if hb_row_counts_as_run(rec):
                 out.add(rec.get("check"))
     except OSError:
         pass
@@ -383,6 +398,14 @@ def self_check() -> int:
     ok.append(("_scheduled_as refuses a generic wrapper that appears on many lines",
                _scheduled_as("scheduled-check-runner.sh", _cron_fixture) is None))
 
+    ok.append(("a status=unknown heartbeat row does NOT count as executed",
+               hb_row_counts_as_run({"check": "x", "status": "unknown", "rc": 127}) is False))
+    ok.append(("a row with NO rc does not count as executed (notify_failed shape)",
+               hb_row_counts_as_run({"check": "x", "status": "ok"}) is False))
+    ok.append(("status=ok with an rc DOES count as executed",
+               hb_row_counts_as_run({"check": "x", "status": "ok", "rc": 0}) is True))
+    ok.append(("status=adverse counts as executed — a detector that FOUND something ran",
+               hb_row_counts_as_run({"check": "x", "status": "adverse", "rc": 1}) is True))
     ok.append(("WIRED-NEVER-RUN does NOT count toward conversion",
                report([("a", "WIRED-NEVER-RUN"), ("b", "WIRED-NEVER-RUN")], 25.0)[3] == 0.0))
     ok.append(("WIRED-NEVER-RUN is PRINTED, not silently folded into SHIPPED",
