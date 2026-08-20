@@ -265,7 +265,7 @@ def grade_pointer(spec: str) -> str:
     except (OSError, subprocess.SubprocessError):
         cron = ""
     ran = _ran_checks()
-    best = "SHIPPED"
+    best = "SHIPPED"          # nothing scheduled at all
     for f in (l.strip() for l in r.stdout.splitlines() if l.strip()):
         # --name-only lists DELETED files too. A commit that removes a scheduled artifact is
         # the opposite of a remediation that fires (CLI review).
@@ -287,7 +287,7 @@ def grade_pointer(spec: str) -> str:
             # promoting file is emitted so the credit is auditable.
             _PROMOTED_BY[spec] = f
             return "BUILT"
-        best = "SHIPPED"
+        best = "WIRED-NEVER-RUN"   # scheduled, but no heartbeat: distinct from not-scheduled
     return best
 
 
@@ -324,13 +324,20 @@ def marker_line(counts, total, converted, pct, ok) -> str:
     gate-blocked to agents (SCHEDULE_PERSIST, denied by default).
     """
     return ("CONVERSION-MARKER: "
-            + " ".join(f"{k}={counts[k]}" for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE"))
+            # WIRED-NEVER-RUN and SELF-ASSERTED are printed because the whole point of
+            # separating them is that a reader can SEE the difference. Adding a state to the
+            # code and not to the output reproduces the defect being fixed one layer over —
+            # which is exactly what the first version of this fix did.
+            + " ".join(f"{k}={counts.get(k, 0)}" for k in
+                       ("BUILT", "WIRED-NEVER-RUN", "SHIPPED", "TESTED", "WAIVED",
+                        "SELF-ASSERTED", "PROSE"))
             + f" total={total} converted={converted} pct={pct:.1f}"
             + (" at-or-above threshold" if ok else " below threshold"))
 
 
 def report(rows, threshold=THRESHOLD_PCT):
-    counts = {k: 0 for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE", "SELF-ASSERTED")}
+    counts = {k: 0 for k in ("BUILT", "SHIPPED", "WIRED-NEVER-RUN", "TESTED", "WAIVED",
+                             "PROSE", "SELF-ASSERTED")}
     for _, k in rows:
         counts[k] = counts.get(k, 0) + 1
     total = len(rows)
@@ -376,6 +383,16 @@ def self_check() -> int:
     ok.append(("_scheduled_as refuses a generic wrapper that appears on many lines",
                _scheduled_as("scheduled-check-runner.sh", _cron_fixture) is None))
 
+    ok.append(("WIRED-NEVER-RUN does NOT count toward conversion",
+               report([("a", "WIRED-NEVER-RUN"), ("b", "WIRED-NEVER-RUN")], 25.0)[3] == 0.0))
+    ok.append(("WIRED-NEVER-RUN is PRINTED, not silently folded into SHIPPED",
+               "WIRED-NEVER-RUN=" in marker_line(
+                   {"BUILT":0,"SHIPPED":0,"WIRED-NEVER-RUN":2,"TESTED":0,"WAIVED":0,
+                    "SELF-ASSERTED":0,"PROSE":0}, 2, 0, 0.0, False)))
+    ok.append(("SELF-ASSERTED is PRINTED too — a state the code has and the output hides is not a state",
+               "SELF-ASSERTED=" in marker_line(
+                   {"BUILT":0,"SHIPPED":0,"WIRED-NEVER-RUN":0,"TESTED":0,"WAIVED":0,
+                    "SELF-ASSERTED":3,"PROSE":0}, 3, 0, 0.0, False)))
     ok.append(("an unresolvable SHA is NOT counted as BUILT",
                classify("fixed in deadbeef1", Path("/nonexistent")) != "BUILT"))
     # The above passed even with sha_resolves BYPASSED, because an untriggered cell falls to
@@ -459,11 +476,23 @@ def main() -> int:
             else parse(text, args.repo if args.repo.exists() else None))
     counts, total, converted, pct, passed = report(rows, args.threshold)
 
+    # total=0 FROM A NON-EMPTY INPUT IS A MEASUREMENT FAILURE, NOT A MEASUREMENT.
+    # The docstring has promised "2 on unreadable input" since this tool was written and no
+    # path delivered it. Measured: a JSONL whose first line is `# ledger v2` misdispatches to
+    # parse(), prints total=0 pct=0.0 "below threshold", exits 0 — byte-identical to what a
+    # GUTTED parser prints. So a broken parser, a misdispatched file and a genuinely empty
+    # corpus were the same output. An input with content that yields zero rows means the
+    # PARSER did not understand it.
+    if total == 0 and text.strip():
+        print(f"ANOMALY CONVERSION: CANNOT-ASSESS — {args.register} has content "
+              f"({len(text.splitlines())} lines) but yielded ZERO parseable instances. "
+              f"This is a parse/dispatch failure, not a measured 0%.", file=sys.stderr)
+        return 2
     print(marker_line(counts, total, converted, pct, passed))
     print(f"ANOMALY CONVERSION: {pct:.1f}% ({converted}/{total} instances closed by something "
           f"that EXISTS)")
-    for k in ("BUILT", "SHIPPED", "TESTED", "WAIVED", "PROSE"):
-        print(f"  {k:7s} {counts[k]}")
+    for k in ("BUILT", "WIRED-NEVER-RUN", "SHIPPED", "TESTED", "WAIVED", "SELF-ASSERTED", "PROSE"):
+        print(f"  {k:16s} {counts.get(k, 0)}")
     if counts["PROSE"]:
         print(f"\n  {counts['PROSE']} instance(s) closed in PROSE. Prose is the failure mode,")
         print("  not the remedy. Each needs a mechanism, a test, or an explicit waiver.")
