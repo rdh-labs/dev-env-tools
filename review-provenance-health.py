@@ -131,8 +131,17 @@ def read_jsonl(path: Path, rep: Report, label: str) -> list[dict]:
         return rows
     if bad:
         rep.add("FAIL", "log_corrupt",
-                f"{label}: {bad} unparseable line(s). Consumers that skip these fail "
-                f"open — ai-stats has done exactly that since 2026-07-30.")
+                f"{label}: {bad} non-record line(s). Consumers that skip these fail "
+                f"open — ai-stats has done exactly that since 2026-07-30. "
+                f"NOTE (2026-08-21): 'non-record', not 'unparseable' — the 8 lines in "
+                f"ai-router-usage.jsonl are VALID JSON strings that are not objects "
+                f"(literal \"$ROUTING_DECISION\" / \"$COMMAND\"), from a one-off writer "
+                f"quoting bug on 2026-02-17, bracketed by clean records 11 minutes apart "
+                f"and not recurring since. The old wording sent an investigator looking "
+                f"for a parse error that does not exist. This FAIL is therefore standing "
+                f"on unfixable historical data and will not self-clear; scoping severity "
+                f"by recoverability was attempted and REVERTED because this check is "
+                f"deliberately fail-closed and weakening it is not self-authorizable.")
     return rows
 
 
