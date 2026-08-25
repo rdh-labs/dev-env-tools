@@ -72,6 +72,9 @@ WINDOW_DAYS = 7
 DEADMAN_HOURS = 36
 MIN_BASELINE_N = 20          # below this, report counts only — never a rate
 FALLBACK_WARN_MULTIPLE = 2.0  # x trailing baseline before it is worth waking someone
+# Absolute ceiling, deliberately NOT adaptive. See fallback_sustained below: the adaptive
+# limb alone stayed silent through a 17-day provider outage because its own baseline moved.
+FALLBACK_ABSOLUTE_CEILING = 0.10
 
 
 def now() -> datetime:
@@ -209,6 +212,27 @@ def check_provenance(rep: Report) -> None:
             baseline = load_state().get("fallback_baseline")
             if baseline is None:
                 rep.stats["fallback_rate_note"] = "baseline seeding this run"
+            elif rate > FALLBACK_ABSOLUTE_CEILING:
+                # AN ADAPTIVE BASELINE NORMALISES THE DRIFT IT WATCHES FOR. Measured
+                # 2026-08-24: the codex/ChatGPT auth expired and the wrapper fell back to
+                # other vendors 69 times over 17 days, 30 of them off-vendor entirely. This
+                # check RAN 17 TIMES across that period, computed the rate correctly every
+                # time, and never warned — because the trailing median climbed WITH the
+                # degradation. State at discovery: baseline 0.1321, rate 0.1346, so the
+                # spike test (rate > baseline x MULTIPLE) was nowhere near tripping. The
+                # 0.05 in that expression is a floor on the THRESHOLD, not a ceiling on the
+                # RATE, so it stops mattering once the baseline is large.
+                # The file's own rationale caused this: "a hardcoded threshold would be a
+                # guess that silently rots". Correct — and an adaptive one silently ADAPTS.
+                # Both limbs are needed: relative catches sudden spikes, absolute catches
+                # slow ramps the baseline would otherwise swallow.
+                rep.add("WARN", "fallback_sustained",
+                        f"fallback rate {rate:.1%} exceeds the absolute ceiling "
+                        f"{FALLBACK_ABSOLUTE_CEILING:.0%} (trailing baseline {baseline:.1%} "
+                        f"has absorbed it — a relative test alone cannot see a slow ramp). "
+                        f"Check provider auth: `codex login status` reports stored "
+                        f"credentials, NOT their validity — it said 'Logged in' while the "
+                        f"API returned HTTP 401 token_expired.")
             elif rate > max(baseline * FALLBACK_WARN_MULTIPLE, 0.05):
                 rep.add("WARN", "fallback_spike",
                         f"fallback rate {rate:.1%} is >{FALLBACK_WARN_MULTIPLE}x the "
