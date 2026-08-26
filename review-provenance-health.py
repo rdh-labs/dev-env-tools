@@ -423,7 +423,11 @@ def main() -> int:
         notify("Review-provenance monitor SELF-CHECK FAILED",
                "Evaluation logic is broken; its results are not trustworthy. "
                + "; ".join(errs)[:300], "urgent")
-        return 3
+        # DEC-334: 2 = CANNOT-ASSESS, not 3 = NOTHING-TO-ASSESS. A self-check failure means
+        # the evaluation logic is broken -- it looked and cannot be trusted. The direct
+        # notify() above is best-effort (its own failure is swallowed by `except: return
+        # False` and never checked), so the runner-level alert on rc=2 is the real backstop.
+        return 2
     if args.self_check:
         print("self-check: all assertions pass")
         return 0

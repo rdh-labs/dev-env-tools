@@ -736,7 +736,12 @@ def outcome_notification_undelivered(days: int, notify: Path | None = None,
                 r = json.loads(line)
             except ValueError:
                 continue
-            if not isinstance(r, dict) or r.get("status") in (None, "ok"):
+            # "idle" (DEC-334 rc=3, NOTHING-TO-ASSESS) is a CORRECT silent outcome: the check
+            # ran and had nothing to measure, so no notification is expected or owed. Without
+            # it in this skip set every idle row is flagged "unannounced" -- context-ceiling
+            # alone runs 72x/day, which would recreate a weekly false-ADVERSE cascade, the
+            # exact defect the runner's rc=3 branch was added to remove.
+            if not isinstance(r, dict) or r.get("status") in (None, "ok", "idle"):
                 continue
             t = _any_ts(r.get("ts"))
             if t is None or t < cutoff:
