@@ -142,7 +142,7 @@ echo "TRIGGERED: [ARCH-REVIEW] ${N} architectural assumption ${ENT} due for re-e
 SHOWN=0
 while IFS=$'\t' read -r days id fals ws act; do
     [[ -n "$id" ]] || continue
-    (( SHOWN >= MAX_SHOW )) && { echo "    ... and more (capped at ${MAX_SHOW})"; break; }
+    (( SHOWN >= MAX_SHOW )) && { echo "    ... and $(( N - MAX_SHOW )) more not shown (full list: ${REG})"; break; }
     echo "    • ${id} (${days}d overdue)"
     [[ -n "$fals" ]] && echo "        falsifier: ${fals}"
     [[ -n "$ws"   ]] && echo "        watch: ${ws}"
