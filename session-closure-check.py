@@ -379,7 +379,13 @@ def main() -> int:
     if errs:
         for e in errs:
             print(f"[SELF-CHECK FAILED] {e}", file=sys.stderr)
-        return 3
+        # DEC-334: 2 = CANNOT-ASSESS, not 3 = NOTHING-TO-ASSESS. This script has NO
+        # notify() of its own (zero matches in-file) and is not currently scheduled, so
+        # a self-check failure has no channel at all except its exit code. If it is ever
+        # wrapped by scheduled-check-runner.sh -- which is now SILENT on rc=3 -- a broken
+        # checker would report nothing to anyone. That is the exact trap
+        # tests/contract-norm-enforcer.py was rescued from on 2026-08-26.
+        return 2
     if args.self_check:
         print("self-check: all assertions pass")
         return 0

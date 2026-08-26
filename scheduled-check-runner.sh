@@ -26,6 +26,12 @@ LOG="${2:?logfile}"
 MARKER="${3:?marker regex or - }"
 shift 3
 [ "${1:-}" = "--" ] && shift
+# NO COMMAND = NO CHECK. Without this, `"$@"` expands to nothing, the command substitution
+# below runs nothing, yields rc=0, and this wrapper writes a GREEN heartbeat every run
+# forever -- silence indistinguishable from health, which is the exact class this file's
+# header says it exists to eliminate. A crontab line that loses its command past `--` was
+# previously undetectable. 64 = EX_USAGE, and being outside {0,1} it also lands in `*)`.
+[ "$#" -gt 0 ] || { echo "usage: <name> <logfile> <marker|-> -- <cmd...>" >&2; exit 64; }
 
 HEARTBEAT="$HOME/.metrics/scheduled-check-heartbeat.jsonl"
 mkdir -p "$(dirname "$LOG")" "$(dirname "$HEARTBEAT")" 2>/dev/null || true
@@ -45,22 +51,36 @@ if [ "$MARKER" != "-" ] && grep -qE "$MARKER" <<< "$OUT"; then
     FOUND=1
 fi
 
+# DEC-334 rc=3 = NOTHING-TO-ASSESS: the check RAN and correctly found nothing to measure
+# (e.g. no live sessions). DEC-334 binds consumers to "1|2 = act, 0|3 = silent"; the `*)`
+# arm below was exactly the forbidden `rc -ne 0` pattern it warned about. NOT collapsed to
+# `ok`: DEC-326/334 hold that nothing-to-assess is not health, so `idle` stays a DISTINCT
+# heartbeat status -- logged and queryable, just not alerted.
+#
+# ROOT CAUSE, CORRECTED 2026-08-26 after an independent review falsified the first account
+# written here. This wrapper was created 2026-08-12 and PREDATES DEC-334 (2026-08-19) by
+# seven days; it never consumed peer-messaging-health, so DEC-334's consumer audit correctly
+# excluded it and the `*)` arm was CORRECT WHEN WRITTEN. What actually happened: three tools
+# adopted DEC-334's split on 2026-08-19 (context-ceiling-watch, peer-comms-check,
+# anomaly-ledger-report) and were wired into this pre-existing wrapper WITH NO CONTRACT CHECK
+# AT THE WIRING STEP. The transferable rule is therefore NOT "greps miss generic wrappers" --
+# a grep for a wrapped tool DOES return this runner's crontab line. It is:
+#     RE-AUDIT CONSUMERS WHENEVER A TOOL ADOPTS AN ALREADY-EXISTING EXIT-CODE CONTRACT.
+# An audit is an EVENT; the population keeps changing. Standing enforcement now exists:
+# bin/tests/contract-norm-enforcer.py::dec334_producer_check, cron 17 7 * * *, both
+# polarities self-controlled.
+#
+# NO LIVE COUNTS IN THIS COMMENT, deliberately. The first draft hardcoded "13 genuine
+# CANNOT-ASSESS alerts"; the true figure was 14 before the commit even landed. A frozen
+# historical count is fine, a live one rots. Measure: grep -c '"rc":2' on the heartbeat.
 STATUS=ok
 case "$RC" in
     0) [ "$FOUND" -eq 1 ] && STATUS=adverse ;;
     1) STATUS=adverse ;;
-    3) STATUS=idle ;;      # DEC-334 NOTHING-TO-ASSESS: the check RAN and correctly found nothing
-                           # to measure (e.g. no live sessions). DEC-334 binds consumers to
-                           # "1|2 = act, 0|3 = silent"; the `*)` below was exactly the forbidden
-                           # `rc -ne 0` pattern it warned about. It turned 229 correct idle
-                           # reports from context-ceiling-watch into high-priority pushes,
-                           # burying the 13 genuine CANNOT-ASSESS alerts at ~5% SNR.
-                           # NOT collapsed to `ok`: DEC-326/334 hold that nothing-to-assess is
-                           # not health, so it stays a DISTINCT heartbeat status -- logged and
-                           # queryable, just not alerted. Contract-bound to rc=3 under DEC-334;
-                           # any other non-{0,1} code still falls through to `*)` and shouts.
-                           # This runner is a THIRD exit-code consumer that DEC-334's audit
-                           # could not find by name, because it takes `-- <cmd...>`.
+    # rc=3 honours the artifact channel exactly as rc=0 does. A check that exits 3 while
+    # PRINTING its adverse marker is reporting a finding, and unconditional silence would
+    # lose it -- a NEW signal-loss path the first version of this fix introduced.
+    3) if [ "$FOUND" -eq 1 ]; then STATUS=adverse; else STATUS=idle; fi ;;
     *) STATUS=unknown ;;   # a check that could not RUN must shout. UNKNOWN is never a pass.
 esac
 

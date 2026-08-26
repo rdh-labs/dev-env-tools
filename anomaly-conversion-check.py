@@ -200,7 +200,14 @@ def hb_row_counts_as_run(rec: dict) -> bool:
     something, which is a detector working. `unknown` is the runner's own word for "could not
     RUN" and its comment says "UNKNOWN is never a pass"; notify_failed rows carry no rc at all.
     """
-    return rec.get("status") in ("ok", "adverse") and rec.get("rc") is not None
+    # `idle` (DEC-334 rc=3, added to the runner 2026-08-26) is ALSO a real execution, and by
+    # this docstring's own rule: the runner's comment for it reads "the check RAN and correctly
+    # found nothing to measure". It is the OPPOSITE of `unknown`. Excluding it would grade an
+    # idle-dominant check WIRED-NEVER-RUN despite it running hourly. Not a pre-2026-08-26
+    # regression (rc=3 rows were `unknown`, also excluded), but the sibling reader
+    # governed-outcomes-check.py was updated for `idle` and this one was missed -- the same
+    # vocabulary-added-without-a-consumer-census defect, one hop downstream.
+    return rec.get("status") in ("ok", "adverse", "idle") and rec.get("rc") is not None
 
 
 def _ran_checks() -> set:

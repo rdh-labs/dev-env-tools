@@ -61,6 +61,11 @@ run_case "rc=0 marker MISS"       0   'ADVERSE' "all fine"          ok      no
 run_case "rc=1 DEGRADED"          1   '-'       "degraded"          adverse yes
 run_case "rc=2 CANNOT-ASSESS"     2   '-'       "cannot assess"     unknown yes
 run_case "rc=3 NOTHING-TO-ASSESS" 3   '-'       "nothing to assess" idle    no
+# rc=3 must still honour the artifact channel, exactly as rc=0 does. The first version of
+# this fix silenced it unconditionally, creating a NEW way to lose a genuine finding: a
+# check that exits 3 while printing its adverse marker. Latent (no live marker currently
+# matches an rc=3 producer's output) but the contract must be explicit either way.
+run_case "rc=3 + marker HIT"      3   'ADVERSE' "ADVERSE: thing"    adverse yes
 run_case "rc=127 genuine failure" 127 '-'       "command not found" unknown yes
 
 echo

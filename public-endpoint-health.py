@@ -635,7 +635,13 @@ def main() -> int:
         notify("Endpoint monitor SELF-CHECK FAILED",
                "public-endpoint-health.py evaluation logic is broken; its results "
                "are not trustworthy. " + "; ".join(errs)[:300], "urgent")
-        return 3
+        # DEC-334: 2 = CANNOT-ASSESS ("it tried to look and failed"), not 3 =
+        # NOTHING-TO-ASSESS ("ran fine, nothing to measure"). A self-check failure is
+        # the former: it looked, and its answer cannot be believed. Harmless while this
+        # runs directly from the schedule, but scheduled-check-runner.sh is now SILENT
+        # on rc=3, so wrapping this script later would mute the alert without anyone
+        # editing this file. Fixing the contract, not relying on the invocation path.
+        return 2
     if args.self_check:
         print("self-check: all assertions pass")
         return 0

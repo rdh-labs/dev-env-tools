@@ -42,7 +42,12 @@ DESIGN RULES (scars — do not relax without reading the rationale)
    derived from the trailing baseline, so "normal" is measured, not asserted, and
    an alert means "worse than this workspace's own history".
 
-Exit codes: 0 pass, 1 warn, 2 failure, 3 self-check failed.
+Exit codes: 0 pass, 1 warn, 2 failure OR self-check failed.
+(Code 3 is NOT used here. DEC-334 reserves 3 for NOTHING-TO-ASSESS, which
+scheduled-check-runner.sh treats as SILENT -- a self-check failure must never be
+silent, so it returns 2. Corrected 2026-08-26; this line still said "3 self-check
+failed" after the code moved to 2, which would have led the next maintainer to
+reintroduce the exact bug.)
 """
 
 from __future__ import annotations
