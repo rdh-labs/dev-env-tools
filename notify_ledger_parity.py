@@ -70,8 +70,12 @@ SHAPES = [
 ]
 
 
-def extract_mirror(path):
-    """Pull the embedded python classification block out of the bash heredoc."""
+def extract_classifier_block(path):
+    """Pull the embedded python classification block out of the bash heredoc.
+
+    (Renamed from extract_mirror: there is no mirror any more, and a stale name in a file whose
+    whole purpose is avoiding misleading green checks is exactly the wrong place for one.)
+    """
     try:
         lines = Path(path).read_text().splitlines()
     except OSError as exc:
@@ -102,18 +106,39 @@ def main():
     """
     path = os.environ.get("MIRROR_UNDER_TEST") or (
         sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MIRROR)
-    block, err = extract_mirror(path)
+    block, err = extract_classifier_block(path)
     if err:
         print(f"UNKNOWN: {err} — delegation NOT verified")
         return 2
 
     problems = []
-    # (1) It must IMPORT, not reimplement. A returning inline classifier is the drift risk.
-    if "from notify_ledger import classify_row" not in block:
-        problems.append("does not import notify_ledger.classify_row — a mirror may have returned")
-    for smell in ("_truthy", 'str(r.get("success")).strip().lower()'):
-        if smell in block:
-            problems.append(f"contains inline classification logic ({smell!r})")
+    # (1) BEHAVIOURAL DELEGATION SPY, not a source grep. The previous form searched the block
+    # for the literal import string and for two known inline-logic smells. That is
+    # text-checking-text -- under-inclusive (a mirror can reappear without either string) and
+    # representational rather than behavioural. It is the same weakness class that let a
+    # DOUBLED dedup window pass an assertion printing "4h intact" earlier in this session.
+    # Instead: stand up a FAKE notify_ledger whose classify_row returns a sentinel state, point
+    # the block's HOME at it, and require the verdict to change accordingly. A cron that
+    # reimplements classification instead of delegating cannot produce the sentinel verdict.
+    with tempfile.TemporaryDirectory() as spy_home:
+        tools = Path(spy_home) / "dev" / "infrastructure" / "tools"
+        tools.mkdir(parents=True)
+        (tools / "notify_ledger.py").write_text(
+            'def classify_row(row):\n    return "withheld"\n')
+        spy_led = Path(spy_home) / "row.jsonl"
+        # A row the CANONICAL classifier calls `delivered`. If the block delegates, the spy
+        # overrides it to `withheld` and the verdict must follow the spy, not the real logic.
+        spy_led.write_text(json.dumps({"timestamp": "t", "success": True}) + "\n")
+        spy_prog = Path(spy_home) / "cron.py"
+        spy_prog.write_text(block)
+        spy = subprocess.run([sys.executable, str(spy_prog), str(spy_led), "0"],
+                             capture_output=True, text=True, timeout=30,
+                             env=dict(os.environ, HOME=spy_home, PYTHONPATH=""))
+        spy_state = VERDICT_TO_STATE.get((spy.stdout or "").split(":")[0].strip())
+        if spy_state != "withheld":
+            problems.append(
+                f"does not delegate: a spy classify_row returning 'withheld' produced "
+                f"{spy_state!r} — classification is not going through notify_ledger")
 
     # (2) Unavailability must ESCALATE, not skip. A cron that silently skips on a missing
     # dependency is the silent failure its own NO SILENT FAILURES header forbids.
@@ -122,7 +147,9 @@ def main():
         prog.write_text(block)
         ledger = Path(tmp) / "row.jsonl"
         ledger.write_text(json.dumps({"timestamp": "t", "success": True}) + "\n")
-        env = dict(os.environ, HOME="/nonexistent-for-parity-probe")
+        # PYTHONPATH scrubbed: an inherited one could expose notify_ledger by another path
+        # and make this "missing classifier" probe pass without the dependency being absent.
+        env = dict(os.environ, HOME="/nonexistent-for-parity-probe", PYTHONPATH="")
         out = subprocess.run([sys.executable, str(prog), str(ledger), "0"],
                              capture_output=True, text=True, timeout=30, env=env)
         verdict = (out.stdout or "").split(":")[0].strip()
