@@ -53,13 +53,17 @@ FUNCTIONAL = re.compile(
 #                                        own console warns it is not for production. This is the
 #                                        one that actually rots.
 # Severity therefore tracks PINNING, not merely the presence of a third-party host.
-PINNED = re.compile(r"@\d+\.\d+", re.I)
+PINNED = re.compile(r"@\d+\.\d+")   # no re.I: the pattern is digits and punctuation only
 
 # Cosmetic: degrades to a fallback, document still reads. NOT a finding.
 COSMETIC = re.compile(r"https?://fonts\.(?:googleapis|gstatic)\.com", re.I)
 
-SKIP_DIRS = ("node_modules", "/.git", "/venv", ".venv", "site-packages",
-             "/dist/", "/build/", "__pycache__", "/.next/")
+# Matched against each directory's BASENAME, not as a substring of the whole path. A substring
+# test on "/dist/" misses a directory whose path ENDS at `/dist` (no trailing slash), so files
+# directly inside it were scanned while only deeper descendants were skipped. Review finding,
+# gpt-5.6-sol 2026-08-27.
+SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "site-packages",
+             "dist", "build", "__pycache__", ".next"}
 # Distinction 3: archived copies of other people's pages.
 ARCHIVED = ("primary-sources", "source-materials", "/raw/", "/downloads/",
             "/fixtures/", "/samples/", "/archive/", "/archives/")
@@ -83,11 +87,11 @@ def is_application(path: str) -> bool:
 def scan(root: str) -> tuple[list, int, int, int]:
     findings, n, cosmetic, archived = [], 0, 0, 0
     for dirpath, dirnames, filenames in os.walk(root):
-        if any(s in dirpath for s in SKIP_DIRS):
-            dirnames[:] = []
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        if os.path.basename(dirpath) in SKIP_DIRS:
             continue
         for fn in filenames:
-            if not fn.endswith((".html", ".htm")):
+            if not fn.lower().endswith((".html", ".htm")):
                 continue
             path = os.path.join(dirpath, fn)
             n += 1
