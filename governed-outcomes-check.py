@@ -608,6 +608,11 @@ def outcome_qc_not_run(days: int, ledger: Path | None = None,
 
 NOTIFY_LEDGER = Path.home() / ".cache" / "notify" / "notifications.jsonl"
 
+# One definition of what a ledger row means, shared with notify-redeliver.py. Imported by path
+# because this module's own filename contains hyphens and cannot be imported in reverse.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from notify_ledger import classify_row as _classify  # noqa: E402
+
 
 def read_jsonl_records(text: str, max_join: int = 40):
     """Yield JSON objects from a JSONL file whose records may SPAN LINES.
@@ -720,30 +725,24 @@ def outcome_notification_undelivered(days: int, notify: Path | None = None,
         # indistinguishable from a guard that passed.
         # Rows PREDATING the flag carry no `dry_run` field: treat MISSING as REAL, never as
         # unknown-so-ignore -- a delivery that predates the flag cannot have been a rehearsal.
-        if r.get("dry_run") is True:
+        state = _classify(r)
+        if state == "rehearsed":
             continue                      # rehearsal: neither a delivery nor a failure
-        # DEDUP CONTRACT (2026-08-27, audit ~/dev/share/notify-consumer-audit-2026.md S1/S3).
-        # A dedup-suppressed row contacted NO channel. Until 2026-08-27 notify.sh wrote
-        # `success: true` on that path, so this function -- the one tool in the workspace built
-        # to answer "did an adverse alert actually reach someone" -- counted a withheld alert as
-        # DELIVERED. That is the same shape as the dry-run defect above, and it was live for
-        # 42.8% of this ledger's rows.
-        #
-        # THREE STATES, not two. A withheld row is neither:
-        #   - not DELIVERED: nothing was sent, so it must not inflate the delivery count; and
-        #   - not FAILED: the notifier did exactly what it was told to do, so it must not raise
-        #     an adverse finding either (that would make correct dedup read as a broken channel).
-        # It IS positive evidence for the dead-man's-switch join below -- a suppressed row proves
-        # notify.sh ran AND that an identical alert was delivered within the dedup window -- so
-        # it joins `delivered` in `announced` for presence, while staying out of the count.
-        # Checked BEFORE `success`: post-fix rows carry `success: false`, and reading that first
-        # would file every dedup event as a transmission failure.
-        if r.get("suppressed") is True:
+        # THREE STATES, not two. A dedup-suppressed row contacted NO channel: not DELIVERED
+        # (nothing was sent, so it must not inflate the count) and not FAILED (the notifier did
+        # what it was told). It IS positive evidence for the dead-man's-switch join below --
+        # it proves an identical alert went out inside the dedup window -- so it joins
+        # `announced` for presence while staying out of the count.
+        # Classification is delegated to notify_ledger.classify_row so this predicate cannot
+        # drift from the other consumers again; four copies of it had already disagreed.
+        if state == "withheld":
             withheld.append((t, str(r.get("title") or "")))
-        elif r.get("success") is False:
+        elif state == "failed":
             failed.append(f"{t:%Y-%m-%dT%H:%M:%SZ} {str(r.get('title'))[:60]}")
-        else:
+        elif state == "delivered":
             delivered.append((t, str(r.get("title") or "")))
+        else:
+            bad += 1                      # DEC-326: unclassifiable is a failure state
 
     # Presence pool for the join: a delivery OR a withheld duplicate both prove the alert path
     # is alive and that this title was announced inside the dedup window. Only `delivered`

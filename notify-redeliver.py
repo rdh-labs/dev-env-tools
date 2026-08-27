@@ -56,6 +56,10 @@ def _ts(v):
         return None
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from notify_ledger import classify_row, read_records  # noqa: E402
+
+
 def undelivered(days: int, ledger: Path | None = None) -> list[dict]:
     """Events where EVERY attempt failed. A partial failure reached someone; this did not."""
     p = ledger or LEDGER
@@ -63,12 +67,12 @@ def undelivered(days: int, ledger: Path | None = None) -> list[dict]:
         return []
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     events: dict[str, dict] = {}
-    for line in p.read_text(errors="replace").splitlines():
-        if not line.strip():
-            continue
-        try:
-            r = json.loads(line)
-        except ValueError:
+    # `.splitlines()` + per-line json.loads silently dropped ~4.3% of this ledger's records
+    # (unescaped newlines in `message` make one record span lines). A dropped record here IS a
+    # notification that reached nobody -- the reader's failure mode was the defect it hunts --
+    # and it was dropping withheld rows this function had just been taught to recognise.
+    for r in read_records(p.read_text(errors="replace")):
+        if not isinstance(r, dict):
             continue
         t = _ts(r.get("timestamp") or r.get("ts"))
         if t is None or t < cutoff:
@@ -93,10 +97,16 @@ def undelivered(days: int, ledger: Path | None = None) -> list[dict]:
         # channel (`fail`), and it keeps an all-withheld event out of the redelivery set entirely.
         # A genuinely failed attempt sitting alongside a withheld one still redelivers (fail > 0).
         # Tested BEFORE `success` -- post-fix withheld rows carry `success: false`.
-        if r.get("suppressed") is True:
+        # Delegated so this predicate cannot drift from the other consumers again: four copies
+        # had already disagreed, and one live row (success as the STRING "False") classified as
+        # failed by one consumer and delivered by this one.
+        st = classify_row(r)
+        if st in ("withheld", "rehearsed"):
             e["withheld"] += 1
-        else:
-            e["fail" if r.get("success") is False else "ok"] += 1
+        elif st == "failed":
+            e["fail"] += 1
+        elif st == "delivered":
+            e["ok"] += 1
     return sorted((e for e in events.values() if e["ok"] == 0 and e["fail"] > 0),
                   key=lambda e: e["first"])
 
