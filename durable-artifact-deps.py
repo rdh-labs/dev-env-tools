@@ -43,6 +43,18 @@ FUNCTIONAL = re.compile(
     r""")""",
     re.I,
 )
+# PINNED vs UNPINNED — the axis that actually predicts decay. Added 2026-08-27 after RUNNING
+# this scanner on real files exposed that it scored these identically, which is wrong:
+#   cdn.jsdelivr.net/npm/d3@7.9.0/...   PINNED and immutable. Only fails if jsdelivr itself dies.
+#                                        Inlining it would take a 7.7KB document to ~400KB to
+#                                        buy almost nothing. Report, do not urge a fix.
+#   cdn.tailwindcss.com                  UNPINNED, and it GENERATES CSS at load time from the
+#                                        classes it finds. No version, no immutability, and its
+#                                        own console warns it is not for production. This is the
+#                                        one that actually rots.
+# Severity therefore tracks PINNING, not merely the presence of a third-party host.
+PINNED = re.compile(r"@\d+\.\d+", re.I)
+
 # Cosmetic: degrades to a fallback, document still reads. NOT a finding.
 COSMETIC = re.compile(r"https?://fonts\.(?:googleapis|gstatic)\.com", re.I)
 
@@ -84,6 +96,9 @@ def scan(root: str) -> tuple[list, int, int, int]:
             except OSError:
                 continue
             hosts = sorted(set(FUNCTIONAL.findall(text)))
+            urls = re.findall(r"""(?:src|href)=["'](https?://[^"']+)""", text)
+            risky = sorted({h for h in hosts
+                            if not any(h in u and PINNED.search(u) for u in urls)})
             if not hosts:
                 if COSMETIC.search(text):
                     cosmetic += 1
@@ -93,7 +108,7 @@ def scan(root: str) -> tuple[list, int, int, int]:
                 continue
             if is_application(path):
                 continue
-            findings.append((path, hosts))
+            findings.append((path, hosts, risky))
     return findings, n, cosmetic, archived
 
 
@@ -116,6 +131,10 @@ def self_check() -> int:
     ok.append(("app path excluded", is_application("/x/public/admin/index.html")))
     ok.append(("named document NOT excluded as app",
                not is_application("/x/deliverables/SHV_Dashboard_v3.html")))
+    # BOTH POLARITIES on the pinning rule — the distinction added after running the tool.
+    ok.append(("pinned version recognised", bool(PINNED.search("/npm/d3@7.9.0/dist/d3.min.js"))))
+    ok.append(("unpinned host has no version to find",
+               not PINNED.search("https://cdn.tailwindcss.com")))
     bad = [m for m, good in ok if not good]
     for m in bad:
         print(f"  [FAIL] {m}")
@@ -145,11 +164,16 @@ def main() -> int:
         print("  no durable documents with a functional third-party dependency")
         return 0
     print(f"\n{len(findings)} durable document(s) whose function depends on a third party:")
-    for path, hosts in findings:
-        print(f"  {path.replace(os.path.expanduser('~'), '~')}")
+    for path, hosts, risky in findings:
+        tag = "UNPINNED" if risky else "pinned  "
+        print(f"  [{tag}] {path.replace(os.path.expanduser('~'), '~')}")
         print(f"      -> {', '.join(hosts)}")
-    print("\nEach will silently degrade if that host blocks, changes or shuts down.")
-    print("Fix = inline the dependency so the document is self-contained.")
+        if risky:
+            print(f"      UNPINNED (no @version, may change under you): {', '.join(risky)}")
+    n_unpinned = sum(1 for _, _, r in findings if r)
+    print(f"\n{n_unpinned} of {len(findings)} carry an UNPINNED dependency — those are the ones")
+    print("that rot. Pinned ones only fail if the CDN itself disappears; inlining a pinned d3")
+    print("can take a 7KB document to 400KB to buy very little. Fix the UNPINNED ones first.")
     return 1
 
 
