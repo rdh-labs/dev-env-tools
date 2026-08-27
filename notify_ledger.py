@@ -77,9 +77,13 @@ def classify_row(row):
     """Classify one ledger row into exactly one of STATES. Never raises."""
     if not isinstance(row, dict):
         return UNKNOWN
-    if row.get("dry_run") is True:
+    # truthy() on ALL THREE fields, not just `success`. The docstring claims truthiness is
+    # normalised "in one place, so the disagreement cannot recur" -- it was applied to one field
+    # of three, and the demonstrated real-world failure WAS a string-valued field. A row with
+    # dry_run:"true" classified as delivered.
+    if truthy(row.get("dry_run")) is True:
         return REHEARSED
-    if row.get("suppressed") is True:
+    if truthy(row.get("suppressed")) is True:
         return WITHHELD
     success = truthy(row.get("success"))
     if success is True:
@@ -163,6 +167,13 @@ if __name__ == "__main__":
         # Rehearsal must win over BOTH: a dry run returns success while contacting no channel.
         ({"success": True, "dry_run": True}, REHEARSED),
         ({"success": True, "dry_run": True, "suppressed": True}, REHEARSED),
+        # REHEARSED negative polarity: dry_run present but FALSE is the shape of every real
+        # post-2026-08-13 row, and nothing pinned it.
+        ({"success": True, "dry_run": False}, DELIVERED),
+        ({"success": True, "suppressed": False}, DELIVERED),
+        # Non-bool on the OTHER two fields -- the exact class that made four consumers disagree.
+        ({"success": True, "dry_run": "true"}, REHEARSED),
+        ({"success": True, "suppressed": "yes"}, WITHHELD),
         # Legacy row, no dry_run field: missing means REAL, never unknown-so-ignore.
         ({"success": True, "hostname": "R-Lenovo"}, DELIVERED),
         # DEC-326: unrecognisable is UNKNOWN, never folded into a neighbour.
@@ -191,8 +202,14 @@ if __name__ == "__main__":
     failures = [(r, want, classify_row(r)) for r, want in cases if classify_row(r) != want]
     for row, want, got in failures:
         print(f"FAIL {row!r}: want {want}, got {got}")
-    # Assert the suite can fail, so a green result is not a dead matcher: this must NOT pass.
-    control_ok = classify_row({"success": True}) != FAILED
+    # CONTROL. The previous form -- `classify_row({"success": True}) != FAILED` -- was a
+    # provable no-op: it could only be False where case 1 already failed, so `failures or not
+    # control_ok` reduced to `failures`. It printed "asserts it can fail" while asserting
+    # nothing. This form feeds the harness a deliberately WRONG expectation and requires the
+    # harness to have SEEN a failure.
+    _control = [(r, want) for r, want in [({"success": True}, FAILED)]
+                if classify_row(r) != want]
+    control_ok = len(_control) == 1
     if failures or not control_ok:
         print(f"FAILED: {len(failures)}/{len(cases)}")
         raise SystemExit(1)
