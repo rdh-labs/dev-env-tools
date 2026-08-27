@@ -79,6 +79,17 @@ def load_user_messages(path: Path) -> list[str]:
     return out
 
 
+# Whitespace-TOLERANT. The first version scraped the fixed literal `"timestamp":"` with
+# str.find. Independent review (gpt-5.5, 2026-08-27) flagged it as fragile and the corpus
+# CONFIRMED it: at least 3 transcript files under ~/.claude/projects write `"timestamp": "`
+# WITH A SPACE. Those returned None from last_record_utc and were dropped from the window
+# entirely -- silently, and in the under-counting direction, which is the same failure class
+# as the mtime bug this file already carries a note about. Two silent-under-inclusion paths
+# in one function is a pattern, not a coincidence: prefer structural parsing over literal
+# scraping whenever the input is JSON.
+_TS_RE = re.compile(r'"timestamp"\s*:\s*"([^"]{19,})"')
+
+
 def is_adverse(mean_rate: float | None, threshold: float | None) -> bool:
     """THE SUCCESS/FAILURE CRITERION, isolated so both polarities can be controlled.
     No threshold configured => no defined failure condition => never adverse (and the caller
@@ -96,9 +107,9 @@ def last_record_utc(path: Path) -> datetime | None:
     last = None
     try:
         for line in path.read_text(errors="replace").splitlines():
-            i = line.find('"timestamp":"')
-            if i != -1:
-                last = line[i + 13:i + 33]
+            m = _TS_RE.search(line)
+            if m:
+                last = m.group(1)
     except OSError:
         return None
     if not last:
