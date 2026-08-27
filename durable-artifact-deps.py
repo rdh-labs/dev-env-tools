@@ -26,6 +26,19 @@ WHY A SCANNER AND NOT A GATE. This workspace has 110 of 228 hook modules wired n
 2026-08-27, DEC-347). Adding an unwired gate would BE the defect this session catalogued. This
 is a script you run and that prints a list; it makes no claim to fire on its own.
 
+THE FIX IS SOLVED PRIOR ART — DO NOT HAND-ROLL IT. Added 2026-08-27 after the user asked
+whether prior art had been checked. It had NOT been, and this file was built without it, which is
+the same defect it was written to catch.
+  monolith  https://github.com/y2z/monolith  — CLI, saves a page as ONE html file with every
+            asset embedded as a base64 data URL. `-I` (isolation) strips external references
+            outright; `-j` drops JavaScript for a static snapshot. Not installed here as of
+            2026-08-27 (`command -v monolith` empty); available as a prebuilt binary.
+  vite-plugin-singlefile — the same idea at build time for Vite projects.
+An earlier draft of this session called inlining Tailwind "real work needing a static build".
+That was WRONG: monolith fetches whatever the CDN serves and embeds it, so the runtime dependency
+disappears without a build pipeline. THIS SCANNER DETECTS; monolith REPAIRS. Do not write a
+repair path here.
+
 Exit: 0 clean · 1 findings present · 2 could not scan (never silently 0).
 """
 from __future__ import annotations
