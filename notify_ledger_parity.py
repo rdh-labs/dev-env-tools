@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""Assert the enforcement-registration-cron.sh mirror agrees with notify_ledger.classify_row.
+"""Assert enforcement-registration-cron.sh DELEGATES to notify_ledger and fails loud without it.
 
-WHY THIS EXISTS. `enforcement-registration-cron.sh` deliberately MIRRORS the canonical
-classifier rather than importing it, so that an unattended cron in ~/bin acquires no runtime
-dependency on ~/dev/infrastructure. That choice is defensible. What is not defensible is
-mirroring without a mechanism that detects divergence: the first mirror copied only the branch
-ORDER and omitted truthiness normalisation, so it disagreed with canonical on 6 of 12 probe
-shapes ({"success": 1} -> unknown vs delivered) and raised AttributeError on a non-dict row.
-It shipped under a comment reading "Keep the two in step" — a behavioural norm guarding a
-machine invariant, which is the weakest enforcement class this workspace has.
+WHY THIS EXISTS. That cron once MIRRORED the canonical classifier inline, to avoid a cross-repo
+runtime dependency in an unattended job. The mirror copied only the branch ORDER and omitted
+truthiness normalisation -- the entire reason the shared module exists -- so it disagreed with
+canonical on 6 of 12 shapes ({"success": 1} -> unknown vs delivered) and raised AttributeError
+on a non-dict row. It shipped under a comment reading "Keep the two in step": a behavioural norm
+guarding a machine invariant, the weakest enforcement class this workspace has.
 
-Duplication is legitimate here. UNVERIFIED duplication is not. This is the verification.
+The mirror is now a guarded import. Two independent reviewers converged on the reason: an
+ImportError is LOUD and unambiguous, while a drifted mirror produces a wrong answer that looks
+correct. The "no cross-repo dependency" principle was already lost anyway -- governance-health-
+cron.sh, same directory, same class of job, takes the dependency and guards it.
+
+So this file no longer checks parity between two implementations; there is only one. It checks
+the three properties that replaced that guarantee. Note it would have been WORSE than useless
+left as a shape comparison: with the mirror gone it would have run the canonical classifier
+against itself and reported agreement -- a tautology wearing a green tick.
 
 Usage:  python3 notify_ledger_parity.py [path-to-cron-script]
-        MIRROR_UNDER_TEST=<path>  overrides the subject (used by the mutation control).
-Exit 0 = full agreement. Exit 1 = divergence (printed). Exit 2 = could not extract the mirror,
-which is a FAILURE state per DEC-326, never a pass — a parity check that cannot find its
-subject has not verified anything.
+        MIRROR_UNDER_TEST=<path>  overrides the subject (used by the mutation controls).
+Exit 0 = delegating correctly. Exit 1 = a checked property failed (printed). Exit 2 = the
+subject could not be read, a FAILURE state per DEC-326 -- a check that cannot find its subject
+has verified nothing and must never report a pass.
 """
 
 import json
@@ -83,44 +89,70 @@ def extract_mirror(path):
 
 
 def main():
+    """Assert the cron DELEGATES to the canonical classifier and FAILS LOUD without it.
+
+    THE SUBJECT CHANGED, SO THE ASSERTION CHANGED. This script used to compare a hand-mirrored
+    classifier in the cron against the canonical one over 18 shapes. That mirror is gone --
+    replaced by a guarded import after two independent reviewers converged on the failure-mode
+    argument (ImportError is loud; a drifted mirror is a wrong answer that looks correct).
+    Left as-is, the shape comparison would now be running the canonical classifier against
+    ITSELF and reporting agreement: a tautology wearing a green tick, which is the defect class
+    this whole change set exists to remove. So it now checks the two properties that are
+    actually load-bearing after the change.
+    """
     path = os.environ.get("MIRROR_UNDER_TEST") or (
         sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MIRROR)
     block, err = extract_mirror(path)
     if err:
-        print(f"UNKNOWN: {err} — parity NOT verified")
+        print(f"UNKNOWN: {err} — delegation NOT verified")
         return 2
 
+    problems = []
+    # (1) It must IMPORT, not reimplement. A returning inline classifier is the drift risk.
+    if "from notify_ledger import classify_row" not in block:
+        problems.append("does not import notify_ledger.classify_row — a mirror may have returned")
+    for smell in ("_truthy", 'str(r.get("success")).strip().lower()'):
+        if smell in block:
+            problems.append(f"contains inline classification logic ({smell!r})")
+
+    # (2) Unavailability must ESCALATE, not skip. A cron that silently skips on a missing
+    # dependency is the silent failure its own NO SILENT FAILURES header forbids.
     with tempfile.TemporaryDirectory() as tmp:
-        prog = Path(tmp) / "mirror.py"
+        prog = Path(tmp) / "cron.py"
         prog.write_text(block)
         ledger = Path(tmp) / "row.jsonl"
-        disagreements = []
+        ledger.write_text(json.dumps({"timestamp": "t", "success": True}) + "\n")
+        env = dict(os.environ, HOME="/nonexistent-for-parity-probe")
+        out = subprocess.run([sys.executable, str(prog), str(ledger), "0"],
+                             capture_output=True, text=True, timeout=30, env=env)
+        verdict = (out.stdout or "").split(":")[0].strip()
+        if verdict != "UNKNOWN" or out.returncode != 2:
+            problems.append(f"missing classifier yields {verdict!r}/rc={out.returncode}, "
+                            f"want 'UNKNOWN'/rc=2 (DEC-326: cannot-assess is a failure state)")
+
+        # (3) With the classifier available, every shape must still classify identically.
         for shape in SHAPES:
             ledger.write_text(json.dumps({**shape, "timestamp": "t"}) + "\n")
-            try:
-                out = subprocess.run([sys.executable, str(prog), str(ledger), "0"],
-                                     capture_output=True, text=True, timeout=30)
-            except subprocess.SubprocessError as exc:
-                disagreements.append((shape, classify_row(shape), f"CRASH: {exc}"))
-                continue
-            verdict = (out.stdout or "").split(":")[0].strip()
-            mirror = VERDICT_TO_STATE.get(verdict)
-            if mirror is None:
-                # A crash or an unmapped verdict is a divergence, not a skip.
-                detail = (out.stderr or out.stdout or "").strip().splitlines()
-                mirror = f"NO-VERDICT ({detail[-1][:60] if detail else 'empty'})"
-            canonical = classify_row(shape)
-            if mirror != canonical:
-                disagreements.append((shape, canonical, mirror))
+            r = subprocess.run([sys.executable, str(prog), str(ledger), "0"],
+                               capture_output=True, text=True, timeout=30)
+            got = VERDICT_TO_STATE.get((r.stdout or "").split(":")[0].strip())
+            want = classify_row(shape)
+            if got != want:
+                problems.append(f"{json.dumps(shape)}: cron={got} canonical={want}")
 
-    if disagreements:
-        print(f"DIVERGENCE: {len(disagreements)}/{len(SHAPES)} shapes disagree")
-        for shape, canonical, mirror in disagreements:
-            print(f"  {json.dumps(shape):<46} canonical={canonical:<10} mirror={mirror}")
+    if problems:
+        print(f"DIVERGENCE: {len(problems)} problem(s)")
+        for p_ in problems:
+            print(f"  {p_}")
         return 1
-    print(f"PARITY: {len(SHAPES)}/{len(SHAPES)} shapes agree")
+    print(f"DELEGATION: cron imports the canonical classifier, escalates when it is "
+          f"unavailable, and agrees on {len(SHAPES)}/{len(SHAPES)} shapes")
     return 0
 
 
 if __name__ == "__main__":
+    # This guard was deleted by an edit that replaced everything from `def main():` to EOF.
+    # The script then ran, executed nothing, and exited 0 — so every control "passed" while
+    # verifying nothing at all. A no-op reporting success, in the file built to catch exactly
+    # that. Caught only because the controls were run and BOTH failed to fire.
     raise SystemExit(main())
