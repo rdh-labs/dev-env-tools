@@ -187,7 +187,25 @@ def main() -> int:
 
     if args.since_days and not args.session:
         cutoff = datetime.now(timezone.utc) - timedelta(days=args.since_days)
-        cheap = [p for p in paths if p.stat().st_mtime >= cutoff.timestamp()]
+        # age-only: mtime is a CHEAP PRE-FILTER for recency, never an identity claim. The
+        # authoritative decision is the record timestamp on the next line.
+        #
+        # AN EARLIER VERSION OF THIS COMMENT CLAIMED IT "can only over-include". That was
+        # WRONG, and an independent review leg (gpt-5.5, 2026-08-27) caught it: a transcript
+        # restored from backup or copied with -p keeps an OLD mtime while holding RECENT
+        # records, and is dropped here before last_record_utc ever sees it. So the prefilter
+        # can UNDER-include, which silently understates the rate. Accepted deliberately: on
+        # this workspace transcripts are append-only and written in place, so the case needs
+        # a restore/copy to arise. If that assumption ever breaks, drop the prefilter -- it is
+        # a speed optimisation, not a correctness requirement.
+        def _recent_mtime(q: Path) -> bool:
+            try:
+                return q.stat().st_mtime >= cutoff.timestamp()
+            except OSError:
+                return True   # unreadable/vanished -> do NOT silently drop; let the record
+                              # timestamp decide, or let it fall out there. Dropping here
+                              # would remove a session from the DENOMINATOR invisibly.
+        cheap = [p for p in paths if _recent_mtime(p)]
         paths = [p for p in cheap if (lr := last_record_utc(p)) and lr >= cutoff]
         if not paths:
             print(f"ADVERSE: no sessions in the last {args.since_days}d — cannot measure")
@@ -228,14 +246,33 @@ def main() -> int:
     print("\n  A FALLING rate can mean the agent improved OR that the user stopped correcting.")
     print("  This instrument cannot tell those apart. The second is the worse outcome.")
 
+    # AGGREGATION CHOICE, and the alternatives it was weighed against (review F6, 2026-08-27
+    # -- the first version of this comment argued only against the rejected all-time-worst,
+    # which is validating a choice in isolation):
+    #   windowed WORST   -- one bad session pins the number; no trend visible. Rejected.
+    #   windowed p95     -- robust, but needs more sessions/window than this corpus gives (100
+    #                       in 30d) for a stable tail estimate. Rejected for now.
+    #   turn-WEIGHTED    -- arguably the most defensible: a 354-message session and a
+    #                       6-message session currently count EQUALLY, so the number moves with
+    #                       session MIX as well as with behaviour. NOT adopted only because the
+    #                       16% baseline recorded on 2026-08-27 is a session-mean; switching
+    #                       aggregations silently breaks comparability with it. Revisit
+    #                       deliberately, re-baselining at the same time.
+    # KNOWN BIAS, stated rather than hidden: session-mean is mix-sensitive per the above.
+    #
     # WINDOWED MEAN, not the all-time worst. Reporting rows[0] over the whole corpus returns
     # the same session forever, which is why this check alerted `adverse` on 2/2 runs while
     # carrying no information (heartbeat 2026-08-17, 2026-08-24). A monitor that cannot change
     # its answer cannot show a trend, and a trend is the only thing this file exists to show.
-    mean = sum(r["correction_rate"] for r in rows) / len(rows) if rows else None
+    # F1 (review, 2026-08-27): rows cannot currently hold a None rate -- the `len(msgs) < 5`
+    # guard above means total >= 5, so measure() never takes its `else None` branch. That is an
+    # IMPLICIT invariant across two distant lines; lower the threshold to 0 and this becomes a
+    # TypeError. Filter explicitly rather than rely on the coupling.
+    rated = [r for r in rows if r["correction_rate"] is not None]
+    mean = sum(r["correction_rate"] for r in rated) / len(rated) if rated else None
     win = f"last {args.since_days}d" if args.since_days else "all time"
     print(f"\n  windowed mean rate ({win}): "
-          f"{mean:.0%} over {len(rows)} session(s)" if mean is not None else "  no rows")
+          f"{mean:.0%} over {len(rated)} session(s)" if mean is not None else "  no rows")
     if args.alert_above is None:
         print("  no --alert-above set: NO DEFINED FAILURE CRITERION, so this run cannot fail.")
         return 0
