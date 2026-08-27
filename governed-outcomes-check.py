@@ -612,45 +612,20 @@ NOTIFY_LEDGER = Path.home() / ".cache" / "notify" / "notifications.jsonl"
 # because this module's own filename contains hyphens and cannot be imported in reverse.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from notify_ledger import classify_row as _classify  # noqa: E402
+from notify_ledger import read_records as _read_records  # noqa: E402
 
 
 def read_jsonl_records(text: str, max_join: int = 40):
-    """Yield JSON objects from a JSONL file whose records may SPAN LINES.
+    """Delegates to notify_ledger.read_records — the canonical ledger reader.
 
-    Measured 2026-08-13 by a /simplify review: `~/.cache/notify/notifications.jsonl` holds 53,707
-    lines of which **2,300 (4.3%) fail `json.loads`** — not corruption, but `message` fields
-    carrying unescaped newlines, so one record occupies several lines. A naive `.splitlines()`
-    reader discards those records silently.
-
-    That matters here more than anywhere: the consumer using this exists to catch notifications
-    that reached nobody, and a dropped record is exactly a notification that reached nobody. The
-    reader's failure mode and the defect it hunts are the same shape. It also explains why this
-    workspace held two figures for the same property — 2,300 (split records, counted by me) and
-    555 (genuinely malformed, counted by a peer): different readers, different populations.
-
-    Joins continuation lines until the buffer parses, bounded by max_join so a genuinely
-    malformed record cannot swallow the rest of the file. Unparseable buffers are yielded as
-    None so callers can COUNT them rather than lose them silently.
+    This function used to hold its own copy, and that copy carried the same defect: joining
+    continuation lines with plain `json.loads` recovers NOTHING, because a raw newline inside a
+    JSON string is an invalid control character that fails at the same offset however many lines
+    are appended, while max_join silently discards the valid records swallowed on the way.
+    Measured: 54,611 records vs 55,455 with strict=False. Kept as a thin alias so existing
+    callers in this file are unaffected.
     """
-    buf = ""
-    joined = 0
-    for line in text.splitlines():
-        if not buf and not line.strip():
-            continue
-        buf = line if not buf else buf + "\n" + line
-        try:
-            yield json.loads(buf)
-        except ValueError:
-            joined += 1
-            if joined <= max_join:
-                continue          # probably a record spanning lines; keep accumulating
-            yield None            # give up on this buffer, never swallow the remainder
-        buf, joined = "", 0
-    if buf:
-        try:
-            yield json.loads(buf)
-        except ValueError:
-            yield None
+    return _read_records(text, max_join=max_join)
 
 
 def _any_ts(v) -> datetime | None:
@@ -744,10 +719,15 @@ def outcome_notification_undelivered(days: int, notify: Path | None = None,
         else:
             bad += 1                      # DEC-326: unclassifiable is a failure state
 
-    # Presence pool for the join: a delivery OR a withheld duplicate both prove the alert path
-    # is alive and that this title was announced inside the dedup window. Only `delivered`
-    # answers "how many reached someone"; only `announced` answers "did the channel go quiet".
-    announced = delivered + withheld
+    # A WITHHELD ROW IS NOT EVIDENCE ANYONE WAS TOLD, and the earlier version of this line
+    # assumed it was. `_dedup_check` stamps the dedup key BEFORE `return 1 # send`
+    # (~/bin/notify.sh), i.e. at ATTEMPT time, not delivery time. So a send that failed still
+    # stamps the key, and every identical alert for the next 4h is withheld while nothing ever
+    # reached anyone. Putting `withheld` in the presence pool therefore suppressed exactly the
+    # adverse finding this function exists to raise -- the same defect this series was written
+    # to remove, relocated from `delivered_count` into the join rather than removed.
+    # Only a real delivery proves the channel carried something.
+    announced = delivered
     unannounced, considered = [], 0
     if hb.exists():
         for line in hb.read_text(errors="replace").splitlines():

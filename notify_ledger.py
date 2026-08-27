@@ -28,7 +28,9 @@ LEGACY ROWS: rows predating 2026-08-13 have no `dry_run` field and rows predatin
 have no `delivered` field. Missing `dry_run` means REAL — a delivery that predates the flag
 cannot have been a rehearsal. `delivered` is deliberately NOT consulted here: it is a
 convenience field for consumers, and deriving state from it would make this module disagree
-with the 47,000 rows written before it existed.
+with essentially the whole ledger — only 55 of ~57,400 rows carry the field. (An earlier
+version of this note said "47,000 rows predate it", which was the wrong quantity: 47,000 is
+approximately the `success:true` count, not the pre-`delivered` count.)
 """
 
 import json
@@ -93,6 +95,14 @@ def reached_someone(row):
 
 
 
+def _try(line):
+    """Parse one line, or None. Used by the reader invariant to compute the naive baseline."""
+    try:
+        return json.JSONDecoder(strict=False).decode(line)
+    except ValueError:
+        return None
+
+
 def read_records(text, max_join=40):
     """Yield JSON objects from a JSONL ledger whose records may SPAN LINES.
 
@@ -106,15 +116,25 @@ def read_records(text, max_join=40):
     and cannot be imported -- which is exactly why notify-redeliver.py hand-rolled a lossy
     `.splitlines()` copy instead of reusing it.
 
+    STRICT=FALSE IS THE WHOLE MECHANISM, and shipping without it made this reader WORSE than
+    the naive per-line loop it replaced. A raw newline inside a JSON string is an INVALID
+    CONTROL CHARACTER: `json.loads` rejects the buffer at the same byte offset no matter how
+    many continuation lines are appended, so joining alone recovers NOTHING while `max_join`
+    silently discards the valid records swallowed along the way. Measured on the live ledger:
+    naive 55,135 records; join+`json.loads` 54,611 with ZERO successful joins (-524);
+    join+`strict=False` 55,455 with 476 multi-line records actually recovered (+320).
+    The remedy was inherited from a 2026-08-13 docstring and re-quoted rather than re-tested.
+
     Unparseable buffers are yielded as None so callers can COUNT them rather than lose them.
     """
+    decode = json.JSONDecoder(strict=False).decode
     buf, joined = "", 0
     for line in text.splitlines():
         if not buf and not line.strip():
             continue
         buf = line if not buf else buf + "\n" + line
         try:
-            yield json.loads(buf)
+            yield decode(buf)
         except ValueError:
             joined += 1
             if joined <= max_join:
@@ -123,7 +143,7 @@ def read_records(text, max_join=40):
         buf, joined = "", 0
     if buf:
         try:
-            yield json.loads(buf)
+            yield decode(buf)
         except ValueError:
             yield None
 
@@ -151,6 +171,23 @@ if __name__ == "__main__":
         ({"success": "maybe"}, UNKNOWN),
         ("not a dict", UNKNOWN),
     ]
+    # READER INVARIANT: a reader that recovers spanning records must never return FEWER
+    # records than the naive per-line loop it replaces. Its absence is precisely why a
+    # -524-record reader shipped as a fix and was migrated onto by a second consumer.
+    import pathlib
+    _led = pathlib.Path.home() / ".cache" / "notify" / "notifications.jsonl"
+    reader_note = "skipped (no ledger)"
+    if _led.exists():
+        _txt = _led.read_text(errors="replace")
+        _naive = sum(1 for l in _txt.splitlines() if l.strip()
+                     and _try(l) is not None)
+        _ours = sum(1 for r in read_records(_txt) if r is not None)
+        if _ours < _naive:
+            print(f"FAIL reader invariant: read_records={_ours} < naive={_naive} "
+                  f"({_naive - _ours} records LOST vs the reader this replaces)")
+            raise SystemExit(1)
+        reader_note = f"reader {_ours} >= naive {_naive} (+{_ours - _naive})"
+
     failures = [(r, want, classify_row(r)) for r, want in cases if classify_row(r) != want]
     for row, want, got in failures:
         print(f"FAIL {row!r}: want {want}, got {got}")
@@ -159,4 +196,5 @@ if __name__ == "__main__":
     if failures or not control_ok:
         print(f"FAILED: {len(failures)}/{len(cases)}")
         raise SystemExit(1)
-    print(f"PASS: {len(cases)}/{len(cases)} classifications, both polarities per state")
+    print(f"PASS: {len(cases)}/{len(cases)} classifications, both polarities per state; "
+          f"{reader_note}")
