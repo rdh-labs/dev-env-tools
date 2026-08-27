@@ -199,19 +199,40 @@ if __name__ == "__main__":
             raise SystemExit(1)
         reader_note = f"reader {_ours} >= naive {_naive} (+{_ours - _naive})"
 
-    failures = [(r, want, classify_row(r)) for r, want in cases if classify_row(r) != want]
+    def _run_cases(classify):
+        """The HARNESS. Extracted so a control can exercise it with a known-bad classifier."""
+        return [(r, want, classify(r)) for r, want in cases if classify(r) != want]
+
+    failures = _run_cases(classify_row)
     for row, want, got in failures:
         print(f"FAIL {row!r}: want {want}, got {got}")
-    # CONTROL. The previous form -- `classify_row({"success": True}) != FAILED` -- was a
-    # provable no-op: it could only be False where case 1 already failed, so `failures or not
-    # control_ok` reduced to `failures`. It printed "asserts it can fail" while asserting
-    # nothing. This form feeds the harness a deliberately WRONG expectation and requires the
-    # harness to have SEEN a failure.
-    _control = [(r, want) for r, want in [({"success": True}, FAILED)]
-                if classify_row(r) != want]
-    control_ok = len(_control) == 1
+    # CONTROL — THIRD ATTEMPT, and the first two were both no-ops.
+    # v1: `classify_row({"success": True}) != FAILED`. Provably vacuous: False only where
+    #     case 1 already fails, so `failures or not control_ok` reduced to `failures`.
+    # v2: `len([(r,w) for r,w in [({"success":True}, FAILED)] if classify_row(r) != w]) == 1`.
+    #     ALGEBRAICALLY IDENTICAL to v1 -- `len([x for x in [X] if P]) == 1` IS `bool(P)`.
+    #     Verified against six classifier mutants: zero distinguish v1 from v2. It shipped
+    #     with a commit message claiming it "requires the harness to have SEEN a failure".
+    #     It did not. And the stated proof -- "verified by neutering it, which exits 1" --
+    #     was inverted-control: the exit came from `failures`, never from the control.
+    # BOTH failed the same way: they RE-EVALUATED THE PREDICATE instead of OBSERVING THE
+    # HARNESS. A control has to answer "can this machinery report a failure at all", which is
+    # a question about _run_cases, not about classify_row.
+    # v3 runs the harness against a deliberately broken classifier and requires it to come
+    # back with the mismatch. Non-vacuity proof: if _run_cases were itself broken and always
+    # returned [], `failures` would be empty (looks clean) while `control_ok` is False -- the
+    # exact state v1 and v2 could never reach.
+    _ctl = _run_cases(lambda r: FAILED)
+    control_ok = len(_ctl) >= 1 and any(got == FAILED for _, _, got in _ctl)
+    if not control_ok:
+        # Distinct from a case failure. "FAILED: 0/17" would say the cases passed while
+        # exiting 1, which is a label asserting less than its predicate -- the defect this
+        # module exists to prevent, in its own output.
+        print("FAIL control: the harness did not report a mismatch it was handed — "
+              "a green result from it is not evidence")
     if failures or not control_ok:
-        print(f"FAILED: {len(failures)}/{len(cases)}")
+        print(f"FAILED: {len(failures)}/{len(cases)} case(s)"
+              f"{'' if control_ok else ' + CONTROL VACUOUS'}")
         raise SystemExit(1)
     print(f"PASS: {len(cases)}/{len(cases)} classifications, both polarities per state; "
           f"{reader_note}")
