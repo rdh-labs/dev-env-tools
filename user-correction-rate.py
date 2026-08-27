@@ -47,6 +47,16 @@ PATTERNS = {
     "asked_anything_else":   re.compile(r"anything else that we can/should complete", re.I),
     "you_did_it_again":      re.compile(r"done it AGAIN", re.I),
     "asked_did_you_run_qc":  re.compile(r"did you run|have you run|are you satisfied", re.I),
+    # Added 2026-08-27 after measuring the corpus: the THREE patterns below were the single
+    # largest blind spot in this instrument. "DO NOT JUMP TO CONCLUSIONS" alone accounts for
+    # 656 user issuances across 369 sessions (measured over ~/.claude/projects, 2026-08-27) --
+    # the most-issued correction template in the workspace, and this file could not see ANY of
+    # it. An instrument built to count corrections was blind to the most common correction.
+    # Rate in substantive sessions (>=5 user turns, non-sidechain): May 47.8% -> Jul 38.0% ->
+    # Aug 84.2%, i.e. the trend this file exists to expose was rising while it read 0.
+    "demanded_no_premature_conclusion": re.compile(r"DO NOT JUMP TO CONCLUSIONS", re.I),
+    "demanded_multi_line_inquiry":      re.compile(r"(multiple|single) lines? of inquiry", re.I),
+    "demanded_prior_art_check":         re.compile(r"reinvent the wheel", re.I),
 }
 
 
@@ -90,6 +100,17 @@ def self_check() -> int:
     ok.append(("an empty session yields None, not 0.0 (no data is not a good score)",
                measure([])["correction_rate"] is None))
     ok.append(("a clean session scores 0.0", measure(["thanks", "ok"])["correction_rate"] == 0.0))
+    # POSITIVE controls for the 2026-08-27 additions: each new pattern must actually fire.
+    for key, probe in [("demanded_no_premature_conclusion", "DO NOT JUMP TO CONCLUSIONS OR ACTION"),
+                       ("demanded_multi_line_inquiry",      "run multiple lines of inquiry"),
+                       ("demanded_prior_art_check",         "so we don't reinvent the wheel")]:
+        ok.append((f"positive control fires: {key}",
+                   measure([probe])["by_pattern"][key] == 1))
+    # NEGATIVE control: prose that is ABOUT the topic but is not the user correcting must NOT
+    # fire, or the rate inflates every time the subject is merely discussed.
+    neg = measure(["the wheel on the cart is broken", "I have a single line of code"])
+    ok.append(("negative control silent: topic-adjacent prose does not fire",
+               neg["corrective_messages"] == 0))
     bad = [m for m, good in ok if not good]
     for m in bad:
         print(f"  [FAIL/self-check] {m}")
