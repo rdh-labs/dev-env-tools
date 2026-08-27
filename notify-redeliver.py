@@ -79,9 +79,24 @@ def undelivered(days: int, ledger: Path | None = None) -> list[dict]:
         # Bucket by title+hour: the same event fans out across channels and can straddle a
         # minute boundary, which an earlier minute-keyed pass split into phantom extra events.
         k = f"{title}|{t:%Y-%m-%dT%H}"
-        e = events.setdefault(k, {"title": title, "first": t, "last": t, "ok": 0, "fail": 0})
+        e = events.setdefault(k, {"title": title, "first": t, "last": t,
+                                  "ok": 0, "fail": 0, "withheld": 0})
         e["first"], e["last"] = min(e["first"], t), max(e["last"], t)
-        e["fail" if r.get("success") is False else "ok"] += 1
+        # THREE STATES (2026-08-27, audit ~/dev/share/notify-consumer-audit-2026.md S3).
+        # From 2026-08-27 notify.sh writes `success: false` on the dedup-suppressed path, because
+        # a suppressed send contacted no channel and `success: true` was a claim of delivery for a
+        # notification that reached nobody. Bucketing that as `fail` here would be a REGRESSION the
+        # audit names explicitly: an adverse event whose every row in an hour bucket was merely
+        # deduped would satisfy `ok == 0 and fail > 0` and this repair tool would RE-SEND it --
+        # undoing the dedup's purpose, for an alert a human already received inside the window.
+        # So suppression gets its own bucket: it is not a reached human (`ok`) and not a broken
+        # channel (`fail`), and it keeps an all-withheld event out of the redelivery set entirely.
+        # A genuinely failed attempt sitting alongside a withheld one still redelivers (fail > 0).
+        # Tested BEFORE `success` -- post-fix withheld rows carry `success: false`.
+        if r.get("suppressed") is True:
+            e["withheld"] += 1
+        else:
+            e["fail" if r.get("success") is False else "ok"] += 1
     return sorted((e for e in events.values() if e["ok"] == 0 and e["fail"] > 0),
                   key=lambda e: e["first"])
 

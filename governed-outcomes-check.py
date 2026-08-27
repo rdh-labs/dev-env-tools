@@ -701,7 +701,7 @@ def outcome_notification_undelivered(days: int, notify: Path | None = None,
                 "unannounced": [], "unreadable": ["no delivery ledger -- alert path UNKNOWN"],
                 "note": "a channel that never logged is indistinguishable from one that works"}
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    delivered, failed, bad = [], [], 0
+    delivered, failed, withheld, bad = [], [], [], 0
     # Multi-line aware: 4.3% of this ledger's records span lines (unescaped newlines in
     # `message`). A .splitlines() reader dropped them, and a dropped record here IS a
     # notification that reached nobody -- the reader's failure mode was the defect it hunts.
@@ -722,11 +722,33 @@ def outcome_notification_undelivered(days: int, notify: Path | None = None,
         # unknown-so-ignore -- a delivery that predates the flag cannot have been a rehearsal.
         if r.get("dry_run") is True:
             continue                      # rehearsal: neither a delivery nor a failure
-        if r.get("success") is False:
+        # DEDUP CONTRACT (2026-08-27, audit ~/dev/share/notify-consumer-audit-2026.md S1/S3).
+        # A dedup-suppressed row contacted NO channel. Until 2026-08-27 notify.sh wrote
+        # `success: true` on that path, so this function -- the one tool in the workspace built
+        # to answer "did an adverse alert actually reach someone" -- counted a withheld alert as
+        # DELIVERED. That is the same shape as the dry-run defect above, and it was live for
+        # 42.8% of this ledger's rows.
+        #
+        # THREE STATES, not two. A withheld row is neither:
+        #   - not DELIVERED: nothing was sent, so it must not inflate the delivery count; and
+        #   - not FAILED: the notifier did exactly what it was told to do, so it must not raise
+        #     an adverse finding either (that would make correct dedup read as a broken channel).
+        # It IS positive evidence for the dead-man's-switch join below -- a suppressed row proves
+        # notify.sh ran AND that an identical alert was delivered within the dedup window -- so
+        # it joins `delivered` in `announced` for presence, while staying out of the count.
+        # Checked BEFORE `success`: post-fix rows carry `success: false`, and reading that first
+        # would file every dedup event as a transmission failure.
+        if r.get("suppressed") is True:
+            withheld.append((t, str(r.get("title") or "")))
+        elif r.get("success") is False:
             failed.append(f"{t:%Y-%m-%dT%H:%M:%SZ} {str(r.get('title'))[:60]}")
         else:
             delivered.append((t, str(r.get("title") or "")))
 
+    # Presence pool for the join: a delivery OR a withheld duplicate both prove the alert path
+    # is alive and that this title was announced inside the dedup window. Only `delivered`
+    # answers "how many reached someone"; only `announced` answers "did the channel go quiet".
+    announced = delivered + withheld
     unannounced, considered = [], 0
     if hb.exists():
         for line in hb.read_text(errors="replace").splitlines():
@@ -749,11 +771,12 @@ def outcome_notification_undelivered(days: int, notify: Path | None = None,
             considered += 1
             name = str(r.get("check", ""))
             if not any(name in title and abs((t - dt).total_seconds()) <= 600
-                       for dt, title in delivered):
+                       for dt, title in announced):
                 unannounced.append(f"{name} was {r.get('status')} at {t:%Y-%m-%dT%H:%M:%SZ} "
                                    f"with no delivery row within 10min")
     return {"outcome": "notification_undelivered", "adverse": len(failed) + len(unannounced),
             "failed": failed, "unannounced": unannounced, "adverse_firings_checked": considered,
+            "delivered_count": len(delivered), "withheld_count": len(withheld),
             "unreadable": ([f"{bad} unparseable delivery row(s)"] if bad else [])
                           + ([] if hb.exists() else ["no heartbeat -- cannot check for silence"]),
             "note": "an adverse check nobody heard about is the same as a check that never ran"}
