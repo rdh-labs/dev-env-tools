@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Measure BEHAVIOURAL-NORM compliance over the session-transcript corpus.
 
-⚠️ NOT WIRED YET. The three divergences below are RECONCILED as of 2026-08-27 — see RECONCILED.
+WIRED 2026-08-27: `47 7 * * *` via scheduled-check-runner.sh. The three divergences below are
+RECONCILED as of the same date — see RECONCILED.
 
 `~/bin/peer-comms-check` (cron'd since 2026-08-19) already measures the same relation
 per-session, and is the SOURCE OF TRUTH for what counts as a shared write. This file was
@@ -46,9 +47,15 @@ SHAPE: deliberately the same as tools/fp_measure.py — a predicate replayed ove
 real corpus, reporting rate + explicit denominator + coverage, so a zero is an
 OBSERVED zero rather than an absence of instrumentation.
 
-CONSUMER (this is the point — an unconsumed metric is the defect it measures):
-    scheduled-check-runner.sh norm-compliance <log> \
+CONSUMER (this is the point — an unconsumed metric is the defect it measures). INSTALLED, not
+aspirational, as of 2026-08-27; verified end-to-end in BOTH polarities before wiring:
+    healthy        -> {"check":"norm-compliance-e2e","rc":0,"marker_hit":0,"status":"ok"}
+    forced-adverse -> {"check":"norm-compliance-e2e-adverse","rc":1,"marker_hit":1,"status":"adverse"}
+    47 7 * * * scheduled-check-runner.sh norm-compliance <log> \
         '^NORM-ADVERSE|^NORM-CHECK-ERROR|^NORM-CHECK-WARN|^NORM-OK-LOWN' -- python3 <this file>
+This file shipped UNCONSUMED for two sessions while its own docstring called that the defect it
+measures. The gap was closed only after an explicit prompt; the artifact existing was mistaken
+for the outcome. If you unwire it, change this banner in the same commit.
 
 WARN IS IN THE MARKER DELIBERATELY. NORM-CHECK-WARN fires when the baseline fails to
 persist, which means regression detection is BLIND on the next run — a cannot-assess
