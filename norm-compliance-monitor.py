@@ -133,6 +133,24 @@ WARN_PCT = 35.0       # below this -> NORM-ADVERSE. Set ~15pp under the observed
 REGRESSION_PP = 10.0  # drop this many percentage points vs baseline -> NORM-ADVERSE.
 MIN_N = 10            # below this denominator, report NORM-OK-LOWN: too few to judge.
 
+# THE CONSTRUCT THE RATE MEASURES. Bump this whenever the PREDICATE changes -- shared-path
+# definition, what counts as a write, or how the corpus is selected. A baseline recorded under a
+# different construct is not a baseline, it is a different quantity wearing the same name.
+#
+# DEMONSTRATED 2026-08-27, which is why this exists: the allowlist reconciliation moved the rate
+# 30.3% -> 61.8% with ZERO behaviour change (proved by running the pre-change code against the
+# same corpus: 31.6%, i.e. flat vs its own baseline). The persisted 30.3% baseline survived the
+# change, so REGRESSION_PP=10 was measuring against a quantity that no longer existed: a real
+# collapse from 61.8% to 35% would have registered as a +4.7pp IMPROVEMENT and never alerted.
+# Silent, and it took a peer misreading the jump as a behaviour change to surface it.
+CONSTRUCT_VERSION = "2026-08-27-allowlist-sessionstart-allprojectdirs"
+# CONTROL GAP, STATED RATHER THAN IMPLIED: this guard has NO assertion and NO mutant. It was
+# proven live in three polarities (differing construct -> WARN; absent construct -> WARN;
+# matching -> silent) but the suite cannot detect its removal, so by this file's own standard its
+# green tick is not evidence. Controlling it needs a contract fixture with a PRE-SEEDED baseline
+# -- the existing fixture always starts with prior=None, so the branch is unreachable there.
+# Owed, not done. Same shape as the dead low-N branch this file was rebuilt to fix.
+
 
 # A Bash command that MUTATES a file. Deliberately broad on the mutation verbs and narrow on
 # redirection (`> &` is a descriptor dup, not a write).
@@ -586,7 +604,18 @@ def _main_inner(args):
 
     pct = 100.0 * compliant / wrote
     baseline = _load_baseline()
-    prior = baseline.get(args.norm, {}).get("pct")
+    _rec = baseline.get(args.norm, {})
+    prior = _rec.get("pct")
+    # A baseline from a DIFFERENT construct is not comparable. Warn loudly and refuse the
+    # regression comparison rather than compute a difference between two different quantities.
+    # NORM-CHECK-WARN is already in the consumer's marker set, so this is not silent.
+    _stale_construct = prior is not None and _rec.get("construct") != CONSTRUCT_VERSION
+    if _stale_construct:
+        print(f"NORM-CHECK-WARN: baseline was recorded under construct "
+              f"{_rec.get('construct', '<unversioned>')!r} but this build measures "
+              f"{CONSTRUCT_VERSION!r} — regression comparison SKIPPED (the two are different "
+              f"quantities). Re-run with --set-baseline to re-anchor.")
+        prior = None
 
     detail = (f"{args.norm}: {compliant}/{wrote} = {pct:.1f}% complied "
               f"({never} never broadcast, {ties} tie; {scanned} transcripts on/after {eff}, "
@@ -609,7 +638,8 @@ def _main_inner(args):
 
     if args.set_baseline or prior is None:
         baseline[args.norm] = {"pct": pct, "n": wrote,
-                               "at": datetime.now(timezone.utc).isoformat()}
+                               "at": datetime.now(timezone.utc).isoformat(),
+                               "construct": CONSTRUCT_VERSION}
         _save_baseline(baseline)
 
     if adverse:
