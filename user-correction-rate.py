@@ -34,6 +34,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECTS = Path.home() / ".claude" / "projects"
@@ -78,6 +79,36 @@ def load_user_messages(path: Path) -> list[str]:
     return out
 
 
+def is_adverse(mean_rate: float | None, threshold: float | None) -> bool:
+    """THE SUCCESS/FAILURE CRITERION, isolated so both polarities can be controlled.
+    No threshold configured => no defined failure condition => never adverse (and the caller
+    says so out loud, because an undefined criterion silently reading 'healthy' is the defect
+    this whole file is about)."""
+    if threshold is None or mean_rate is None:
+        return False
+    return mean_rate >= threshold
+
+
+def last_record_utc(path: Path) -> datetime | None:
+    """Timestamp of the session's LAST record. mtime is a cheap PRE-filter only: a file can be
+    touched without a new record, and norm-compliance-monitor.py documents mtime-vs-record drift
+    as a real defect. So mtime narrows the candidate set; the record timestamp decides."""
+    last = None
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            i = line.find('"timestamp":"')
+            if i != -1:
+                last = line[i + 13:i + 33]
+    except OSError:
+        return None
+    if not last:
+        return None
+    try:
+        return datetime.strptime(last[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def measure(messages: list[str]) -> dict:
     counts = {k: sum(1 for m in messages if rx.search(m)) for k, rx in PATTERNS.items()}
     total = len(messages)
@@ -111,6 +142,13 @@ def self_check() -> int:
     neg = measure(["the wheel on the cart is broken", "I have a single line of code"])
     ok.append(("negative control silent: topic-adjacent prose does not fire",
                neg["corrective_messages"] == 0))
+    # BOTH POLARITIES on the failure criterion. A positive-only control cannot fail.
+    ok.append(("criterion fires when mean >= threshold",  is_adverse(0.50, 0.25) is True))
+    ok.append(("criterion silent when mean < threshold",  is_adverse(0.10, 0.25) is False))
+    ok.append(("criterion silent when no threshold set",  is_adverse(0.99, None) is False))
+    ok.append(("criterion silent when nothing measured",  is_adverse(None, 0.25) is False))
+    ok.append(("boundary: equal to threshold IS adverse", is_adverse(0.25, 0.25) is True))
+
     bad = [m for m, good in ok if not good]
     for m in bad:
         print(f"  [FAIL/self-check] {m}")
@@ -124,6 +162,15 @@ def main() -> int:
     ap.add_argument("--session", help="session uuid; default = every transcript found")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--self-check", action="store_true")
+    ap.add_argument("--since-days", type=int, default=0,
+                    help="only sessions whose LAST record is within N days (0 = all time). "
+                         "Without this the tool rescans all history and reports the all-time "
+                         "worst session, which never changes -- so a weekly alert built on it "
+                         "carries no information and cannot show a trend.")
+    ap.add_argument("--alert-above", type=float, default=None,
+                    help="SUCCESS/FAILURE CRITERION. If the windowed mean rate is >= this, "
+                         "print the ADVERSE: marker. Without it this tool has no defined "
+                         "failure condition and its consumer cannot distinguish good from bad.")
     args = ap.parse_args()
 
     if args.self_check:
@@ -133,8 +180,18 @@ def main() -> int:
     paths = sorted(PROJECTS.rglob(f"{args.session}.jsonl")) if args.session \
         else sorted(PROJECTS.rglob("*.jsonl"))
     if not paths:
-        print("no transcripts found — cannot measure, which is not the same as a good score")
-        return 0
+        # NO SILENT FAILURE. rc=2 -> the wrapper maps it to `unknown`, which it treats as
+        # "a check that could not RUN must shout". Returning 0 here would report health.
+        print("ADVERSE: no transcripts found — cannot measure, which is not a good score")
+        return 2
+
+    if args.since_days and not args.session:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=args.since_days)
+        cheap = [p for p in paths if p.stat().st_mtime >= cutoff.timestamp()]
+        paths = [p for p in cheap if (lr := last_record_utc(p)) and lr >= cutoff]
+        if not paths:
+            print(f"ADVERSE: no sessions in the last {args.since_days}d — cannot measure")
+            return 2
 
     rows = []
     for p in paths:
@@ -170,6 +227,22 @@ def main() -> int:
                 print(f"    {v:4d}  {k}")
     print("\n  A FALLING rate can mean the agent improved OR that the user stopped correcting.")
     print("  This instrument cannot tell those apart. The second is the worse outcome.")
+
+    # WINDOWED MEAN, not the all-time worst. Reporting rows[0] over the whole corpus returns
+    # the same session forever, which is why this check alerted `adverse` on 2/2 runs while
+    # carrying no information (heartbeat 2026-08-17, 2026-08-24). A monitor that cannot change
+    # its answer cannot show a trend, and a trend is the only thing this file exists to show.
+    mean = sum(r["correction_rate"] for r in rows) / len(rows) if rows else None
+    win = f"last {args.since_days}d" if args.since_days else "all time"
+    print(f"\n  windowed mean rate ({win}): "
+          f"{mean:.0%} over {len(rows)} session(s)" if mean is not None else "  no rows")
+    if args.alert_above is None:
+        print("  no --alert-above set: NO DEFINED FAILURE CRITERION, so this run cannot fail.")
+        return 0
+    if is_adverse(mean, args.alert_above):
+        print(f"ADVERSE: mean correction rate {mean:.0%} >= threshold {args.alert_above:.0%}")
+        return 1
+    print(f"  within criterion (< {args.alert_above:.0%})")
     return 0
 
 
