@@ -14,6 +14,11 @@ Usage: recommendation-form-check.py '~/.claude/projects/-home-ichardart-dev/*.js
 """
 import re, json, glob, sys
 
+def _usage(code=0):
+    print(__doc__.strip()); sys.exit(code)
+if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    _usage(0 if len(sys.argv) > 1 else 2)
+
 TAIL = re.compile(r'^\s*(?:\*\*)?You:?(?:\*\*)?:?\s*\[(decision|approval)\]', re.M)
 REC  = re.compile(r'\(Recommended\)')
 FENCE= re.compile(r'```.*?```', re.S)
@@ -48,9 +53,17 @@ print("  %d/%d passed" % (ok, len(CONTROLS)))
 if ok != len(CONTROLS):
     print("  ABORT: matcher unproven, corpus number would be meaningless."); sys.exit(1)
 
-print("\nCORPUS MEASUREMENT (%d transcripts):" % len(glob.glob(sys.argv[1])))
+_files = glob.glob(sys.argv[1])
+# An EMPTY corpus prints 0/0/0, which is shape-identical to a clean pass. The original
+# guard proved the MATCHER and left the CORPUS unproven -- the same incomplete mediation
+# this tool exists to measure. Caught 2026-08-28 when `--help` was globbed as a path.
+if not _files:
+    print("\n  ABORT: pattern %r matched 0 files. A zero here would read as "
+          "'no non-conformance' when it means 'nothing was measured'." % sys.argv[1])
+    sys.exit(2)
+print("\nCORPUS MEASUREMENT (%d transcripts):" % len(_files))
 tot = tokened = nonconf = 0
-for f in glob.glob(sys.argv[1]):
+for f in _files:
     try: lines = open(f, errors='replace').read().splitlines()
     except OSError: continue
     for l in lines:
