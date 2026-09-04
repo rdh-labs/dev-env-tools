@@ -264,7 +264,20 @@ def _a97_evidence(text: str) -> list[str]:
 
 
 # scanner_id -> (extractor, evidence_kind). A scanner absent here CANNOT be measured.
+def _a94_evidence(text: str) -> list[str]:
+    """The ACK block bodies A94 classified — the scanned REGION (block text incl. its `remediations:` section),
+    for every v2 block whose remediations are all behavioural, exactly as the live classifier judged them, so an
+    auditor labels the same text the predicate saw."""
+    out: list[str] = []
+    for ack_id, body in evidence_gate._A66_BEGIN_ACK_BLOCK_RE.findall(text):
+        all_behavioral, _items = evidence_gate._a94_classify_block(body)
+        if all_behavioral:
+            out.append(f"{ack_id}: {body.strip()}")
+    return out
+
+
 EVIDENCE_EXTRACTORS: dict[str, tuple[Callable[[str], list[str]], str]] = {
+    "a94": (_a94_evidence, "scanned-region"),
     "a14c": (_a14c_evidence, "matched-span"),
     "a101": (_a101_evidence, "scanned-region"),
     "A97": (_a97_evidence, "matched-span"),
@@ -316,7 +329,26 @@ def _assert_evidence_invariant(art: dict) -> None:
                 f"-- the head-excerpt defect has REGRESSED")
 
 
+
+# ── A94 (session ba652863, 2026-09-04) ──────────────────────────────────────────────────────
+# Promotion candidate: all-behavioural ANOMALY-ACK remediations. Manual graduation review found 8/8 TP on the
+# agent-authored sample (share/session-ba652863-artifacts/a94-graduation-tp-review-2026-09-04.md); this corpus
+# replay is the FP-substance gate's evidence (IDEA-10413) — the patch registers a94 in _fp_streams, so the
+# block engages only when this artifact is fully labeled with zero confirmed FP.
+def _a94_fires(text: str) -> bool:
+    """Calls the REAL evidence_gate check (faithful to the live scanner); the valve, when present in the live
+    file, is applied by that same function."""
+    return bool(evidence_gate.check_behavioral_only_remediation(text, ""))
+
+
 SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], str | None]] = {
+    "a94": (
+        _a94_fires,
+        [evidence_gate._A66_BEGIN_ACK_BLOCK_RE, evidence_gate._A94_BEHAVIORAL_RE, evidence_gate._A94_STRUCTURAL_RE]
+        + ([evidence_gate._A94_VALVE_RE] if hasattr(evidence_gate, "_A94_VALVE_RE") else []),
+        "begin-ack",   # a v2 ACK block is a NECESSARY condition of firing
+    ),
+
     # lowercase key — see the a101 NOTE below; _fp_streams / _fp_artifact_path use lowercase ids.
     "a14c": (
         _a14c_fires,
