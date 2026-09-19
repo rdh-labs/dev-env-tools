@@ -67,7 +67,7 @@ def digest(path: Path) -> str | None:
     return h.hexdigest()
 
 
-def collect(root: Path) -> dict[str, Path]:
+def collect(root: Path, prune: bool = True) -> dict[str, Path]:
     """Every file under root, keyed by path RELATIVE TO root -- never by basename.
 
     Basename keying silently collapsed `a/report.py` and `b/report.py` into one entry, so a
@@ -88,7 +88,10 @@ def collect(root: Path) -> dict[str, Path]:
         # and trip the credential scanner on prop names. Peer session c37ca269 hit both on
         # 2026-09-19 committing an auto-sweep and pruned by hand. Pruned dirs are COUNTED and
         # surfaced so "0 missing" cannot be read as "everything copied".
-        pruned = [d for d in dirnames if d in PRUNE_DIRS]
+        # prune=False for the durable index and the credential audit: a file already rescued
+        # under a fixture .git must still count as rescued, and a token in .git/config is still
+        # a token (Agent review leg, 2026-09-19).
+        pruned = [d for d in dirnames if d in PRUNE_DIRS] if prune else []
         if pruned:
             PRUNED_DIRS.extend(str(Path(dirpath) / d) for d in pruned)
             dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
@@ -104,7 +107,7 @@ def collect(root: Path) -> dict[str, Path]:
 def content_index(root: Path) -> set[str]:
     """Hashes of everything already durable. Rescue is proven by CONTENT, not by filename --
     a stale file with the right name is not a copy of anything."""
-    return {d for p in collect(root).values() if (d := digest(p))}
+    return {d for p in collect(root, prune=False).values() if (d := digest(p))}
 
 
 def already_durable(path: Path) -> Path | None:
@@ -192,6 +195,11 @@ def unattributed_root_files(durable: Path, root: Path | None = None) -> list[dic
 
 
 def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0, src_override: Path | None = None):
+    # PRUNED_DIRS is reset per sweep and carried on the result. The first version left it
+    # append-only across calls, so the rescue path's RE-SWEEP and --all-sessions both
+    # accumulated earlier sessions' prunes, and --all-sessions never printed them at all
+    # (CLI review leg, 2026-09-19: surfaced at one output site, not every site).
+    PRUNED_DIRS.clear()
     src_dir = src_override or find_session_dir(session_id)
     if src_dir is None:
         return {"verdict": "SOURCE_GONE", "detail": f"no /tmp dir for {session_id} — ephemeral state already lost",
@@ -225,7 +233,8 @@ def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0, src_overri
                       f"copy in durable ({len(unreadable)} unreadable)",
             "missing": missing, "durable_elsewhere": elsewhere, "unreadable": unreadable,
             "src": str(src_dir), "durable": str(durable),
-            "source_count": len(src), "durable_count": len(dst_hashes)}
+            "source_count": len(src), "durable_count": len(dst_hashes),
+            "pruned": list(PRUNED_DIRS)}
 
 
 # Filenames whose CONTENT is typically a live credential. Rescuing these moves secrets from
@@ -472,7 +481,7 @@ def all_sessions(durable_root: Path) -> int:
     if not TMP_ROOT.exists():
         print("SWEEP(all): no /tmp session root — nothing to check")
         return 0
-    at_risk, unstarted, checked = [], [], 0
+    at_risk, unstarted, checked, pruned_total = [], [], 0, 0
     for proj in TMP_ROOT.iterdir():
         if not proj.is_dir():
             continue
@@ -482,6 +491,7 @@ def all_sessions(durable_root: Path) -> int:
             checked += 1
             durable = durable_root / f"session-{sess.name[:8]}-artifacts"
             r = sweep(sess.name, durable)
+            pruned_total += len(r.get("pruned", []))
             if r["verdict"] != "MISSING":
                 continue
             # Sessions with no rescue dir were previously SKIPPED as "not a broken promise".
@@ -491,7 +501,8 @@ def all_sessions(durable_root: Path) -> int:
             (unstarted if not durable.exists() else at_risk).append(
                 (sess.name[:8], len(r["missing"])))
     print(f"SWEEP(all): {checked} session(s) checked, {len(at_risk)} with unrescued artifacts, "
-          f"{len(unstarted)} with no rescue directory at all")
+          f"{len(unstarted)} with no rescue directory at all, {pruned_total} dir(s) pruned "
+          f"({'/'.join(sorted(PRUNE_DIRS))})")
     for sid, n in unstarted:
         print(f"  NO-RESCUE-DIR  {sid}  {n} file(s) live only in /tmp")
     for sid, n in at_risk:
@@ -540,7 +551,7 @@ def audit_credentials() -> int:
         for sess in proj.iterdir():
             if not sess.is_dir():
                 continue
-            for rel, fp in collect(sess).items():
+            for rel, fp in collect(sess, prune=False).items():
                 if rel == "__WALK_ERRORS__":
                     continue
                 scanned += 1
@@ -663,9 +674,9 @@ def main() -> int:
     result = sweep(args.session, args.durable.expanduser())
     print(f"SESSION ARTIFACT SWEEP: {result['verdict']}")
     print(f"  {result['detail']}")
-    if PRUNED_DIRS:
-        print(f"  PRUNED (not rescued, by design): {len(PRUNED_DIRS)} dir(s) named "
-              f"{'/'.join(sorted(PRUNE_DIRS))} -- e.g. {PRUNED_DIRS[0]}")
+    if result.get("pruned"):
+        print(f"  PRUNED (not rescued, by design): {len(result['pruned'])} dir(s) named "
+              f"{'/'.join(sorted(PRUNE_DIRS))} -- e.g. {result['pruned'][0]}")
     print(f"  source : {result['src']}")
     print(f"  durable: {result['durable']}")
     if result.get("durable_elsewhere"):
