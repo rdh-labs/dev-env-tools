@@ -452,6 +452,17 @@ def self_check() -> int:
         ok.append(("re-running must leave archived bytes byte-for-byte identical",
                    (arch/"claude-bbb.jsonl").read_bytes() == keep))
 
+    # STDOUT CONTRACT: context-ceiling-watch parses exactly one trailing FINAL-VERDICT: line.
+    # Assert it through the real CLI, not the dict (Agent review leg 2026-09-19: the fix
+    # "rested on an unasserted stdout contract between two files").
+    import subprocess as _sp
+    with tempfile.TemporaryDirectory() as td_fv:
+        _r = _sp.run([sys.executable, __file__, "--session", "00000000-self-check-no-such-session",
+                      "--durable", str(Path(td_fv) / "fv-durable")], capture_output=True, text=True, timeout=60)
+    _lines = [l for l in _r.stdout.splitlines() if l.startswith("FINAL-VERDICT:")]
+    ok.append(("CLI prints exactly one FINAL-VERDICT line, as the LAST stdout line, on the SOURCE_GONE path",
+               _lines == ["FINAL-VERDICT: SOURCE_GONE"] and _r.stdout.rstrip().endswith("FINAL-VERDICT: SOURCE_GONE")))
+    ok.append(("CLI returns 1 (not 0) on SOURCE_GONE -- a lost source is never a pass", _r.returncode == 1))
     # VERDICT-LINE fixtures: without these, hardcoding verdict="COMPLETE" passes everything.
     with tempfile.TemporaryDirectory() as td:
         t = Path(td); (s2 := t/"s").mkdir(); (d2 := t/"d").mkdir()
@@ -714,8 +725,14 @@ def main() -> int:
                 print(f"    NOT RESCUED: {f}")
             after = sweep(args.session, args.durable.expanduser())
             print(f"  RE-SWEEP: {after['verdict']} — {after['detail']}")
+            # FINAL-VERDICT is the ONE line a consumer should parse. It is printed on every
+            # single-session exit, after any rescue, in the same shape. context-ceiling-watch
+            # first parsed RE-SWEEP (printed only after a copy) and read a no-op sweep as a
+            # failure; a consumer parsing an incidental line is the class, this line is the fix.
+            print(f"FINAL-VERDICT: {after['verdict']}")
             return 0 if after["verdict"] == "COMPLETE" or args.report_only else 1
 
+    print(f"FINAL-VERDICT: {result['verdict']}")
     return 0 if (result["verdict"] == "COMPLETE" or args.report_only) else 1
 
 
