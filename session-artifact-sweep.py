@@ -33,6 +33,9 @@ from pathlib import Path
 
 TMP_ROOT = Path("/tmp/claude-1001")
 
+# Directory names never rescued: fixture repos, dependency dumps, bytecode. Surfaced, not silent.
+PRUNE_DIRS = {".git", "node_modules", "__pycache__"}
+PRUNED_DIRS: list[str] = []
 # Directories os.walk could not read. Non-empty => the sweep saw less than the whole tree.
 COLLECT_ERRORS: list[str] = []
 
@@ -79,7 +82,16 @@ def collect(root: Path) -> dict[str, Path]:
     # unreadable subtree yields "0 of 0 missing -> COMPLETE" -- the cleanest possible report
     # over data that is entirely invisible. Unreadable dirs are collected and surfaced.
     errors: list[str] = []
-    for dirpath, _dirnames, filenames in os.walk(root, onerror=lambda e: errors.append(str(e))):
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: errors.append(str(e))):
+        # PRUNE, never silently: an embedded .git (a test-fixture repo) makes `git add` of the
+        # rescue refuse or nest a repo; node_modules dumps and __pycache__ are reconstructible
+        # and trip the credential scanner on prop names. Peer session c37ca269 hit both on
+        # 2026-09-19 committing an auto-sweep and pruned by hand. Pruned dirs are COUNTED and
+        # surfaced so "0 missing" cannot be read as "everything copied".
+        pruned = [d for d in dirnames if d in PRUNE_DIRS]
+        if pruned:
+            PRUNED_DIRS.extend(str(Path(dirpath) / d) for d in pruned)
+            dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
         for fn in filenames:
             fp = Path(dirpath) / fn
             out[str(fp.relative_to(root))] = fp
@@ -651,6 +663,9 @@ def main() -> int:
     result = sweep(args.session, args.durable.expanduser())
     print(f"SESSION ARTIFACT SWEEP: {result['verdict']}")
     print(f"  {result['detail']}")
+    if PRUNED_DIRS:
+        print(f"  PRUNED (not rescued, by design): {len(PRUNED_DIRS)} dir(s) named "
+              f"{'/'.join(sorted(PRUNE_DIRS))} -- e.g. {PRUNED_DIRS[0]}")
     print(f"  source : {result['src']}")
     print(f"  durable: {result['durable']}")
     if result.get("durable_elsewhere"):
