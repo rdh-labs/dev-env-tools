@@ -237,6 +237,31 @@ def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0, src_overri
             "pruned": list(PRUNED_DIRS)}
 
 
+def final_lines(result: dict, rescued: int | None = None, not_rescued: int | None = None) -> list[str]:
+    """The sweep's two CONTRACT lines, in order, on every single-session exit.
+
+    FINAL-VERDICT carries the verdict token ONLY and must stay byte-identical (context-ceiling-watch
+    compares it with ==). FINAL-DETAIL carries the counts a consumer needs to READ the verdict: the
+    first live PreCompact proof (2026-09-21) reported MISSING for 3 of 198 files the secret guard
+    refused by design, and the hook that kept only the token could not tell that from a lost rescue,
+    so it -- and context-ceiling-watch before it -- parsed incidental lines instead. Grammar, stable:
+      FINAL-DETAIL: verdict=<V> missing=<n|-> total=<n|-> unreadable=<n|-> rescued=<n|-> not_rescued=<n|->
+    Counts are the POST-rescue sweep's when a rescue ran; '-' means not applicable on this path.
+    """
+    def n(v):
+        return "-" if v is None else str(v)
+    src_known = result.get("src") is not None
+    return [
+        "FINAL-DETAIL: verdict={} missing={} total={} unreadable={} rescued={} not_rescued={}".format(
+            result["verdict"],
+            n(len(result.get("missing", [])) if src_known else None),
+            n(result.get("source_count") if src_known else None),
+            n(len(result.get("unreadable", [])) if src_known else None),
+            n(rescued), n(not_rescued)),
+        f"FINAL-VERDICT: {result['verdict']}",
+    ]
+
+
 # Filenames whose CONTENT is typically a live credential. Rescuing these moves secrets from
 # an ephemeral dir into a git repo. Found the hard way: a rescue copied live JWT session
 # cookies for a client site into ~/dev/share. They were untracked and removed, but the tool
@@ -477,6 +502,19 @@ def self_check() -> int:
     ok.append(("CLI prints exactly one FINAL-VERDICT line, as the LAST stdout line, on the SOURCE_GONE path",
                _lines == ["FINAL-VERDICT: SOURCE_GONE"] and _r.stdout.rstrip().endswith("FINAL-VERDICT: SOURCE_GONE")))
     ok.append(("CLI returns 1 (not 0) on SOURCE_GONE -- a lost source is never a pass", _r.returncode == 1))
+    # SECOND CONTRACT LINE: FINAL-DETAIL directly precedes FINAL-VERDICT with a fixed key=value grammar,
+    # so no consumer has to parse incidental lines for the counts (precompact_checkpoint.py and
+    # context-ceiling-watch both did, 2026-09-21). Asserted through the CLI on the SOURCE_GONE path and
+    # through final_lines() on the MISSING / rescued paths.
+    _out = _r.stdout.splitlines()
+    ok.append(("CLI prints FINAL-DETAIL as the line directly before FINAL-VERDICT (SOURCE_GONE: every count '-')",
+               len(_out) >= 2 and _out[-2] == "FINAL-DETAIL: verdict=SOURCE_GONE missing=- total=- unreadable=- rescued=- not_rescued=-"))
+    _grammar = re.compile(r"^FINAL-DETAIL: verdict=[A-Z_]+ missing=(\d+|-) total=(\d+|-) unreadable=(\d+|-) rescued=(\d+|-) not_rescued=(\d+|-)$")
+    ok.append(("FINAL-DETAIL grammar holds on every path (a consumer parses ONE regex)",
+               all(_grammar.match(final_lines(x, *a)[0]) for x, a in (
+                   ({"verdict": "SOURCE_GONE", "src": None, "missing": []}, ()),
+                   ({"verdict": "MISSING", "src": "/s", "missing": [1, 2], "unreadable": [], "source_count": 5}, ()),
+                   ({"verdict": "COMPLETE", "src": "/s", "missing": [], "unreadable": [], "source_count": 5}, (2, 0))))))
     # VERDICT-LINE fixtures: without these, hardcoding verdict="COMPLETE" passes everything.
     with tempfile.TemporaryDirectory() as td:
         t = Path(td); (s2 := t/"s").mkdir(); (d2 := t/"d").mkdir()
@@ -486,6 +524,10 @@ def self_check() -> int:
         r_complete = sweep("x", d2, src_override=s2)
         ok.append(("sweep() must return MISSING when a file is genuinely unrescued",
                    r_missing["verdict"] == "MISSING"))
+        ok.append(("FINAL-DETAIL carries the real counts: MISSING 1 of 1 before the copy, then COMPLETE with rescued=1",
+                   final_lines(r_missing)[0] == "FINAL-DETAIL: verdict=MISSING missing=1 total=1 unreadable=0 rescued=- not_rescued=-"
+                   and final_lines(r_complete, 1, 0)[0] == "FINAL-DETAIL: verdict=COMPLETE missing=0 total=1 unreadable=0 rescued=1 not_rescued=0"
+                   and final_lines(r_complete, 1, 0)[1] == "FINAL-VERDICT: COMPLETE"))
         ok.append(("sweep() must return COMPLETE once the bytes exist in durable",
                    r_complete["verdict"] == "COMPLETE"))
     ok.append(("a nonexistent session is SOURCE_GONE, never COMPLETE",
@@ -743,10 +785,10 @@ def main() -> int:
             # single-session exit, after any rescue, in the same shape. context-ceiling-watch
             # first parsed RE-SWEEP (printed only after a copy) and read a no-op sweep as a
             # failure; a consumer parsing an incidental line is the class, this line is the fix.
-            print(f"FINAL-VERDICT: {after['verdict']}")
+            print("\n".join(final_lines(after, len(confirmed), len(failed))))
             return 0 if after["verdict"] == "COMPLETE" or args.report_only else 1
 
-    print(f"FINAL-VERDICT: {result['verdict']}")
+    print("\n".join(final_lines(result)))
     return 0 if (result["verdict"] == "COMPLETE" or args.report_only) else 1
 
 
