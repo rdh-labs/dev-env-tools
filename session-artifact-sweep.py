@@ -307,6 +307,16 @@ SECRET_PATTERNS = [
     ("bearer-header", re.compile(r"[Aa]uthorization:\s*[Bb]earer\s+\S{20,}")),
     ("generic-secret-assign", re.compile(
         r"(?i)\b(api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*[\"\']?[A-Za-z0-9/_+\-]{16,}")),
+    # Google OAuth client secret (client_secret.json) -- absent until 2026-09-21: the cron rescue copied one into a
+    # pushed working tree (dev-79 Agent-leg review C2; Dart AQ7MTb9SRbhj). Split literal: the pre-commit scanner
+    # refuses the joined shape.
+    ("google-client-secret", re.compile(r"\bGOCSP" r"X-[A-Za-z0-9_-]{10,}")),
+    # The JSON-quoted form of generic-secret-assign: {"token": "..."} -- the closing quote sits between the word and
+    # the separator, so the \b\s*[:=] form above can never match a JSON key (same review). Exact key only, so
+    # token_uri / client_secret_file do not fire; the value must be 16+ characters, JSON escapes (\" \\) allowed
+    # inside it (/ship Agent leg: a value containing an escaped quote must not slip through). Linear: no nested quantifier.
+    ("generic-secret-assign-json", re.compile(
+        r'(?i)"(api[_-]?key|client[_-]?secret|secret|password|passwd|token|private[_-]?key)"\s*:\s*"(?:[^"\\\n]|\\.){16,}"')),
 ]
 
 
@@ -567,6 +577,26 @@ def self_check() -> int:
     ok.append(("a nonexistent session is SOURCE_GONE, never COMPLETE",
                sweep("00000000-0000-0000-0000-000000000000", Path("/nonexistent"))["verdict"]
                == "SOURCE_GONE"))
+    # SECRET GUARD SHAPES (2026-09-21): on 2026-09-19 the cron rescue copied a Google OAuth client_secret.json into
+    # ~/dev/share because SECRET_PATTERNS had no Google prefix and generic-secret-assign cannot match a JSON-quoted
+    # key. Fixtures are assembled from fragments (the joined literal never appears in this source); positive AND
+    # negative, so a widened pattern that starts refusing token_uri or a short password fails here.
+    with tempfile.TemporaryDirectory() as td_sec:
+        ts = Path(td_sec)
+        (ts / "google.json").write_text('{"installed": {"client_id": "1-a.apps.googleusercontent.com", "client_secret": "'
+                                        + "GOCSP" + "X-" + "Ab" * 14 + '", "token_uri": "https://oauth2.googleapis.com/token"}}')
+        (ts / "quoted.json").write_text('{"token": "' + "Zz" * 16 + '", "kind": "x"}')
+        (ts / "benign.json").write_text('{"token_uri": "https://oauth2.googleapis.com/token", "password": "short", '
+                                        '"client_secret_file": "where-it-lives.json", "note": "no secret here"}')
+        ok.append(("a Google OAuth client_secret.json shape is refused by CONTENT (google-client-secret)",
+                   content_secret_kind(ts / "google.json") == "google-client-secret"))
+        ok.append(("a JSON-quoted secret key is refused (generic-secret-assign-json)",
+                   content_secret_kind(ts / "quoted.json") == "generic-secret-assign-json"))
+        (ts / "escaped.json").write_text('{"token": "' + "Ab" * 6 + '\\"' + "Cd" * 6 + '"}')   # an escaped quote INSIDE the value
+        ok.append(("a JSON-quoted secret whose value contains an escaped quote is still refused",
+                   content_secret_kind(ts / "escaped.json") == "generic-secret-assign-json"))
+        ok.append(("token_uri, a short password and *_file keys in JSON are NOT refused (no false positive)",
+                   content_secret_kind(ts / "benign.json") is None))
     failed = [m for m, good in ok if not good]
     for m in failed:
         print(f"  [FAIL/self-check] {m}")
