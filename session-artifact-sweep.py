@@ -255,6 +255,11 @@ def looks_like_credential(name: str) -> bool:
 SECRET_PATTERNS = [
     ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
     ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY")),
+    # Anthropic / OpenAI-style keys -- absent until 2026-09-21 although the precompact checkpoint's
+    # own redactor had them; a task output echoing one would have been copied into a pushed repo
+    # (session-end critique, Opus leg, session f3219e83).
+    ("anthropic-key", re.compile(r"sk-" r"ant-[A-Za-z0-9_-]{16,}")),   # split literal: the pre-commit scanner blocks the joined shape
+    ("sk-key", re.compile(r"\bsk-[A-Za-z0-9_-]{16,}")),
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
     ("slack-token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
@@ -264,8 +269,9 @@ SECRET_PATTERNS = [
 ]
 
 
-def content_secret_kind(path: Path, probe_bytes: int = 262_144) -> str | None:
-    """Name of the secret shape found in this file's head, or None.
+def content_secret_kind(path: Path, probe_bytes: int = 8 * 1024 * 1024) -> str | None:
+    """Name of the secret shape found in this file (first probe_bytes, default 8 MB -- above the
+    rescue's own oversize cap, so every file the rescue would copy is probed WHOLE), or None.
 
     NEVER returns or prints the matched text -- only the KIND. A scanner that echoes the
     secret it found has moved the secret into a log, which is the defect it exists to stop.
@@ -370,6 +376,14 @@ def self_check() -> int:
         ok.append(("a private key must be caught", content_secret_kind(f3) == "private-key"))
         ok.append(("the name guard alone would have MISSED the innocently-named file",
                    looks_like_credential("innocent-notes.txt") is False))
+        # 2026-09-21: an Anthropic-style key had NO shape here while the precompact checkpoint's
+        # redactor had one; and a shape sitting past the old 256 KB probe was never seen.
+        sk = "sk-" + "ant-" + "api03-" + "x" * 24
+        (f4 := t/"task-output.txt").write_text(f"tool said: {sk}\n")
+        (f5 := t/"big-output.txt").write_text(("noise\n" * 60_000) + f"late {sk}\n")   # ~360 KB, key at the end
+        ok.append(("an Anthropic-style key must be caught by CONTENT", content_secret_kind(f4) == "anthropic-key"))
+        ok.append(("a key past the old 256 KB probe must still be caught (whole-file probe)",
+                   content_secret_kind(f5) == "anthropic-key"))
 
     # SYMLINK fixture (Agent review SAS-2). shutil.copy2 WRITES THROUGH a symlinked target,
     # silently overwriting whatever it points at. os.replace severs the link instead. This was
