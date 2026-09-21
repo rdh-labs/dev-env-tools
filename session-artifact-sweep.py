@@ -237,27 +237,43 @@ def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0, src_overri
             "pruned": list(PRUNED_DIRS)}
 
 
-def final_lines(result: dict, rescued: int | None = None, not_rescued: int | None = None) -> list[str]:
-    """The sweep's two CONTRACT lines, in order, on every single-session exit.
+def would_refuse(m: dict) -> bool:
+    """True when rescue() would REFUSE this missing entry by design (name, content, size) -- same order,
+    same predicates as rescue(), so a report-only sweep can print refused= without copying anything.
+    Third consumer found by the batch-3 Agent leg: unrescued-check never passes --rescue and read every
+    guard refusal as 'UNRESCUED -- rescue with: ...' forever."""
+    if not isinstance(m, dict) or "name" not in m or "path" not in m:
+        return False          # a malformed entry is not a refusal; the sweep itself never produces one
+    return (looks_like_credential(m["name"]) or content_secret_kind(Path(m["path"])) is not None
+            or bool(m.get("oversize")))
+
+
+def final_lines(result: dict, rescued: int | None = None, refused: int | None = None,
+                not_rescued: int | None = None) -> list[str]:
+    """The sweep's two CONTRACT lines, in order, on every single-session CLI exit.
 
     FINAL-VERDICT carries the verdict token ONLY and must stay byte-identical (context-ceiling-watch
-    compares it with ==). FINAL-DETAIL carries the counts a consumer needs to READ the verdict: the
-    first live PreCompact proof (2026-09-21) reported MISSING for 3 of 198 files the secret guard
-    refused by design, and the hook that kept only the token could not tell that from a lost rescue,
-    so it -- and context-ceiling-watch before it -- parsed incidental lines instead. Grammar, stable:
-      FINAL-DETAIL: verdict=<V> missing=<n|-> total=<n|-> unreadable=<n|-> rescued=<n|-> not_rescued=<n|->
+    compares it with ==). FINAL-DETAIL carries the counts a consumer needs to READ the verdict.
+    Grammar, stable (a consumer parses ONE regex; fields only ever APPEND):
+      FINAL-DETAIL: verdict=<V> missing=<n|-> total=<n|-> unreadable=<n|-> rescued=<n|-> refused=<n|-> not_rescued=<n|->
     Counts are the POST-rescue sweep's when a rescue ran; '-' means not applicable on this path.
+    `refused` is the by-design count (secret guard, oversize); `not_rescued` is copy/read-back
+    failures. A consumer reads missing == refused as MISSING-BY-DESIGN — the reading the first
+    live PreCompact proof could not make (2026-09-21; session-end critique, Opus leg, HIGH-1).
     """
     def n(v):
         return "-" if v is None else str(v)
     src_known = result.get("src") is not None
+    if refused is None and src_known and result.get("missing"):
+        # no rescue ran (report-only): classify without copying, so refused= is never '-' when it is knowable
+        refused = sum(1 for m in result["missing"] if would_refuse(m))
     return [
-        "FINAL-DETAIL: verdict={} missing={} total={} unreadable={} rescued={} not_rescued={}".format(
+        "FINAL-DETAIL: verdict={} missing={} total={} unreadable={} rescued={} refused={} not_rescued={}".format(
             result["verdict"],
             n(len(result.get("missing", [])) if src_known else None),
             n(result.get("source_count") if src_known else None),
             n(len(result.get("unreadable", [])) if src_known else None),
-            n(rescued), n(not_rescued)),
+            n(rescued), n(refused), n(not_rescued)),
         f"FINAL-VERDICT: {result['verdict']}",
     ]
 
@@ -313,23 +329,28 @@ def content_secret_kind(path: Path, probe_bytes: int = 8 * 1024 * 1024) -> str |
     return None
 
 
-def rescue(result, durable: Path) -> list[str]:
+def rescue(result, durable: Path) -> tuple[list[str], list[str], list[str]]:
     """Copy missing files, then RE-READ to confirm each landed. cp exit 0 proves nothing.
 
-    Credential-shaped files are SKIPPED and NAMED — never silently, because a silent skip
-    would recreate the original defect (something absent from durable with no record why).
+    Returns (confirmed, refused, failed). REFUSED is BY DESIGN — credential-shaped name, secret
+    content, oversize — and FAILED is a copy or read-back error. They were ONE list until
+    2026-09-21: the first live PreCompact proof then reported "MISSING" for three guard refusals,
+    a FINAL-DETAIL line was added to carry the counts, and the session-end critique (Opus leg)
+    showed the line still could not say "refused" because the fact was never in the data model.
+    Refusals are NAMED, never silent: a silent skip would recreate the original defect
+    (something absent from durable with no record why).
     """
     durable.mkdir(parents=True, exist_ok=True)
-    confirmed, failed = [], []
+    confirmed, refused, failed = [], [], []
     for m in result["missing"]:
         if looks_like_credential(m["name"]):
-            failed.append(f"{m['name']} (SKIPPED: credential-shaped NAME — not copied into a repo)")
+            refused.append(f"{m['name']} (SKIPPED: credential-shaped NAME — not copied into a repo)")
             continue
         if (kind := content_secret_kind(Path(m["path"]))) is not None:
-            failed.append(f"{m['name']} (SKIPPED: contains a {kind} — not copied into a repo)")
+            refused.append(f"{m['name']} (SKIPPED: contains a {kind} — not copied into a repo)")
             continue
         if m["oversize"]:
-            failed.append(f"{m['name']} (oversize {m['size_mb']}MB — copy manually if wanted)")
+            refused.append(f"{m['name']} (oversize {m['size_mb']}MB — copy manually if wanted)")
             continue
         target = durable / m["name"]
         try:
@@ -345,7 +366,7 @@ def rescue(result, durable: Path) -> list[str]:
             confirmed.append(m["name"])
         else:
             failed.append(f"{m['name']} (copied but read-back mismatch)")
-    return confirmed, failed
+    return confirmed, refused, failed
 
 
 def self_check() -> int:
@@ -508,13 +529,13 @@ def self_check() -> int:
     # through final_lines() on the MISSING / rescued paths.
     _out = _r.stdout.splitlines()
     ok.append(("CLI prints FINAL-DETAIL as the line directly before FINAL-VERDICT (SOURCE_GONE: every count '-')",
-               len(_out) >= 2 and _out[-2] == "FINAL-DETAIL: verdict=SOURCE_GONE missing=- total=- unreadable=- rescued=- not_rescued=-"))
-    _grammar = re.compile(r"^FINAL-DETAIL: verdict=[A-Z_]+ missing=(\d+|-) total=(\d+|-) unreadable=(\d+|-) rescued=(\d+|-) not_rescued=(\d+|-)$")
+               len(_out) >= 2 and _out[-2] == "FINAL-DETAIL: verdict=SOURCE_GONE missing=- total=- unreadable=- rescued=- refused=- not_rescued=-"))
+    _grammar = re.compile(r"^FINAL-DETAIL: verdict=[A-Z_]+ missing=(\d+|-) total=(\d+|-) unreadable=(\d+|-) rescued=(\d+|-) refused=(\d+|-) not_rescued=(\d+|-)$")
     ok.append(("FINAL-DETAIL grammar holds on every path (a consumer parses ONE regex)",
                all(_grammar.match(final_lines(x, *a)[0]) for x, a in (
                    ({"verdict": "SOURCE_GONE", "src": None, "missing": []}, ()),
                    ({"verdict": "MISSING", "src": "/s", "missing": [1, 2], "unreadable": [], "source_count": 5}, ()),
-                   ({"verdict": "COMPLETE", "src": "/s", "missing": [], "unreadable": [], "source_count": 5}, (2, 0))))))
+                   ({"verdict": "COMPLETE", "src": "/s", "missing": [], "unreadable": [], "source_count": 5}, (2, 0, 0))))))
     # VERDICT-LINE fixtures: without these, hardcoding verdict="COMPLETE" passes everything.
     with tempfile.TemporaryDirectory() as td:
         t = Path(td); (s2 := t/"s").mkdir(); (d2 := t/"d").mkdir()
@@ -525,9 +546,22 @@ def self_check() -> int:
         ok.append(("sweep() must return MISSING when a file is genuinely unrescued",
                    r_missing["verdict"] == "MISSING"))
         ok.append(("FINAL-DETAIL carries the real counts: MISSING 1 of 1 before the copy, then COMPLETE with rescued=1",
-                   final_lines(r_missing)[0] == "FINAL-DETAIL: verdict=MISSING missing=1 total=1 unreadable=0 rescued=- not_rescued=-"
-                   and final_lines(r_complete, 1, 0)[0] == "FINAL-DETAIL: verdict=COMPLETE missing=0 total=1 unreadable=0 rescued=1 not_rescued=0"
-                   and final_lines(r_complete, 1, 0)[1] == "FINAL-VERDICT: COMPLETE"))
+                   final_lines(r_missing)[0] == "FINAL-DETAIL: verdict=MISSING missing=1 total=1 unreadable=0 rescued=- refused=0 not_rescued=-"
+                   and final_lines(r_complete, 1, 0, 0)[0] == "FINAL-DETAIL: verdict=COMPLETE missing=0 total=1 unreadable=0 rescued=1 refused=0 not_rescued=0"
+                   and final_lines(r_complete, 1, 0, 0)[1] == "FINAL-VERDICT: COMPLETE"))
+        # REFUSED vs FAILED are different facts (session-end critique 2026-09-21, Opus HIGH-1): a credential-shaped
+        # fixture through the REAL rescue() lands in `refused`, not `failed`, and FINAL-DETAIL says so.
+        (s3 := t/"s3").mkdir(); (d3 := t/"d3").mkdir()
+        (s3/"ok.txt").write_text("plain"); (s3/"token.json").write_text("placeholder: the NAME is credential-shaped; the content need not be")
+        r3 = sweep("x", d3, src_override=s3)
+        c3, ref3, fail3 = rescue(r3, d3)
+        after3 = sweep("x", d3, src_override=s3)
+        ok.append(("rescue() splits REFUSED (credential-shaped name) from FAILED; FINAL-DETAIL carries refused=1 and missing == refused",
+                   c3 == ["ok.txt"] and len(ref3) == 1 and fail3 == [] and after3["verdict"] == "MISSING"
+                   and final_lines(after3, len(c3), len(ref3), len(fail3))[0]
+                       == "FINAL-DETAIL: verdict=MISSING missing=1 total=2 unreadable=0 rescued=1 refused=1 not_rescued=0"
+                   # REPORT-ONLY (no rescue ran): refused= is still classified, so a read-only consumer can read by-design
+                   and final_lines(r3)[0] == "FINAL-DETAIL: verdict=MISSING missing=2 total=2 unreadable=0 rescued=- refused=1 not_rescued=-"))
         ok.append(("sweep() must return COMPLETE once the bytes exist in durable",
                    r_complete["verdict"] == "COMPLETE"))
     ok.append(("a nonexistent session is SOURCE_GONE, never COMPLETE",
@@ -775,8 +809,10 @@ def main() -> int:
             flag = "  [OVERSIZE]" if m["oversize"] else ""
             print(f"    MISSING  {m['name']}  ({m['size_mb']}MB){flag}")
         if args.rescue:
-            confirmed, failed = rescue(result, args.durable.expanduser())
+            confirmed, refused, failed = rescue(result, args.durable.expanduser())
             print(f"  rescued (read-back confirmed): {len(confirmed)}")
+            for f in refused:
+                print(f"    REFUSED (by design): {f}")
             for f in failed:
                 print(f"    NOT RESCUED: {f}")
             after = sweep(args.session, args.durable.expanduser())
@@ -785,7 +821,7 @@ def main() -> int:
             # single-session exit, after any rescue, in the same shape. context-ceiling-watch
             # first parsed RE-SWEEP (printed only after a copy) and read a no-op sweep as a
             # failure; a consumer parsing an incidental line is the class, this line is the fix.
-            print("\n".join(final_lines(after, len(confirmed), len(failed))))
+            print("\n".join(final_lines(after, len(confirmed), len(refused), len(failed))))
             return 0 if after["verdict"] == "COMPLETE" or args.report_only else 1
 
     print("\n".join(final_lines(result)))
