@@ -328,7 +328,9 @@ case_capture_failed() { # a full /tmp (proxy: ulimit -f 16 KiB) must not read as
     fixture; local h=$FX c rc=0
     enable "$h" scrt-cap
     c=$(child "$h" cap 'head -c 40000 /dev/zero | tr "\0" x; echo; echo ADVERSE last-line; exit 0' '# BUDGET: 30')
-    ( ulimit -f 16; env --default-signal=PIPE -C "$h" HOME="$h" TMPDIR="$h/tmp" bash "$RUNNER" scrt-cap /dev/null ADVERSE -- "$c" \
+    # --ignore-signal=XFSZ: cat then fails with EFBIG (as on a real full disk) instead of dying by SIGXFSZ,
+    # whose core dump WSL's core_pattern (|/wsl-capture-crash) writes OUTSIDE the fixture (judge 3, 2026-09-26)
+    ( ulimit -f 16; env --default-signal=PIPE --ignore-signal=XFSZ -C "$h" HOME="$h" TMPDIR="$h/tmp" bash "$RUNNER" scrt-cap /dev/null ADVERSE -- "$c" \
         </dev/null >/dev/null 2>&1 )                             # LOG=/dev/null: only the capture file is capped
     eq "$(q "$(RUNS "$h")" "(n('capture_failed'), first('capture_failed').get('check_exit'), first('end').get('exit'))")" "(1, 0, 70)" || rc=1
     eq "$(q "$(HB "$h")" "[r['status'] for r in rows]")" "['unknown']" || rc=1   # check_exit 0: drained, not SIGPIPEd

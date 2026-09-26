@@ -193,7 +193,7 @@ for p in sorted((d for d in os.listdir("/proc") if d.isdigit()), key=int):
         _row start "$_SCR_INV" "$NAME" "\"exit\":null,\"budget_s\":$_SCR_B,\"budget_src\":\"$_SCR_SRC\",\"pstart\":$_SCR_PSTART"
         # The group writes its pid (the evidence root), undoes the SIGINT/SIGQUIT ignore bash may give an
         # asynchronous command (belt-and-braces: bash 5.2 does not add it for a pipeline, so no test can fail
-        # on that word), runs the check with cron's stdin and its stderr into the pipe, and hands the rc back
+        # on that word), runs the check with an EOF stdin (cron gives an empty pipe; both read EOF) and its stderr into the pipe, and hands the rc back
         # in a file (`wait` on a background pipeline reports the tail's status). The group's OWN stderr is
         # /dev/null, so bash's job-status lines ("Killed", "Terminated") never reach OUT: the capture line has
         # no such parent. The tail stores the output; if it cannot (a full /tmp) a second cat DRAINS the
@@ -303,7 +303,10 @@ PY
         trap 'exit 143' TERM; trap 'exit 129' HUP
         _SCR_LOCKFILE="$_SCR_LOCKS/$(_san "$NAME")"
         if { exec {_SCR_FD}>>"$_SCR_LOCKFILE"; } 2>/dev/null; then
-            if ! flock -n "$_SCR_FD"; then
+            flock -n "$_SCR_FD"; _SCR_FLRC=$?
+            if [ "$_SCR_FLRC" -gt 1 ]; then   # flock itself failed (not contention): run unguarded, and say so
+                _row lock_unavailable "$_SCR_INV" "$NAME" "\"evidence\":\"flock failed (rc $_SCR_FLRC): ran without the overlap guard\""
+            elif [ "$_SCR_FLRC" -eq 1 ]; then  # held: this check's previous run is still going
                 _SCR_HOLDER=""; { read -r _SCR_HOLDER < "$_SCR_LOCKFILE"; } 2>/dev/null
                 _row skipped-locked "$_SCR_INV" "$NAME" "\"holder\":\"$(_san "${_SCR_HOLDER:-unknown}")\""
                 if [ -n "$_SCR_HOLDER" ] && ! _closed "$_SCR_HOLDER" \
