@@ -372,6 +372,15 @@ case_runner_death() { # the runner is TERMed mid-run while a grandchild holds th
     tmp_empty "$h" || rc=1
     return $rc
 }
+case_flock_error() { # flock itself fails (rc 2, injected by source mutation - no PATH shadow): run unguarded, say so
+    fixture; local h=$FX fi="$ROOT/flock-inject.sh"
+    sed 's/flock -n "\$_SCR_FD"; _SCR_FLRC=\$?/(exit 2); _SCR_FLRC=$?/' "$RUNNER" > "$fi"
+    grep -q '(exit 2); _SCR_FLRC=' "$fi" || { echo "        injection not applied"; return 1; }
+    enable "$h" scrt-fle
+    RUNNER="$fi" run "$h" scrt-fle - "$(child "$h" fle 'exit 0' '# BUDGET: 5')"
+    eq "$(q "$(RUNS "$h")" "(n('lock_unavailable'), 'flock failed' in first('lock_unavailable').get('evidence',''), n('start'), n('end'), n('skipped-locked'))")" "(1, True, 1, 1, 0)" &&
+    eq "$(q "$(HB "$h")" "[r['status'] for r in rows]")" "['ok']"
+}
 case_lock_unavailable() { # the lock path cannot be opened: the check still runs, and the ledger says so
     fixture; local h=$FX
     enable "$h" scrt-lu; printf x > "$h/.metrics/scheduled-check-locks"   # a FILE where the dir should be
@@ -602,6 +611,7 @@ ck "suspend: runner SIGSTOPped 8 s -> suspended=1, no false breach"  case_suspen
 ck "suspend control: no stop, child past budget -> breach, suspended=0" case_suspend_control
 ck "lock: second run -> skipped-locked (holder = first inv), no page, no heartbeat" case_lock
 ck "lock path unusable -> lock_unavailable, the check still runs"    case_lock_unavailable
+ck "flock error (not contention) -> lock_unavailable, runs unguarded, no skip" case_flock_error
 ck "mktemp fails -> budget_unavailable, pre-pilot path (5-key row)"  case_mktemp_fails
 ck "adversarial output and BUDGET line: nothing executes; quoted NAME sanitised" case_adversarial
 ck "stdin: EOF on both paths under cron-like stdin; enabled EOF on a pipe" case_stdin
@@ -639,6 +649,7 @@ mutant m12 's/cat > \/dev\/null; }; } {_SCR_FD}>&- &$/cat > \/dev\/null; }; } \&
 mutant m13 's/^            RC=70$/            :/' case_capture_failed "an incomplete capture keeps the check's rc"
 mutant m14 's/^if \[ -f "\$HOME\/\.config\/scheduled-check-runner\/enabled" \] && /if /' case_enabled_path_not_a_file "the regular-file guard removed"
 mutant m15 's/^            {_SCR_FD}>&- 2>\/dev\/null \\$/            {_SCR_FD}>\&- 2>\&1 \\/' case_differential "the group's own stderr goes into the capture"
+mutant m16 's/"\$_SCR_FLRC" -gt 1/"$_SCR_FLRC" -gt 9/' case_flock_error "a flock error treated as contention"
 
 echo
 echo "── evidence ──"
@@ -676,5 +687,5 @@ echo "  live enabled file: $LIVE_ENABLED"
 
 [ "${KEEP:-0}" = 1 ] || rm -rf -- "$ROOT"   # the suite's own mktemp root, nothing else
 echo
-echo "pass=$pass fail=$fail mutants_caught=$caught/15"
-[ "$fail" -eq 0 ] && [ "$caught" -eq 15 ]
+echo "pass=$pass fail=$fail mutants_caught=$caught/16"
+[ "$fail" -eq 0 ] && [ "$caught" -eq 16 ]
