@@ -15,6 +15,8 @@ DESIGN NOTES that are load-bearing:
 - MISSING is a FAILURE state, and so is "source directory absent" — the latter means the
   session's /tmp is already gone, which is unrecoverable, not clean.
 - --rescue copies, then RE-READS to confirm. `cp` exiting 0 is not evidence the file arrived.
+- WHERE copies go is decided ONCE, by rescue_dir(): ${XDG_STATE_HOME:-~/.local/state}/claude-rescue/<project-dir>/
+  session-<sid8>/<kind>/ -- never ~/dev/share (2026-09-27). Callers pass --kind or ask --print-rescue-dir.
 
 Exit codes: 0 when everything is rescued OR --report-only; 1 when files are missing and you
 did not ask it to fix them. That non-zero is deliberate: this is a check, not telemetry.
@@ -26,21 +28,64 @@ import hashlib
 import re
 import os
 import shutil
+import stat
 import subprocess
 import time
 import sys
 from pathlib import Path
 
-TMP_ROOT = Path("/tmp/claude-1001")
+# SWEEP_TMP_ROOT (tests only) moves the whole ephemeral root, for the reason SWEEP_ORPHAN_ROOT exists below: without
+# it --all-sessions can only run against the machine's real /tmp (323 session dirs, 8.1 GB on 2026-09-27), so a
+# round-trip control would read ambient state and send real notifications.
+TMP_ROOT = Path(os.environ.get("SWEEP_TMP_ROOT") or "/tmp/claude-1001")
 
 # Directory names never rescued: fixture repos, dependency dumps, bytecode. Surfaced, not silent.
 PRUNE_DIRS = {".git", "node_modules", "__pycache__"}
 PRUNED_DIRS: list[str] = []
 # Directories os.walk could not read. Non-empty => the sweep saw less than the whole tree.
 COLLECT_ERRORS: list[str] = []
+# NON-REGULAR files (FIFO, socket, device) skipped BEFORE any open() -- "path (kind)". Surfaced, not silent, like
+# PRUNED_DIRS: they hold no bytes to rescue, and open() on a writer-less FIFO never returns (Dart tqbNKHjSsJUh R0-1).
+SKIPPED_FILES: list[str] = []
+_SPECIAL_KINDS = ((stat.S_ISFIFO, "fifo"), (stat.S_ISSOCK, "socket"), (stat.S_ISCHR, "char-device"),
+                  (stat.S_ISBLK, "block-device"))
+
+
+def _special_kind(path: Path) -> str | None:
+    """The kind of a NON-REGULAR file, decided by os.lstat (and, for a symlink, by its target) before anything opens
+    it: 'fifo', 'socket', 'char-device', 'block-device'. None for a regular file or a directory, and None for a path
+    that cannot be stat'ed at all -- a broken symlink stays in the listing and is REPORTED unreadable, as before.
+
+    A symlink is judged by its TARGET because open() follows it: a link to a FIFO blocks exactly as the FIFO does.
+    Measured 2026-09-27: 8 FIFOs under /tmp/claude-1001 hung two scheduled --all-sessions runs for 10 h and 22 h.
+    """
+    try:
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            st = os.stat(path)
+    except OSError:
+        return None
+    if stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode):
+        return None
+    return next((name for test, name in _SPECIAL_KINDS if test(st.st_mode)), "special")
+
+
+# A session id names ONE path component -- the FULL id, not just the 8 characters the layout keeps (2026-09-27
+# review of step 1.2: `--session <sid>/../../../elsewhere --rescue` swept a tree OUTSIDE TMP_ROOT and wrote its
+# copies above the rescue root; `--session ..` swept the whole root into one project's partition). The rule is
+# precompact_checkpoint.SID_OK's. 0 of 346 live session dirs failed it when it was introduced.
+SID_OK = re.compile(r"(?!\.+\Z)[A-Za-z0-9._-]{1,64}")
+
+
+def check_session_id(sid) -> str:
+    """The id itself, if it can name exactly one directory; ValueError otherwise -- before anything is read."""
+    if not isinstance(sid, str) or not SID_OK.fullmatch(sid):
+        raise ValueError(f"session id {sid!r} cannot name a directory")
+    return sid
 
 
 def find_session_dir(session_id: str) -> Path | None:
+    check_session_id(session_id)
     if not TMP_ROOT.exists():
         return None
     for proj in TMP_ROOT.iterdir():
@@ -54,12 +99,81 @@ def find_session_dir(session_id: str) -> Path | None:
 # `/tmp` is NOT here — that is the whole premise.
 DURABLE_ROOTS = (Path.home() / ".claude" / "projects", Path.home() / "dev")
 
+# THE RESCUE LAYOUT, defined ONCE (plan v2.1 step 1.2, review H5, 2026-09-27). Every writer (precompact_checkpoint.py,
+# ~/bin/context-ceiling-watch, a manual --rescue) and every reader (--all-sessions, ~/bin/unrescued-check) resolves
+# through rescue_dir(); the others pass --kind or ask --print-rescue-dir instead of building a path of their own.
+#   <root>/<project-dir>/session-<sid8>/<kind>/      root = ${XDG_STATE_HOME:-~/.local/state}/claude-rescue
+# <project-dir> is the /tmp source's parent (e.g. -home-ichardart-dev), so each project's copies stay in their own
+# partition: a confidential engagement's sessions never land in the dev estate's directory.
+# WHY NOT ~/dev/share: three producers defaulted to it although the estate had REJECTED it as a durable root on
+# 2026-09-05 (precompact_checkpoint.py:28-30: a repo with a remote and session-end auto-commits). The rejection was
+# never executed; by 2026-09-26 share showed 4,200 Source Control lines, 99% session copies, two sessions pushed.
+RESCUE_KINDS = ("precompact", "auto-sweep")
+UNATTRIBUTED_PROJECT = "_unattributed"   # the /tmp source is gone, so no project dir can be read (never a real slug)
+
+
+def rescue_root() -> Path:
+    """${XDG_STATE_HOME:-~/.local/state}/claude-rescue. XDG Base Directory spec 0.8: unset OR EMPTY means
+    $HOME/.local/state, and a RELATIVE value is invalid and is ignored."""
+    xdg = os.environ.get("XDG_STATE_HOME", "")
+    return (Path(xdg) if os.path.isabs(xdg) else Path.home() / ".local" / "state") / "claude-rescue"
+
+
+def rescue_dir(sid: str, kind: str | None, project: str | None = None, root: Path | None = None) -> Path:
+    """<root>/<project-dir>/session-<sid8>/<kind>/ -- the single source of the rescue layout.
+
+    kind: one of RESCUE_KINDS for a WRITER's own directory, or None for the session directory that holds every
+    kind -- what a READER indexes, so a file counts as rescued if it sits under EITHER kind (review H5).
+    project: the /tmp source's parent dir name; None derives it from the live /tmp tree, and UNATTRIBUTED_PROJECT
+    when that tree is gone (a SOURCE_GONE session has nothing to copy, so nothing is ever written there).
+    Both are refused (ValueError) unless each names exactly one path component: the FULL session id, and a project
+    that is not '', '.', '..' and holds no '/' or NUL.
+    """
+    if kind is not None and kind not in RESCUE_KINDS:
+        raise ValueError(f"unknown rescue kind {kind!r} (expected one of {', '.join(RESCUE_KINDS)})")
+    check_session_id(sid)
+    if project is None:
+        src = find_session_dir(sid)
+        project = src.parent.name if src is not None else UNATTRIBUTED_PROJECT
+    if project in ("", ".", "..") or "/" in project or "\0" in project:
+        raise ValueError(f"project dir {project!r} cannot name a directory")
+    base = (root if root is not None else rescue_root()) / project / f"session-{sid[:8]}"
+    return base / kind if kind else base
+
+
+def _open_regular(path: Path):
+    """A binary file object for a REGULAR file, else None -- and it never blocks.
+
+    os.walk lists FIFOs, sockets and devices as files, and open() on a FIFO with no writer never returns. Measured
+    2026-09-27: two scheduled --all-sessions runs had sat in open() (wchan wait_for_partner) for 10 h and 22 h on
+    test FIFOs in session 779d2073's scratchpad, so the twice-daily sweep had reported nothing since 09-26 07:04.
+    Two layers: _special_kind() (lstat, BEFORE any open) refuses a non-regular file outright; O_NONBLOCK plus fstat
+    on the OPEN fd then covers a file swapped for a FIFO between that check and this open. Anything refused here has
+    no bytes to rescue, and callers REPORT it (skipped or unreadable) -- it is never dropped silently.
+    """
+    if _special_kind(path) is not None:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            return os.fdopen(fd, "rb")
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
 
 def digest(path: Path) -> str | None:
-    """sha256 of the file's bytes. None when unreadable -- which is itself reportable."""
+    """sha256 of the file's bytes. None when unreadable or not a regular file -- which is itself reportable."""
     h = hashlib.sha256()
+    fh = _open_regular(path)
+    if fh is None:
+        return None
     try:
-        with path.open("rb") as fh:
+        with fh:
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
     except OSError:
@@ -97,6 +211,9 @@ def collect(root: Path, prune: bool = True) -> dict[str, Path]:
             dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
         for fn in filenames:
             fp = Path(dirpath) / fn
+            if (kind := _special_kind(fp)) is not None:
+                SKIPPED_FILES.append(f"{fp} ({kind})")   # never opened, never listed as a file, never silent
+                continue
             out[str(fp.relative_to(root))] = fp
     if errors:
         out["__WALK_ERRORS__"] = Path("/dev/null")   # forces a non-COMPLETE verdict
@@ -200,14 +317,25 @@ def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0, src_overri
     # accumulated earlier sessions' prunes, and --all-sessions never printed them at all
     # (CLI review leg, 2026-09-19: surfaced at one output site, not every site).
     PRUNED_DIRS.clear()
+    SKIPPED_FILES.clear()
     src_dir = src_override or find_session_dir(session_id)
     if src_dir is None:
         return {"verdict": "SOURCE_GONE", "detail": f"no /tmp dir for {session_id} — ephemeral state already lost",
                 "missing": [], "src": None, "durable": str(durable)}
 
+    n_err = len(COLLECT_ERRORS)
     src = collect(src_dir)
+    src_errs = COLLECT_ERRORS[n_err:]   # THIS walk's errors; the durable index below appends its own
+    skipped = list(SKIPPED_FILES)   # the SOURCE's non-regular files; the durable index below must not add to them
     dst_hashes = content_index(durable)
     missing, elsewhere, unreadable = [], [], []
+    if "__WALK_ERRORS__" in src:
+        # EXPLICIT (2026-09-27 review, HIGH-1): a directory the walk could not read means the sweep saw less than the
+        # whole tree -- unreadable >= 1, so never COMPLETE and never MISSING-BY-DESIGN. This rode on digest()
+        # refusing the /dev/null sentinel; had it hashed it as empty, a durable EMPTY file would have "rescued" it.
+        del src["__WALK_ERRORS__"]
+        unreadable.append({"name": "__WALK_ERRORS__", "path": f"{len(src_errs)} unreadable dir(s) in the source tree"
+                           + (f", e.g. {src_errs[0]}" if src_errs else "")})
     for name, path in sorted(src.items()):
         if (target := already_durable(path)) is not None:
             elsewhere.append({"name": name, "target": str(target)})
@@ -234,7 +362,7 @@ def sweep(session_id: str, durable: Path, skip_large_mb: float = 5.0, src_overri
             "missing": missing, "durable_elsewhere": elsewhere, "unreadable": unreadable,
             "src": str(src_dir), "durable": str(durable),
             "source_count": len(src), "durable_count": len(dst_hashes),
-            "pruned": list(PRUNED_DIRS)}
+            "pruned": list(PRUNED_DIRS), "skipped": skipped}
 
 
 def would_refuse(m: dict) -> bool:
@@ -260,6 +388,9 @@ def final_lines(result: dict, rescued: int | None = None, refused: int | None = 
     `refused` is the by-design count (secret guard, oversize); `not_rescued` is copy/read-back
     failures. A consumer reads missing == refused as MISSING-BY-DESIGN — the reading the first
     live PreCompact proof could not make (2026-09-21; session-end critique, Opus leg, HIGH-1).
+    `refused` counts the SAME population as `missing` -- the files still missing now -- on every path
+    (2026-09-27 review, HIGH-A): the rescue path used to count this run's refusals over the PRE-rescue list,
+    so a refused file deduped by content plus one failed copy made missing == refused with a file LOST.
     """
     def n(v):
         return "-" if v is None else str(v)
@@ -327,8 +458,11 @@ def content_secret_kind(path: Path, probe_bytes: int = 8 * 1024 * 1024) -> str |
     NEVER returns or prints the matched text -- only the KIND. A scanner that echoes the
     secret it found has moved the secret into a log, which is the defect it exists to stop.
     """
+    fh = _open_regular(path)   # a FIFO would block --audit-credentials forever (see _open_regular)
+    if fh is None:
+        return None
     try:
-        with path.open("rb") as fh:
+        with fh:
             head = fh.read(probe_bytes)
     except OSError:
         return None
@@ -337,6 +471,27 @@ def content_secret_kind(path: Path, probe_bytes: int = 8 * 1024 * 1024) -> str |
         if rx.search(text):
             return kind
     return None
+
+
+def _mkdir_private(path: Path) -> None:
+    """mkdir -p where every directory CREATED here is 0700; an existing directory keeps its mode.
+
+    XDG Base Directory spec 0.8: a missing base directory "should be created with permission 0700".
+    mkdir(parents=True) used the umask, so a fresh XDG_STATE_HOME -- and each rescue directory under it -- came out
+    0755 (2026-09-27 review, L2). Rescue copies are session scratch, which can hold client material.
+    """
+    missing = []
+    while not path.is_dir():
+        missing.append(path)
+        if path.parent == path:
+            break
+        path = path.parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            continue          # created concurrently, or not a directory: never chmod what this call did not create
+        os.chmod(d, 0o700)    # the umask cannot narrow or widen it
 
 
 def rescue(result, durable: Path) -> tuple[list[str], list[str], list[str]]:
@@ -350,7 +505,7 @@ def rescue(result, durable: Path) -> tuple[list[str], list[str], list[str]]:
     Refusals are NAMED, never silent: a silent skip would recreate the original defect
     (something absent from durable with no record why).
     """
-    durable.mkdir(parents=True, exist_ok=True)
+    _mkdir_private(durable)
     confirmed, refused, failed = [], [], []
     for m in result["missing"]:
         if looks_like_credential(m["name"]):
@@ -367,7 +522,7 @@ def rescue(result, durable: Path) -> tuple[list[str], list[str], list[str]]:
             # names are RELATIVE PATHS since the basename-collision fix; without this the
             # copy fails ENOENT on every nested file. Caught by RUNNING it, not by review:
             # both review legs saw the pre-relative-path commit.
-            target.parent.mkdir(parents=True, exist_ok=True)
+            _mkdir_private(target.parent)
             shutil.copy2(m["path"], target)
         except OSError as exc:
             failed.append(f"{m['name']} ({exc})")
@@ -380,14 +535,42 @@ def rescue(result, durable: Path) -> tuple[list[str], list[str], list[str]]:
 
 
 def self_check() -> int:
+    """Run _self_check() against an ISOLATED ephemeral root: TMP_ROOT, SWEEP_TMP_ROOT and SWEEP_ORPHAN_ROOT all
+    point at an empty temp dir, and every CLI subprocess below inherits them. Before 2026-09-27 the self-check read
+    the machine's real /tmp/claude-1001 (a find_session_dir scan and the orphan scan of 99 loose files), so its
+    result depended on ambient state and it could meet the FIFOs that hung the scheduled sweep (orchestrator rule,
+    session 6ccf0ff0: no suite reads the real root)."""
+    global TMP_ROOT
+    import tempfile
+    saved = (TMP_ROOT, os.environ.get("SWEEP_TMP_ROOT"), os.environ.get("SWEEP_ORPHAN_ROOT"))
+    with tempfile.TemporaryDirectory() as td_iso:
+        TMP_ROOT = Path(td_iso) / "tmp"
+        TMP_ROOT.mkdir()
+        os.environ["SWEEP_TMP_ROOT"] = os.environ["SWEEP_ORPHAN_ROOT"] = str(TMP_ROOT)
+        try:
+            return _self_check(TMP_ROOT)
+        finally:
+            TMP_ROOT = saved[0]
+            for key, val in (("SWEEP_TMP_ROOT", saved[1]), ("SWEEP_ORPHAN_ROOT", saved[2])):
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+
+def _self_check(iso_root: Path) -> int:
     """Fixtures with known answers, run on every scheduled invocation.
 
     Every case below is a defect that ACTUALLY SHIPPED and was caught by independent review
     after an earlier 4/4 local pass. Fixtures written by the author of the bug share the
     author's blind spot, so these are regression tests against real history, not imagination.
     """
+    global TMP_ROOT   # the round trip below points the reader at a fixture tree, and restores it
     import tempfile
     ok = []
+    ok.append(("the self-check runs against an ISOLATED /tmp root, never the machine's (every CLI call inherits it)",
+               TMP_ROOT == iso_root and Path("/tmp/claude-1001") not in (TMP_ROOT, *TMP_ROOT.parents)
+               and os.environ.get("SWEEP_TMP_ROOT") == os.environ.get("SWEEP_ORPHAN_ROOT") == str(iso_root)))
     with tempfile.TemporaryDirectory() as td:
         t = Path(td)
         (src := t / "src").mkdir(); (dur := t / "dur").mkdir()
@@ -597,6 +780,244 @@ def self_check() -> int:
                    content_secret_kind(ts / "escaped.json") == "generic-secret-assign-json"))
         ok.append(("token_uri, a short password and *_file keys in JSON are NOT refused (no false positive)",
                    content_secret_kind(ts / "benign.json") is None))
+
+    # RESCUE LAYOUT (plan v2.1 step 1.2, review H5, 2026-09-27). The shipped defect: three producers defaulted to
+    # ~/dev/share and the reader looked where only one of them wrote. The recorded rejection becomes a check here;
+    # rescue-layout.test.sh proves each CALLER resolves through this function, with a mutation control per producer.
+    share = (Path.home() / "dev" / "share").resolve()
+    sid_l, proj_l = "abcdef12-3456-4789-8abc-def012345678", "-home-u-dev--with--dashes"   # edge: dashes, leading too
+    defaults = [rescue_root()] + [rescue_dir(sid_l, k, project=proj_l) for k in RESCUE_KINDS]   # THIS environment's
+    ok.append(("NO rescue default resolves under ~/dev/share (the 2026-09-05 rejection, as a check)",
+               not any(d.resolve().is_relative_to(share) for d in defaults)))
+
+    def _refused(*a) -> bool:
+        try:
+            rescue_dir(*a)
+        except ValueError:
+            return True
+        return False
+    saved_xdg = os.environ.get("XDG_STATE_HOME")
+    try:
+        with tempfile.TemporaryDirectory() as td_l:
+            tl = Path(td_l)
+            os.environ["XDG_STATE_HOME"] = str(tl / "not-created-yet")          # edge: the XDG dir does not exist
+            ok.append(("an absolute XDG_STATE_HOME is the root's base, and resolving it creates nothing",
+                       rescue_root() == tl / "not-created-yet" / "claude-rescue" and not (tl / "not-created-yet").exists()))
+            for val, what in (("", "an EMPTY"), ("relative/state", "a RELATIVE")):
+                os.environ["XDG_STATE_HOME"] = val
+                ok.append((f"{what} XDG_STATE_HOME falls back to ~/.local/state (XDG spec 0.8)",
+                           rescue_root() == Path.home() / ".local" / "state" / "claude-rescue"))
+            ok.append(("rescue_dir(sid, kind) is <root>/<project-dir>/session-<sid8>/<kind> for BOTH kinds",
+                       [rescue_dir(sid_l, k, project=proj_l, root=tl) for k in RESCUE_KINDS]
+                       == [tl / proj_l / "session-abcdef12" / k for k in RESCUE_KINDS]))
+            ok.append(("rescue_dir(sid, None) is the ONE dir holding every kind (what a reader indexes)",
+                       {rescue_dir(sid_l, k, project=proj_l, root=tl).parent for k in RESCUE_KINDS}
+                       == {rescue_dir(sid_l, None, project=proj_l, root=tl)}))
+            # The FULL id is checked (review MEDIUM-2): until 2026-09-27 only sid[:8] was, and this label claimed more
+            # than it tested -- '/' past the 8th character, '.' and '..' all passed.
+            bad_ids = ("", "1111aaaa-0000/../../../elsewhere", "..", ".", "...", "a b", "x" * 65, "ab\0cd", "ab\ncd")
+            ok.append(("an unknown kind is refused, and so is every session id that is not ONE safe path component "
+                       "('/' past the 8th character, '.', '..', a space, 65 chars, NUL, newline); a valid one is not",
+                       _refused(sid_l, "bogus") and all(_refused(s, "precompact") for s in bad_ids)
+                       and not _refused("ab.cd_ef-12", "precompact", proj_l, tl) and not _refused("x" * 64, None, proj_l, tl)))
+            ok.append(("a project component that is '', '.', '..' or holds '/' or NUL is refused, never a path",
+                       all(_refused(sid_l, "precompact", p, tl) for p in ("", ".", "..", "a/b", "a\0b"))))
+    finally:
+        if saved_xdg is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = saved_xdg
+
+    # FIFO / SPECIAL FILES (2026-09-27, Dart tqbNKHjSsJUh R0-1): open() on a FIFO with no writer never returns, and
+    # os.walk lists FIFOs as files -- the scheduled sweep had hung for 22 h. A non-regular file, and a symlink to one,
+    # is SKIPPED before any open(): counted and reported as its kind, never hashed or probed, never MISSING or
+    # unreadable, never blocking COMPLETE (a broken symlink is still reported unreadable: fixture above). The alarm
+    # turns a regression into a FAIL instead of a hung self-check.
+    import signal
+
+    class _FifoHung(Exception):
+        """NOT TimeoutError: that is an OSError, which the open guard itself would swallow."""
+
+    def _hung(signum, frame):
+        raise _FifoHung()
+    with tempfile.TemporaryDirectory() as td_f:
+        tf = Path(td_f); (sf := tf / "src").mkdir(); (df := tf / "dur").mkdir()
+        os.mkfifo(sf / "test.fifo"); (sf / "plain.txt").write_text("p"); (sf / "to-fifo.lnk").symlink_to(sf / "test.fifo")
+        prev = signal.signal(signal.SIGALRM, _hung); signal.alarm(10); t0 = time.monotonic()
+        try:
+            r1 = sweep("x", df, src_override=sf)
+            (df / "plain.txt").write_text("p")                  # the one REGULAR file is now rescued
+            r2 = sweep("x", df, src_override=sf)
+            got_f = (sorted(r1["skipped"]), [m["name"] for m in r1["missing"]], r1["unreadable"], r1["verdict"],
+                     r2["verdict"], r2["skipped"] == r1["skipped"], digest(sf / "test.fifo"),
+                     content_secret_kind(sf / "to-fifo.lnk"))
+        except _FifoHung:
+            got_f = "HUNG"
+        finally:
+            signal.alarm(0); signal.signal(signal.SIGALRM, prev)
+        secs_f = time.monotonic() - t0
+        ok.append(("a FIFO and a symlink to it are SKIPPED before any open(): reported as 'fifo', not MISSING or "
+                   "unreadable, never blocking COMPLETE, and the sweep returns within seconds",
+                   got_f == ([f"{sf / 'test.fifo'} (fifo)", f"{sf / 'to-fifo.lnk'} (fifo)"], ["plain.txt"], [],
+                             "MISSING", "COMPLETE", True, None, None) and secs_f < 5))
+
+    # CLI on the DEFAULT path (no --durable): the SOURCE_GONE contract is unchanged, --print-rescue-dir prints the
+    # layout, a --rescue that names no kind is refused, and nothing is created for a session that has no source.
+    with tempfile.TemporaryDirectory() as td_cd:
+        st = Path(td_cd) / "st"; (orph := Path(td_cd) / "no-orphans").mkdir()
+        env_cd = dict(os.environ, XDG_STATE_HOME=str(st), SWEEP_ORPHAN_ROOT=str(orph))
+        gone = "00000000-self-check-no-such-session"
+        _d = _sp.run([sys.executable, __file__, "--session", gone], env=env_cd, capture_output=True, text=True, timeout=60)
+        _p = _sp.run([sys.executable, __file__, "--print-rescue-dir", "--session", gone, "--kind", "auto-sweep"],
+                     env=env_cd, capture_output=True, text=True, timeout=60)
+        _n = _sp.run([sys.executable, __file__, "--session", gone, "--rescue"], env=env_cd, capture_output=True, text=True, timeout=60)
+        created = st.exists()
+    ok.append(("CLI default path: SOURCE_GONE contract unchanged (one FINAL-VERDICT, last line, rc 1), nothing created",
+               [l for l in _d.stdout.splitlines() if l.startswith("FINAL-VERDICT:")] == ["FINAL-VERDICT: SOURCE_GONE"]
+               and _d.stdout.rstrip().endswith("FINAL-VERDICT: SOURCE_GONE") and _d.returncode == 1 and not created))
+    ok.append(("--print-rescue-dir prints the layout path on ONE line and exits 0",
+               _p.returncode == 0 and _p.stdout == f"{st / 'claude-rescue' / UNATTRIBUTED_PROJECT / 'session-00000000' / 'auto-sweep'}\n"))
+    ok.append(("--rescue with neither --durable nor --kind is refused (rc 1), never a guessed directory",
+               _n.returncode == 1 and "needs --kind" in _n.stderr and "FINAL-VERDICT" not in _n.stdout))
+
+    # WALK ERROR -> MISSING by construction (2026-09-27 review, HIGH-1). A source dir the walk cannot read makes the
+    # sweep MISSING with unreadable=1 whatever digest() makes of the sentinel: durable holds an EMPTY file, so a
+    # sentinel hashed as empty bytes would be "rescued" and read COMPLETE. The FINAL-DETAIL pinned here (missing=0
+    # == refused=0, unreadable=1) is exactly the shape the hook and the watcher must NOT read as by design.
+    with tempfile.TemporaryDirectory() as td_w:
+        tw = Path(td_w); (sw := tw / "src").mkdir(); (dw := tw / "dur").mkdir()
+        (sw / "kept.txt").write_text("k"); (dw / "kept.txt").write_text("k"); (dw / "empty").write_bytes(b"")
+        (locked := sw / "locked").mkdir(); (locked / "hidden.txt").write_text("h"); os.chmod(locked, 0)
+        try:
+            locked_really = not os.access(locked, os.R_OK | os.X_OK)
+            rw = sweep("x", dw, src_override=sw)
+        finally:
+            os.chmod(locked, 0o700)
+        ok.append(("a source dir the walk cannot read makes the sweep MISSING with unreadable=1, never COMPLETE, even "
+                   "with an empty file in durable (precondition: chmod 000 made the dir unreadable)",
+                   locked_really and rw["verdict"] == "MISSING" and rw["missing"] == []
+                   and [u["name"] for u in rw["unreadable"]] == ["__WALK_ERRORS__"]
+                   and final_lines(rw, 0, 0, 0)[0] == "FINAL-DETAIL: verdict=MISSING missing=0 total=1 unreadable=1 "
+                                                      "rescued=0 refused=0 not_rescued=0"))
+
+    # TRAVERSAL via --session (2026-09-27 review, MEDIUM-2 / CLI leg HIGH): an id that climbs out of its project dir,
+    # '..' or '.', is refused by the CLI -- rc 1, nothing read (no "source :" line), nothing created. Pre-fix, the
+    # first vector swept a tree OUTSIDE TMP_ROOT and wrote it above the rescue root (derived project '..').
+    real_sid = "cafe0001-0000-4000-8000-000000000003"
+    (TMP_ROOT / "-p" / real_sid / "scratchpad").mkdir(parents=True, exist_ok=True)
+    (TMP_ROOT / "-p" / real_sid / "scratchpad" / "own.txt").write_text("own")
+    (outside := TMP_ROOT.parent / "elsewhere").mkdir(exist_ok=True); (outside / "not-yours.txt").write_text("x")
+    with tempfile.TemporaryDirectory() as td_tv:
+        st_tv = Path(td_tv) / "st"; env_tv = dict(os.environ, XDG_STATE_HOME=str(st_tv))
+        runs = [_sp.run([sys.executable, __file__, *a], env=env_tv, capture_output=True, text=True, timeout=60)
+                for a in (["--session", f"{real_sid}/../../../elsewhere", "--rescue", "--kind", "precompact"],
+                          ["--session", "..", "--rescue", "--kind", "precompact"],
+                          ["--session", ".", "--report-only"],
+                          ["--print-rescue-dir", "--session", "..", "--kind", "auto-sweep"])]
+        created = st_tv.exists()
+    ok.append(("a --session that climbs out (<sid>/../../../elsewhere), '..' or '.' is refused: rc 1, nothing read, "
+               "nothing created",
+               all(r.returncode == 1 and "cannot name a directory" in r.stderr and "source :" not in r.stdout
+                   and "FINAL-VERDICT" not in r.stdout for r in runs) and not created))
+
+    # 0700 (XDG spec 0.8; review L2): every directory the rescue CREATES is 0700 -- a fresh XDG_STATE_HOME, the layout
+    # below it, nested dirs -- and an EXISTING directory keeps its mode.
+    with tempfile.TemporaryDirectory() as td_m:
+        tm = Path(td_m); (tm / "src" / "sub").mkdir(parents=True); (tm / "src" / "sub" / "f.txt").write_text("f")
+        fresh = tm / "fresh-xdg"                                   # does not exist yet
+        (old := tm / "old-xdg").mkdir(); os.chmod(old, 0o755)      # exists: must be left alone
+        k_new = rescue_dir("x", "precompact", project="-p", root=fresh / "claude-rescue")
+        k_old = rescue_dir("x", "precompact", project="-p", root=old / "claude-rescue")
+        for k in (k_new, k_old):
+            rescue(sweep("x", k.parent, src_override=tm / "src"), k)
+        made = [fresh, fresh / "claude-rescue", k_new.parent.parent, k_new.parent, k_new, k_new / "sub"]
+        modes = [p.stat().st_mode & 0o777 if p.exists() else None for p in made]
+        old_modes = (old.stat().st_mode & 0o777, (old / "claude-rescue").stat().st_mode & 0o777)
+    ok.append(("every directory the rescue CREATES is 0700 (fresh XDG_STATE_HOME, layout, nested), an existing one "
+               "keeps its mode",
+               modes == [0o700] * len(made) and old_modes == (0o755, 0o700)))
+
+    # REFUSED COUNTS THE FILES STILL MISSING (2026-09-27 review, HIGH-A; the Agent leg's E13, reproduced through the
+    # real CLI). cookies.txt is refused by name but its bytes equal a.txt's, which IS rescued; sub/b.md's copy fails
+    # (read-only target). Pre-fix the rescue path printed refused=1 over the PRE-rescue list -> missing=1 == refused=1
+    # -> every consumer read MISSING-BY-DESIGN "none lost" while b.md was LOST. Now refused=0: not by design.
+    sid_13 = "e13e13e1-0000-4000-8000-000000000013"
+    (s13 := TMP_ROOT / "-e13" / sid_13 / "scratchpad" / "sub").mkdir(parents=True, exist_ok=True)
+    (s13.parent / "a.txt").write_text("same"); (s13.parent / "cookies.txt").write_text("same"); (s13 / "b.md").write_text("precious")
+    with tempfile.TemporaryDirectory() as td_13:
+        st13 = Path(td_13) / "st"
+        blocked = st13 / "claude-rescue" / "-e13" / "session-e13e13e1" / "precompact" / "scratchpad" / "sub" / "b.md"
+        blocked.parent.mkdir(parents=True); blocked.write_text("stale"); os.chmod(blocked, 0o444)
+        r13 = _sp.run([sys.executable, __file__, "--session", sid_13, "--rescue", "--kind", "precompact", "--report-only"],
+                      env=dict(os.environ, XDG_STATE_HOME=str(st13)), capture_output=True, text=True, timeout=60)
+    d13 = [l for l in r13.stdout.splitlines() if l.startswith("FINAL-DETAIL:")]
+    ok.append(("after a --rescue, refused= counts only files STILL missing: a refused twin of a rescued file plus one "
+               "failed copy is missing=1 refused=0 (never missing == refused with a file lost)",
+               d13 == ["FINAL-DETAIL: verdict=MISSING missing=1 total=3 unreadable=0 rescued=1 refused=0 not_rescued=1"]))
+
+    # ROUND TRIP (review H5): two WRITERS through the real rescue() into the layout, then the scheduled READER through
+    # the real all_sessions(). Isolated: TMP_ROOT and the orphan root point at a fixture tree; notify is off.
+    import contextlib, io
+    saved_tmp, saved_orph = TMP_ROOT, os.environ.get("SWEEP_ORPHAN_ROOT")
+    prev = signal.signal(signal.SIGALRM, _hung); signal.alarm(30)   # a FIFO regression must FAIL here, never hang
+    try:
+        with tempfile.TemporaryDirectory() as td_rt:
+            tr = Path(td_rt); root_rt = tr / "state" / "claude-rescue"
+            TMP_ROOT = tr / "tmp"; os.environ["SWEEP_ORPHAN_ROOT"] = str(TMP_ROOT)
+            sid_rt = "feedf00d-0000-4000-8000-00000000c0de"
+            s_rt = TMP_ROOT / "-home-u-dev" / sid_rt
+
+            def _reader() -> tuple[int, str]:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc_r = all_sessions(root_rt, notify=False)
+                return rc_r, buf.getvalue()
+            try:
+                (s_rt / "scratchpad").mkdir(parents=True); (s_rt / "tasks").mkdir()
+                (s_rt / "scratchpad" / "notes.md").write_text("n1"); (s_rt / "tasks" / "t.output").write_text("o1")
+                os.mkfifo(s_rt / "tasks" / "live.pipe")                             # a writer-less FIFO in the session dir
+                rc0, out0 = _reader()                                               # nothing rescued yet
+                c1, _, _ = rescue(sweep(sid_rt, rescue_dir(sid_rt, None, root=root_rt)), rescue_dir(sid_rt, "precompact", root=root_rt))
+                (s_rt / "scratchpad" / "late.py").write_text("late")                # created AFTER the first rescue
+                c2, _, _ = rescue(sweep(sid_rt, rescue_dir(sid_rt, None, root=root_rt)), rescue_dir(sid_rt, "auto-sweep", root=root_rt))
+                t_rd = time.monotonic(); rc1, out1 = _reader(); secs_rd = time.monotonic() - t_rd
+                (s_rt / "scratchpad" / "unsaved.txt").write_text("u")
+                rc2, out2 = _reader()
+                landed = sorted(str(p.relative_to(root_rt)) for p in root_rt.rglob("*") if p.is_file())
+                # the SAME session id under a second project dir, holding 2 files of its own: each pair must be read
+                # against its own tree (1 at risk in -home-u-dev, 2 with no dir in -home-u) whatever order iterdir gives
+                (s2_rt := TMP_ROOT / "-home-u" / sid_rt / "scratchpad").mkdir(parents=True)
+                (s2_rt / "e1.md").write_text("e1"); (s2_rt / "e2.md").write_text("e2")
+                rc3, out3 = _reader()
+            finally:
+                TMP_ROOT = saved_tmp
+                if saved_orph is None:
+                    os.environ.pop("SWEEP_ORPHAN_ROOT", None)
+                else:
+                    os.environ["SWEEP_ORPHAN_ROOT"] = saved_orph
+    except _FifoHung:
+        rc0 = rc1 = rc2 = rc3 = -1; out0 = out1 = out2 = out3 = "HUNG"; c1, c2, landed, secs_rd = [], [], [], float("inf")
+    finally:
+        signal.alarm(0); signal.signal(signal.SIGALRM, prev)
+    ok.append(("round trip, before any rescue: the reader says NO-RESCUE-DIR for the session (reported, not silent)",
+               "1 session(s) checked, 0 with unrescued artifacts, 1 with no rescue directory at all" in out0
+               and "NO-RESCUE-DIR  feedf00d" in out0))
+    ok.append(("round trip: each writer lands in <project-dir>/session-<sid8>/<its kind>, and the later auto-sweep copies "
+               "ONLY the new file (the index spans both kinds)",
+               sorted(c1) == ["scratchpad/notes.md", "tasks/t.output"] and c2 == ["scratchpad/late.py"]
+               and landed == ["-home-u-dev/session-feedf00d/auto-sweep/scratchpad/late.py",
+                              "-home-u-dev/session-feedf00d/precompact/scratchpad/notes.md",
+                              "-home-u-dev/session-feedf00d/precompact/tasks/t.output"]))
+    ok.append(("round trip: --all-sessions counts a file rescued under EITHER kind -> 0 unrescued, 0 without a dir, rc 0",
+               rc1 == 0 and "1 session(s) checked, 0 with unrescued artifacts, 0 with no rescue directory at all" in out1))
+    ok.append(("round trip: the session's FIFO is counted SKIPPED by the scheduled reader, which returns within seconds",
+               "1 special file(s) skipped (fifo/socket/device)" in out1 and "SKIPPED  feedf00d  1 special file(s)" in out1
+               and secs_rd < 5))
+    ok.append(("round trip negative control: a file created after both rescues is AT RISK and exits 1",
+               rc2 == 1 and "1 with unrescued artifacts" in out2 and "AT RISK  feedf00d  1 file(s)" in out2))
+    ok.append(("one session id under TWO project dirs: each pair is read against its own tree and partition",
+               rc3 == 1 and "2 session(s) checked, 1 with unrescued artifacts, 1 with no rescue directory at all" in out3
+               and "AT RISK  feedf00d  1 file(s)" in out3 and "NO-RESCUE-DIR  feedf00d  2 file(s)" in out3))
     failed = [m for m, good in ok if not good]
     for m in failed:
         print(f"  [FAIL/self-check] {m}")
@@ -605,14 +1026,17 @@ def self_check() -> int:
     return 1 if failed else 0
 
 
-def all_sessions(durable_root: Path) -> int:
+def all_sessions(durable_root: Path, notify: bool = True) -> int:
     """Scheduled mode: every live /tmp session, not just mine. /tmp retention is ~24-36h, so
     an unrescued artifact has a DEADLINE — this is what makes a date-driven trigger correct
-    rather than decorative. Notifies on loss; silence means genuinely nothing at risk."""
+    rather than decorative. Notifies on loss; silence means genuinely nothing at risk.
+
+    durable_root is the root of the rescue LAYOUT (rescue_dir). notify=False is for the self-check's round
+    trip only: the notification is not the path under test, and a test must never page the user."""
     if not TMP_ROOT.exists():
         print("SWEEP(all): no /tmp session root — nothing to check")
         return 0
-    at_risk, unstarted, checked, pruned_total = [], [], 0, 0
+    at_risk, unstarted, checked, pruned_total, skipped_by = [], [], 0, 0, []
     for proj in TMP_ROOT.iterdir():
         if not proj.is_dir():
             continue
@@ -620,9 +1044,22 @@ def all_sessions(durable_root: Path) -> int:
             if not sess.is_dir():
                 continue
             checked += 1
-            durable = durable_root / f"session-{sess.name[:8]}-artifacts"
-            r = sweep(sess.name, durable)
+            # THE LAYOUT: this session's dir in ITS OWN project partition, holding every kind -- a file rescued by
+            # EITHER producer counts (review H5). Until 2026-09-27 this read ~/dev/share/session-<sid8>-artifacts,
+            # so the auto-sweep's copies (under -RESCUE/auto-sweep) never counted at all. src_override pins the sweep
+            # to THIS dir: one session id can live under two project dirs (6 live on 2026-09-27, e.g.
+            # -home-ichardart-dev and -home-ichardart), and find_session_dir() answered with the first for both.
+            try:
+                durable = rescue_dir(sess.name, None, project=proj.name, root=durable_root)
+            except ValueError:
+                # a dir name no rescue path can carry (0 of 346 on 2026-09-27): no producer can rescue it, so it is
+                # AT RISK and named here -- never skipped, and never a crash of the scheduled run
+                at_risk.append((repr(sess.name)[:40], len(collect(sess))))
+                continue
+            r = sweep(sess.name, durable, src_override=sess)
             pruned_total += len(r.get("pruned", []))
+            if r.get("skipped"):
+                skipped_by.append((sess.name[:8], len(r["skipped"])))
             if r["verdict"] != "MISSING":
                 continue
             # Sessions with no rescue dir were previously SKIPPED as "not a broken promise".
@@ -633,7 +1070,10 @@ def all_sessions(durable_root: Path) -> int:
                 (sess.name[:8], len(r["missing"])))
     print(f"SWEEP(all): {checked} session(s) checked, {len(at_risk)} with unrescued artifacts, "
           f"{len(unstarted)} with no rescue directory at all, {pruned_total} dir(s) pruned "
-          f"({'/'.join(sorted(PRUNE_DIRS))})")
+          f"({'/'.join(sorted(PRUNE_DIRS))}), {sum(n for _, n in skipped_by)} special file(s) skipped "
+          f"(fifo/socket/device)")   # appended: governed-outcomes-check reads '(\d+) with unrescued artifacts'
+    for sid, n in skipped_by:
+        print(f"  SKIPPED  {sid}  {n} special file(s) (fifo/socket/device): no bytes to rescue, never opened")
     for sid, n in unstarted:
         print(f"  NO-RESCUE-DIR  {sid}  {n} file(s) live only in /tmp")
     for sid, n in at_risk:
@@ -657,7 +1097,7 @@ def all_sessions(durable_root: Path) -> int:
               + (f", {near} past 20h" if near else ""))
         at_risk = at_risk or [("<tmp-root>", len(orphans))]   # force the non-zero exit below
 
-    if at_risk and (NOTIFY := Path.home() / "bin" / "notify.sh").exists():
+    if at_risk and notify and (NOTIFY := Path.home() / "bin" / "notify.sh").exists():
         body = ", ".join(f"{s}:{n}" for s, n in at_risk)
         p = subprocess.run([str(NOTIFY), "Session artifacts unrescued",
                             f"{len(at_risk)} session(s) have files only in /tmp ({body}). "
@@ -676,6 +1116,7 @@ def audit_credentials() -> int:
     if not TMP_ROOT.exists():
         print("AUDIT: no /tmp session root"); return 0
     hits, scanned = [], 0
+    SKIPPED_FILES.clear()
     for proj in TMP_ROOT.iterdir():
         if not proj.is_dir():
             continue
@@ -690,6 +1131,9 @@ def audit_credentials() -> int:
                     hits.append((sess.name[:8], rel, kind))
     print(f"CREDENTIAL AUDIT: {scanned} file(s) scanned across ephemeral session dirs, "
           f"{len(hits)} carrying secret-shaped content")
+    if SKIPPED_FILES:
+        print(f"  {len(SKIPPED_FILES)} special file(s) skipped (fifo/socket/device, never opened), "
+              f"e.g. {SKIPPED_FILES[0]}")
     for sid, rel, kind in sorted(hits):
         print(f"  {kind:22s} {sid}  {rel}")
     if hits:
@@ -777,10 +1221,19 @@ def main() -> int:
                     help="read-only: find secret-shaped content in ephemeral session dirs")
     # NOT required=True: that made --self-check and --all-sessions unrunnable without an
     # irrelevant flag — a checker that cannot demonstrate it works. Validated per-mode below.
-    ap.add_argument("--durable", type=Path, help="the rescue directory to compare against")
+    ap.add_argument("--durable", type=Path,
+                    help="an EXPLICIT directory to compare against (and --rescue into), bypassing the layout "
+                         "(tests); with --all-sessions, the layout's root. Omit it: rescue_dir() decides")
+    ap.add_argument("--kind", choices=RESCUE_KINDS,
+                    help="which producer is rescuing; --rescue without --durable copies into that kind's dir")
+    ap.add_argument("--rescue-root", type=Path,
+                    help="root of the layout (default ${XDG_STATE_HOME:-~/.local/state}/claude-rescue)")
+    ap.add_argument("--print-rescue-dir", action="store_true",
+                    help="print rescue_dir(--session, --kind) and exit 0; without --kind, the session dir")
     ap.add_argument("--rescue", action="store_true", help="copy the missing files, with read-back confirmation")
     ap.add_argument("--report-only", action="store_true", help="always exit 0")
     args = ap.parse_args()
+    root = args.rescue_root.expanduser() if args.rescue_root else None   # None: rescue_root(), resolved in rescue_dir
 
     if args.self_check:
         print("SESSION ARTIFACT SWEEP: self-check")
@@ -793,23 +1246,46 @@ def main() -> int:
         return audit_credentials()
 
     if args.all_sessions:
-        return all_sessions(args.durable.expanduser() if args.durable else Path.home() / "dev" / "share")
+        # The default is the layout's root -- until 2026-09-27 it was ~/dev/share, which also made the orphan
+        # check below hash every file in share (its .git included) on each scheduled run.
+        return all_sessions(args.durable.expanduser() if args.durable else (root or rescue_root()))
 
-    if not args.durable:
-        print("ERROR: --durable is required for a single-session sweep", file=sys.stderr)
-        return 1
     if not args.session:
         print("ERROR: no session id (pass --session or set CLAUDE_CODE_SESSION_ID)", file=sys.stderr)
         return 1
+    try:
+        check_session_id(args.session)   # the FULL id, before anything is read (review MEDIUM-2)
+        if args.print_rescue_dir:
+            print(rescue_dir(args.session, args.kind, root=root))
+            return 0
+        if args.durable:
+            index_dir = write_dir = args.durable.expanduser()
+        elif args.rescue and not args.kind:
+            # --durable used to be required; guessing a directory for a caller that named neither is how a default
+            # drifts, so the caller must say which producer it is.
+            print(f"ERROR: --rescue without --durable needs --kind ({'|'.join(RESCUE_KINDS)})", file=sys.stderr)
+            return 1
+        else:
+            # Compare against the SESSION dir -- a file under EITHER kind is rescued -- and copy into this kind's own.
+            index_dir = rescue_dir(args.session, None, root=root)
+            write_dir = rescue_dir(args.session, args.kind, root=root) if args.kind else index_dir
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
-    result = sweep(args.session, args.durable.expanduser())
+    result = sweep(args.session, index_dir)
     print(f"SESSION ARTIFACT SWEEP: {result['verdict']}")
     print(f"  {result['detail']}")
     if result.get("pruned"):
         print(f"  PRUNED (not rescued, by design): {len(result['pruned'])} dir(s) named "
               f"{'/'.join(sorted(PRUNE_DIRS))} -- e.g. {result['pruned'][0]}")
+    if result.get("skipped"):
+        print(f"  SKIPPED (not a regular file: no bytes to rescue, never opened): {len(result['skipped'])} -- "
+              f"e.g. {result['skipped'][0]}")
     print(f"  source : {result['src']}")
     print(f"  durable: {result['durable']}")
+    if args.rescue and write_dir != index_dir:
+        print(f"  rescue into: {write_dir}")
     if result.get("durable_elsewhere"):
         # Named, never silent: the reader must be able to check this judgement.
         print(f"  {len(result['durable_elsewhere'])} symlink(s) already durable elsewhere "
@@ -818,7 +1294,7 @@ def main() -> int:
     # ORPHAN RECONCILIATION always prints, including the zero case. A line that appears only
     # on failure makes silence ambiguous -- the reader cannot tell "no orphans" from "this
     # build does not check". That ambiguity is the defect this whole tool exists to remove.
-    orphans = unattributed_root_files(args.durable.expanduser())
+    orphans = unattributed_root_files(index_dir)
     if orphans:
         near = [o for o in orphans if o["near_deadline"]]
         print(f"  ORPHAN RECONCILIATION: {len(orphans)} unattributed file(s) loose in "
@@ -839,19 +1315,21 @@ def main() -> int:
             flag = "  [OVERSIZE]" if m["oversize"] else ""
             print(f"    MISSING  {m['name']}  ({m['size_mb']}MB){flag}")
         if args.rescue:
-            confirmed, refused, failed = rescue(result, args.durable.expanduser())
+            confirmed, refused, failed = rescue(result, write_dir)
             print(f"  rescued (read-back confirmed): {len(confirmed)}")
             for f in refused:
                 print(f"    REFUSED (by design): {f}")
             for f in failed:
                 print(f"    NOT RESCUED: {f}")
-            after = sweep(args.session, args.durable.expanduser())
+            after = sweep(args.session, index_dir)
             print(f"  RE-SWEEP: {after['verdict']} — {after['detail']}")
             # FINAL-VERDICT is the ONE line a consumer should parse. It is printed on every
             # single-session exit, after any rescue, in the same shape. context-ceiling-watch
             # first parsed RE-SWEEP (printed only after a copy) and read a no-op sweep as a
             # failure; a consumer parsing an incidental line is the class, this line is the fix.
-            print("\n".join(final_lines(after, len(confirmed), len(refused), len(failed))))
+            # refused= over the files STILL missing (review HIGH-A), so missing == refused is a set identity
+            print("\n".join(final_lines(after, len(confirmed), sum(1 for m in after["missing"] if would_refuse(m)),
+                                        len(failed))))
             return 0 if after["verdict"] == "COMPLETE" or args.report_only else 1
 
     print("\n".join(final_lines(result)))
