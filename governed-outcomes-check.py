@@ -437,6 +437,11 @@ EXPECTED_CADENCE_H = {
     "ratchet-hooks-pretooluse-tests": 24, "ratchet-hooks-posttooluse-tests": 24,
     "ratchet-hooks-sessionend-tests": 24, "ratchet-hooks-governance-tests": 24,
     "ratchet-hooks-scanner-registry-tests": 24, "ratchet-hooks-test": 24, "ratchet-tools-tests": 24,
+    # 2026-09-27 (session 5cdb5def): `git-census --scm`, the SCM-noise and stale-lock monitor (plan
+    # eventual-purring-tide.md 1.5), daily. Added BEFORE its crontab line, which session 6ccf0ff0
+    # owns: until that line is installed, outcome_marker_cannot_fire reports "expected by the
+    # consumer but NOT in the live schedule", so a handoff that is never installed cannot pass silently.
+    "scm-noise": 24,
 }
 
 
