@@ -418,6 +418,25 @@ EXPECTED_CADENCE_H = {
     "artifact-sweep": 12, "gate-ledger-archive": 1, "selfcheck-canary": 168,
     "anomaly-conversion": 168, "correction-rate": 168, "gate-ack": 24,
     "governed-outcomes": 168,
+    # 2026-09-26 (session 9945d90f): 29 wrapped checks were live in crontab but absent here, so
+    # none was audited for going silent -- outcome_marker_cannot_fire reported the same 29 as
+    # registration drift every week, a constant red nobody acted on. Cadences derived from each
+    # check's crontab expression; the derivation reproduced all 7 entries above exactly.
+    "absent-suite": 168, "anomaly-conversion-contract": 168, "anomaly-initiation": 24,
+    "anomaly-ledger": 24, "anomaly-log-suite": 168, "anomaly-register-suite": 168,
+    "blocker-harness": 6, "cc-socket-dir": 168, "census-hooks": 168, "context-ceiling": 1,
+    "contract-norm-enforcer": 24, "dangerous-command-blocker-tests": 24, "deliverable-verify": 24,
+    "drg-choice-shape": 24, "enforcement-canary": 24, "evaluator-gate-e2e": 6,
+    "memory-index-size": 24, "norm-compliance": 24, "notify-suppressed-contract": 168,
+    "peer-comms": 24, "peer-msg-exit-codes": 168, "pmcron-suite": 168,
+    "retrieval-discrimination": 24, "review-provenance-health": 24, "review-provenance-suite": 168,
+    "share-quiescent-sweep": 1, "share-quiescent-sweep-e2e": 24, "shv-gate-monitor": 24,
+    "shv-heartbeat-watchdog": 24,
+    # suite-ratchet consumers for test directories that had NO scheduled runner (same session).
+    "ratchet-hooks-stop-tests": 24, "ratchet-hooks-startup-tests": 24,
+    "ratchet-hooks-pretooluse-tests": 24, "ratchet-hooks-posttooluse-tests": 24,
+    "ratchet-hooks-sessionend-tests": 24, "ratchet-hooks-governance-tests": 24,
+    "ratchet-hooks-scanner-registry-tests": 24, "ratchet-hooks-test": 24, "ratchet-tools-tests": 24,
 }
 
 
