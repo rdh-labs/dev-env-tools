@@ -63,6 +63,14 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 HOME = Path.home()
+
+
+def _int(v) -> int:
+    """A ledger number as int, 0 when absent or malformed (one bad row must not crash the check)."""
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
 USAGE_LOG = HOME / ".cache/model-selection/usage.jsonl"
 ROUTER_LOG = HOME / ".cache/model-selection/ai-router-usage.jsonl"
 REFLEXION_LOG = HOME / ".claude/logs/reflexion-execution.jsonl"
@@ -208,6 +216,49 @@ def check_provenance(rep: Report) -> None:
         rate = len(fb) / len(typed)
         rep.stats["fallback_rate_window"] = round(rate, 4)
         rep.stats["fallback_count_window"] = len(fb)
+        # WHY each primary did not answer (2026-09-27, session e48e95fa). This check warned
+        # daily at 24-31 % and advised "check provider auth"; auth was fine (live probe), and
+        # the dominant cause was the wrappers' fixed 120 s kill. The rows now record the reason
+        # (gemini-ask, codex-ask since 64ee00b); older rows are classed by shape: a fallback
+        # after >= 118 s is timeout-shaped, a faster one is a fast failure.
+        # ONE classifier, shared with ~/bin/ask-budget (~/bin/lib/fallback_class.py): a hand copy here
+        # missed codex-ask's "primary MODEL: timeout after 120s" reasons within hours (review HIGH).
+        causes: dict[str, int] = {}
+        timeouts = 0
+        try:
+            import os
+            sys.path.insert(0, os.environ.get("FALLBACK_CLASS_DIR") or str(HOME / "bin" / "lib"))
+            from fallback_class import classify
+        except Exception as e:  # noqa: BLE001 -- say so; never guess a cause
+            classify = None
+            rep.stats["fallback_causes"] = f"unavailable: {type(e).__name__}: {e}"
+        if classify is not None:
+            for r in fb:
+                kind, label = classify(r)
+                causes[label] = causes.get(label, 0) + 1
+                timeouts += kind == "timeout"
+            rep.stats["fallback_causes"] = dict(sorted(causes.items(), key=lambda kv: -kv[1]))
+            # ask-budget's stated FAILURE condition: budgets grew to the cap and calls STILL time
+            # out there, so the cause is not time (an outage or a hang). Nothing watched this before.
+            capped = [r for r in typed if classify(r)[0] == "timeout" and _int(r.get("budget_s")) >= 600]
+            rep.stats["timeouts_at_budget_cap"] = len(capped)
+            if len(capped) >= 3:
+                rep.add("WARN", "budget_saturated",
+                        f"{len(capped)} calls timed out AT the 600 s budget cap in {WINDOW_DAYS}d — "
+                        f"more time will not fix these (provider outage or hang); check the provider, "
+                        f"and `ask-budget --explain SCRIPT MODEL LEN` for the bucket")
+        if classify is None:
+            # No classifier -> no cause claim at all (advising "check auth" here is the defect this
+            # block exists to remove).
+            cause_note = "causes: UNAVAILABLE (fallback_class import failed; see stats.fallback_causes)."
+        else:
+            cause_note = ("causes: " + ", ".join(f"{k} {n}" for k, n in causes.items())
+                          + ". " + ("Timeouts dominate: the per-call budget (~/bin/ask-budget) is not keeping up, "
+                                    "or a wrapper still uses a fixed one."
+                                    if fb and timeouts * 2 > len(fb) else
+                                    "Fast failures dominate: check provider auth (`codex login status` reports "
+                                    "stored credentials, NOT their validity -- it said 'Logged in' while the API "
+                                    "returned HTTP 401 token_expired)."))
 
         if len(typed) < MIN_BASELINE_N:
             # Honest about small n — a rate off 3 samples is noise dressed as signal.
@@ -235,14 +286,12 @@ def check_provenance(rep: Report) -> None:
                         f"fallback rate {rate:.1%} exceeds the absolute ceiling "
                         f"{FALLBACK_ABSOLUTE_CEILING:.0%} (trailing baseline {baseline:.1%} "
                         f"has absorbed it — a relative test alone cannot see a slow ramp). "
-                        f"Check provider auth: `codex login status` reports stored "
-                        f"credentials, NOT their validity — it said 'Logged in' while the "
-                        f"API returned HTTP 401 token_expired.")
+                        f"{cause_note}")
             elif rate > max(baseline * FALLBACK_WARN_MULTIPLE, 0.05):
                 rep.add("WARN", "fallback_spike",
                         f"fallback rate {rate:.1%} is >{FALLBACK_WARN_MULTIPLE}x the "
                         f"trailing baseline {baseline:.1%} — models may be degrading "
-                        f"silently; check which primary is failing")
+                        f"silently. {cause_note}")
 
         for r in fb:
             if r.get("model") == r.get("requested_model"):
