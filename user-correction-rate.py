@@ -26,7 +26,36 @@ WHAT IT CANNOT DO, stated because a measurement that oversells itself is worse t
   distinguish those, and the second is the outcome that matters most. Read it alongside
   session length and whether work actually shipped.
 
-Exit 0 always — it reports, it does not judge.
+Exit codes: 0 when it measured and no --alert-above threshold is breached (it reports, it does not
+judge); 1 when the windowed mean breaches --alert-above; 2 when there is nothing to measure. (An
+older line here said "Exit 0 always", which the code has not done since the threshold was added.)
+
+MECHANISM HEADER (back-filled 2026-09-27, session 0a10c312; Dart EUVVnvFyRHeJ found 34 of 35
+scheduled checks without one):
+OBJECTIVE:   OBJECTIVES.md Tier 1 "System Catches Own Errors". The standing rules files
+             (~/.claude/rules/*.md) name this tool as their effect measure: if the agent catches its
+             own errors, the user issues fewer corrections. The metric serves the objective only if
+             it counts the USER's words, hence the 2026-09-27 provenance rule.
+SUCCESS:     the windowed session-mean correction rate falls over successive windows while sessions
+             keep shipping work, and every run prints its rate and its definition.
+FAILURE:     the rate rises or holds; OR the tool cannot measure (no transcripts or no sessions in the
+             window: rc 2, never read as healthy); OR the definition changes without a re-baseline.
+TRIGGERS:    date-driven, weekly (crontab Mon 06:47, scheduled-check-runner `correction-rate`). An
+             event trigger was considered and rejected: a correction happens at UserPromptSubmit, but
+             this is a cross-session TREND, and a per-prompt alarm would tell the user what they have
+             just done themselves. The event-driven counterparts are the in-session gates that
+             consume the SAME rules.
+CONSUMER:    scheduled-check-runner (it pages on its marker or a non-zero rc); the rules files'
+             effect-measure targets (<= 10% of sessions by 2026-10-21); sessions that re-measure
+             before claiming a rule works.
+SILENT-FAIL: rc 2 with an ADVERSE line when there is nothing to measure; the definition is printed on
+             every run, so a changed rule is visible in the output rather than inferred.
+PRIOR-ART:   Huang et al. ICLR 2024 (arXiv:2310.01798) on intrinsic self-correction; ~/bin
+             route_ledger.py (promptSource); anomaly-initiation-rate.py (interaction-scoped measure).
+PROMOTION:   never blocking, by design: it measures the user, not an agent action, so there is
+             nothing to gate. Its numbers feed decisions about promoting the rules' own gates.
+predicate-rung: occurrence -- --self-check (16 checks, including 2 provenance cases); a mutant without
+             the provenance filter fails both.
 """
 from __future__ import annotations
 
@@ -61,20 +90,64 @@ PATTERNS = {
 }
 
 
+# WHO IS SPEAKING is decided by PROVENANCE, not by text (definition change, 2026-09-27, session
+# 0a10c312). A transcript row with type "user" is anything delivered in the user ROLE, not only the
+# user's own words: peer-session messages, task notifications, skill and hook injections (isMeta)
+# and slash-command caveats all arrive that way. Measured over the 69 transcripts of the previous
+# 30 days: of 3,363 rows the old text-only filter counted as "the user", 725 (21.6%) had
+# origin.kind == "human". The rest were isMeta 1,624, peer 398, slash-command rows 389, task
+# notifications 210, other 17. Those rows DILUTED the rate (a bigger denominator) and could add
+# corrections the user never made (a peer quoting "THIS IS AN ANOMALY").
+# RE-BASELINED AT THE CHANGE (both runs `--since-days 30`, 2026-09-27 ~22:00 PDT, same corpus):
+#   old definition: 74 sessions, windowed mean 11%
+#   new definition: 58 sessions, windowed mean 41% (decided per row: origin.kind when present, else
+#     not isMeta and no machine prefix; drafts gave 60/42% and, with a rejected per-transcript
+#     rule, 58/42%)
+# So the measure was diluted about 4x. Any target set against the old number (the rules files'
+# "<= 10% by 2026-10-21") was set against a figure that hid most corrections. Compare later runs
+# with 42%, never 11%: a drop from 42% is a real change; a "drop" from 11% was never available.
+DEFINITION = ("the user's own words only, since 2026-09-27: a row with origin counts iff origin.kind == "
+              "'human'; a row without origin counts unless isMeta or a machine-wrapper prefix "
+              "(decided per row). Before: every text user-role row.")
+_MACHINE_PREFIXES = ("<task-notification", "<local-command", "<command-name", "<command-message",
+                     "<cross-session-message", "Another Claude session", "[Cross-session",
+                     "Stop hook feedback", "<agent-message", "Caveat: The messages below",
+                     "This session is being continued from a previous conversation")
+
+
+def is_human_row(d: dict, txt: str) -> bool:
+    """True when a user-role transcript row carries the user's own words.
+
+    A row WITH `origin` is decided by origin.kind. A row WITHOUT it is decided PER ROW: not isMeta and
+    no machine-wrapper prefix. NOT per transcript. The origin field is written on a minority of rows
+    even within a transcript: in 436 of 524 origin-bearing transcripts, under 10% of user rows carry
+    it, and genuine typed prompts sit between them without one (round-6 review, 2026-09-28; a
+    "no origin => machine" rule dropped most real turns). The prefixes cover the origin-less machine
+    shapes found by the round-5 review: compaction-continuation summaries (1,303 rows, 262 matching
+    correction patterns, i.e. double counts) and `<command-message>` rows (942)."""
+    origin = d.get("origin")
+    if isinstance(origin, dict) and origin.get("kind"):
+        return origin.get("kind") == "human"
+    return not d.get("isMeta") and not txt.lstrip().startswith(_MACHINE_PREFIXES)
+
+
 def load_user_messages(path: Path) -> list[str]:
     out = []
+    rows = []
     for line in path.read_text(errors="replace").splitlines():
         try:
             d = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if d.get("type") != "user":
-            continue
+        if d.get("type") == "user":
+            rows.append(d)
+    for d in rows:
         c = d.get("message", {}).get("content", [])
         txt = c if isinstance(c, str) else "".join(
             b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
-        # Tool results and system reminders are not the user speaking.
-        if txt.strip() and "<system-reminder>" not in txt[:200]:
+        # Tool results and system reminders are not the user speaking; nor is anything whose
+        # provenance says another session, a notification or an injection sent it.
+        if txt.strip() and "<system-reminder>" not in txt[:200] and is_human_row(d, txt):
             out.append(txt)
     return out
 
@@ -159,6 +232,46 @@ def self_check() -> int:
     ok.append(("criterion silent when no threshold set",  is_adverse(0.99, None) is False))
     ok.append(("criterion silent when nothing measured",  is_adverse(None, 0.25) is False))
     ok.append(("boundary: equal to threshold IS adverse", is_adverse(0.25, 0.25) is True))
+    # PROVENANCE (2026-09-27): only the user's own words count. Real row shapes, from transcripts.
+    import tempfile
+    rows = [
+        {"type": "user", "origin": {"kind": "human"}, "promptSource": "typed",
+         "message": {"content": "THIS IS AN ANOMALY"}},                                   # counts
+        {"type": "user", "origin": {"kind": "peer"}, "promptSource": "system", "isMeta": True,
+         "message": {"content": "Another Claude session sent a message: THIS IS AN ANOMALY"}},
+        {"type": "user", "origin": {"kind": "task-notification"}, "promptSource": "system",
+         "message": {"content": "<task-notification> done it AGAIN </task-notification>"}},
+        {"type": "user", "isMeta": True, "message": {"content": "skill text: gaps #1 #2 #3"}},
+        {"type": "user", "message": {"content": "<task-notification> legacy row </task-notification>"}},
+        {"type": "user", "message": {"content": "legacy human row, before origin existed"}},  # counts
+    ]
+    def _load(rs):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in rs))
+        try:
+            return load_user_messages(Path(fh.name))
+        finally:
+            Path(fh.name).unlink()
+    # A transcript that HAS origin fields still holds origin-less human prompts (round-6 review):
+    # they count; origin-less MACHINE shapes do not.
+    got = _load(rows + [
+        {"type": "user", "message": {"content": "This session is being continued from a previous "
+                                                 "conversation. The user said DO NOT JUMP TO CONCLUSIONS"}},
+        {"type": "user", "message": {"content": "<command-message>ship</command-message>"}},
+    ])
+    ok.append(("provenance: peer, notification, isMeta, continuation summary and command rows are "
+               "excluded; human rows (with or without origin) count",
+               got == ["THIS IS AN ANOMALY", "legacy human row, before origin existed"]))
+    ok.append(("provenance: a peer or a summary quoting a correction is NOT a user correction",
+               measure(got)["corrective_messages"] == 1))
+    ok.append(("provenance: an origin-less typed prompt amid origin-bearing rows still counts",
+               _load([rows[0], {"type": "user", "message": {"content": "proceed"}}]) ==
+               ["THIS IS AN ANOMALY", "proceed"]))
+    # A LEGACY transcript (no origin anywhere): the prefix fallback applies.
+    legacy = _load([r for r in rows if "origin" not in r] + [
+        {"type": "user", "message": {"content": "This session is being continued from a previous conversation."}}])
+    ok.append(("legacy transcript: plain rows count, wrappers and continuation summaries do not",
+               legacy == ["legacy human row, before origin existed"]))
 
     bad = [m for m, good in ok if not good]
     for m in bad:
@@ -242,7 +355,8 @@ def main() -> int:
         return 0
 
     print(f"USER CORRECTION RATE — {len(rows)} session(s) with >=5 user messages")
-    print(f"  (shorter sessions excluded: too few messages for the rate to mean anything)\n")
+    print(f"  (shorter sessions excluded: too few messages for the rate to mean anything)")
+    print(f"  definition: {DEFINITION}\n")
     print(f"  {'session':10} {'msgs':>5} {'corrective':>11} {'rate':>6}")
     for r in rows[:15]:
         print(f"  {r['session']:10} {r['user_messages']:5d} {r['corrective_messages']:11d} "
