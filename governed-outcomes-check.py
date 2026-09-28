@@ -442,6 +442,17 @@ EXPECTED_CADENCE_H = {
     # owns: until that line is installed, outcome_marker_cannot_fire reports "expected by the
     # consumer but NOT in the live schedule", so a handoff that is never installed cannot pass silently.
     "scm-noise": 24,
+    # 2026-09-28 (session 50b32b9a), both daily and installed the same day by that session, so
+    # either one going silent is itself detectable:
+    #  - multi-check-legs: multi-check-health.py --ledger, the judge of every multi-check leg over
+    #    real traffic (multi-check 97c41f4). Its event-driven alarm lives in multi-check itself
+    #    (a 3-run failure streak pages in-process); this is the backstop.
+    #  - resolve-model-suite: ~/bin/tests/resolve-model.test.sh, whose section 10 checks the LIVE
+    #    model registry. Its commit-time trigger (GUARDS) does not cover edits that are never
+    #    committed (the weekly refresh cron) or commits in dev-env-docs (whose local pre-commit
+    #    skips tests-for-staged), so this date-driven run is the only backstop for those.
+    "multi-check-legs": 24,
+    "resolve-model-suite": 24,
 }
 
 
