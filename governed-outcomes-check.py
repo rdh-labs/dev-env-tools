@@ -453,6 +453,10 @@ EXPECTED_CADENCE_H = {
     #    skips tests-for-staged), so this date-driven run is the only backstop for those.
     "multi-check-legs": 24,
     "resolve-model-suite": 24,
+    # 2026-09-29 (session 6cdb3561): the D1 live codex sandbox canary (~/bin/tests/codex-ask-sandbox.live.sh,
+    # crontab 37 3 * * *, installed by the user from session 4e214452). It was live in crontab but absent here,
+    # so this check reported it as registration drift and nothing audited it for going silent.
+    "codex-sandbox-canary": 24,
 }
 
 
