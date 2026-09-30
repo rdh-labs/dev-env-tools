@@ -44,7 +44,12 @@ TRIGGERS:    date-driven, weekly (crontab Mon 06:47, scheduled-check-runner `cor
              event trigger was considered and rejected: a correction happens at UserPromptSubmit, but
              this is a cross-session TREND, and a per-prompt alarm would tell the user what they have
              just done themselves. The event-driven counterparts are the in-session gates that
-             consume the SAME rules.
+             consume the SAME rules. REVISITED 2026-09-29 (session 1bdb029f): that reasoning
+             misses the SYSTEM as a consumer (a prompt-time fingerprint of a pasted directive could
+             feed its promotion into a rules file); proposal tracked on Dart EUVVnvFyRHeJ.
+             PASTE-COUNT MODE (--phrase, added 2026-09-29): on demand; it is the shared counter the
+             rules/*.md effect measures point at, because ad-hoc whole-file greps over-counted every
+             rules phrase 1.4x-8x (any record, not the user's words).
 CONSUMER:    scheduled-check-runner (it pages on its marker or a non-zero rc); the rules files'
              effect-measure targets (<= 10% of sessions by 2026-10-21); sessions that re-measure
              before claiming a rule works.
@@ -131,22 +136,62 @@ def is_human_row(d: dict, txt: str) -> bool:
     return not d.get("isMeta") and not txt.lstrip().startswith(_MACHINE_PREFIXES)
 
 
-def load_user_messages(path: Path) -> list[str]:
+def _flatten(c) -> str:
+    """Message content (a string, or a list of blocks) -> its text blocks joined."""
+    return c if isinstance(c, str) else "".join(
+        b.get("text", "") for b in (c or []) if isinstance(b, dict) and b.get("type") == "text")
+
+
+def _own_words(txt: str) -> bool:
+    """Tool results, system reminders and machine-injected prompts are not the user speaking."""
+    return bool(txt.strip()) and "<system-reminder>" not in txt[:200] and not txt.lstrip().startswith(_MACHINE_PREFIXES)
+
+
+def phrase_needles(ph: str) -> tuple[str, ...]:
+    """The forms a phrase takes INSIDE a raw JSONL line: as typed, JSON-escaped (quotes, backslashes,
+    newlines), and \\u-escaped (non-ASCII written with ensure_ascii). A raw-text prefilter that tests only
+    the typed form drops real hits for any phrase holding one of those characters and reports 0 (review Q3)."""
+    return tuple(dict.fromkeys((ph, json.dumps(ph, ensure_ascii=False)[1:-1], json.dumps(ph)[1:-1])))
+
+
+def load_user_messages(path: Path, include_queued: bool = False, needles: tuple[str, ...] = ()) -> list[str]:
+    """The user's own words. include_queued (paste mode, 2026-09-29): ALSO the user's MID-TURN messages,
+    which the transcript records as `attachment` records of type `queued_command` (origin.kind human), not
+    as `type: user` rows. An Opus review leg measured the TRIGGERS directive counted in 8 sessions and MISSED
+    in 21 without them. The RATE mode keeps its definition (a silent definition change is this tool's own
+    FAILURE condition): its matching undercount is tracked for an explicit re-baseline (Dart EUVVnvFyRHeJ).
+    needles (paste mode): skip the JSON parse of any line holding none of them. A record whose text holds
+    the phrase WITHIN ONE text block holds one of phrase_needles() in its raw line (JSON escapes covered:
+    quote, backslash, control chars, \\u; not `\\/`, which Node never writes). It cut a 55 s / 846 MB run.
+    LIMIT: a phrase split across two text BLOCKS of one message exists only after the join, so it is
+    missed (as the earlier whole-file prefilter missed it). Measured 2026-09-30: 0 multi-text-block user
+    rows in 179 top-level transcripts; re-measure if Claude Code starts splitting typed prompts."""
     out = []
     rows = []
-    for line in path.read_text(errors="replace").splitlines():
-        try:
-            d = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if d.get("type") == "user":
-            rows.append(d)
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if needles and not any(n in line for n in needles):
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if d.get("type") == "user":
+                rows.append(d)
+            elif include_queued and d.get("type") == "attachment":
+                a = d.get("attachment") if isinstance(d.get("attachment"), dict) else {}
+                origin = a.get("origin") if isinstance(a.get("origin"), dict) else {}
+                if a.get("type") == "queued_command" and origin.get("kind") == "human":
+                    txt = _flatten(a.get("prompt"))
+                    if _own_words(txt):     # same text filter as a user row (review: reuse leg 6)
+                        out.append(txt)
     for d in rows:
-        c = d.get("message", {}).get("content", [])
-        txt = c if isinstance(c, str) else "".join(
-            b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
-        # Tool results and system reminders are not the user speaking; nor is anything whose
-        # provenance says another session, a notification or an injection sent it.
+        txt = _flatten(d.get("message", {}).get("content", []))
+        # Provenance: nothing another session, a notification or an injection sent counts. This predicate
+        # is the RATE mode's DEFINITION: is_human_row decides machine prefixes itself (origin rows are
+        # trusted by origin), so _own_words is NOT applied here (delta review MEDIUM: 20 rows changed).
         if txt.strip() and "<system-reminder>" not in txt[:200] and is_human_row(d, txt):
             out.append(txt)
     return out
@@ -179,10 +224,28 @@ def last_record_utc(path: Path) -> datetime | None:
     as a real defect. So mtime narrows the candidate set; the record timestamp decides."""
     last = None
     try:
-        for line in path.read_text(errors="replace").splitlines():
+        # Tail first (the last record's timestamp is near the end): 12.4 s -> 0.01 s over 178 files
+        # (efficiency leg, 2026-09-30). Full scan only when the tail holds no timestamp at all, e.g. a
+        # final multi-MB tool_result line.
+        # Same answer as the full scan: the FIRST match on the LAST line that has one (a record can carry
+        # nested timestamps; delta review MEDIUM). The tail's first line may be cut, so it is dropped.
+        with open(path, "rb") as fh:
+            size = fh.seek(0, 2)
+            fh.seek(max(0, size - 65536))
+            tail_lines = fh.read().decode("utf-8", errors="replace").splitlines()
+        if size > 65536:
+            tail_lines = tail_lines[1:]
+        for line in reversed(tail_lines):
             m = _TS_RE.search(line)
             if m:
                 last = m.group(1)
+                break
+        if last is None:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = _TS_RE.search(line)
+                    if m:
+                        last = m.group(1)
     except OSError:
         return None
     if not last:
@@ -232,6 +295,75 @@ def self_check() -> int:
     ok.append(("criterion silent when no threshold set",  is_adverse(0.99, None) is False))
     ok.append(("criterion silent when nothing measured",  is_adverse(None, 0.25) is False))
     ok.append(("boundary: equal to threshold IS adverse", is_adverse(0.25, 0.25) is True))
+    # PASTE-COUNT MODE (2026-09-29): a session counts once, only for the user's OWN words, and only
+    # top-level session files are in the population. Each exclusion has its own negative control.
+    import contextlib
+    import io
+    import tempfile as _tfp
+    PH = "consider whether event-driven triggers were necessary"
+    with _tfp.TemporaryDirectory() as _d:
+        root = Path(_d)
+        (root / "p" / "s3" / "subagents").mkdir(parents=True)
+        def _w(path, recs):
+            path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+        _w(root / "p" / "s1.jsonl", [{"type": "user", "origin": {"kind": "human"},
+                                      "message": {"content": f"TRIGGERS: {PH}? twice: {PH}"}}])
+        _w(root / "p" / "s2.jsonl", [{"type": "user", "origin": {"kind": "peer"}, "isMeta": True,
+                                      "message": {"content": f"peer quoting: {PH}"}},
+                                     {"type": "user", "message": {"content": [
+                                         {"type": "tool_result", "content": f"grep hit: {PH}"}]}}])
+        _w(root / "p" / "s3" / "subagents" / "a.jsonl", [{"type": "user", "message": {"content": f"brief: {PH}"}}])
+        # a MID-TURN paste (queued_command attachment, origin human) counts; a non-human queued one does not
+        _w(root / "p" / "s4.jsonl", [{"type": "attachment", "attachment": {
+            "type": "queued_command", "origin": {"kind": "human"}, "prompt": f"<pasted_content> TRIGGERS {PH}"}}])
+        _w(root / "p" / "s5.jsonl", [{"type": "attachment", "attachment": {
+            "type": "queued_command", "origin": {"kind": "peer"}, "prompt": f"peer relays: {PH}"}}])
+        # human-origin but machine-shaped queued text (a notification) is not the user's words
+        _w(root / "p" / "s6.jsonl", [{"type": "attachment", "attachment": {
+            "type": "queued_command", "origin": {"kind": "human"}, "prompt": f"<task-notification> {PH}"}}])
+        allp = sorted(root.rglob("*.jsonl"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            phrase_counts(allp, [PH], 30, True, root)
+        res = json.loads(buf.getvalue())
+    ok.append(("paste mode: population is top-level session files only (nested subagent excluded)",
+               res["population"] == 5))
+    ok.append(("paste mode: human pastes count ONCE per session (typed s1 + MID-TURN queued s4); peer, "
+               "tool_result, subagent and a peer-origin queued command do not", res["counts"][PH] == 2))
+    # A phrase holding a quote and a non-ASCII char is JSON-escaped in the raw line: the raw prefilter
+    # must still find it (review Q3). The tail-first timestamp read must fall back to a full scan when the
+    # final 64 KB hold no timestamp, and must return the LAST timestamp, not the first.
+    PHQ = 'the "shape" — fix it'
+    with _tfp.TemporaryDirectory() as _d:
+        root = Path(_d)
+        (root / "p").mkdir()
+        _w(root / "p" / "q1.jsonl", [{"type": "user", "origin": {"kind": "human"}, "message": {"content": f"x {PHQ}"}}])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            phrase_counts([root / "p" / "q1.jsonl"], [PHQ], 30, True, root)
+        resq = json.loads(buf.getvalue())
+        _w(root / "p" / "t1.jsonl", [{"timestamp": "2026-01-01T00:00:00Z"}, {"timestamp": "2026-02-02T00:00:00Z"},
+                                     {"type": "user", "message": {"content": "y" * 70000}}])
+        _w(root / "p" / "t2.jsonl", [{"timestamp": "2026-01-01T00:00:00Z"}, {"timestamp": "2026-03-03T00:00:00Z"}])
+        # a record with a NESTED timestamp after its own: the full scan took the FIRST match on the last line
+        _w(root / "p" / "t3.jsonl", [{"timestamp": "2026-04-04T00:00:00Z",
+                                      "toolUseResult": {"timestamp": "2026-05-05T00:00:00Z"}}])
+        lr1, lr2 = last_record_utc(root / "p" / "t1.jsonl"), last_record_utc(root / "p" / "t2.jsonl")
+        lr3 = last_record_utc(root / "p" / "t3.jsonl")
+    ok.append(("last_record_utc: first match on the last line, as the full scan did", lr3 is not None and lr3.month == 4))
+    # RATE-mode definition is unchanged: a human-ORIGIN row starting with a machine prefix is still decided
+    # by is_human_row alone (the paste-mode queued filter must not leak into it)
+    with _tfp.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as _fh:
+        _fh.write(json.dumps({"type": "user", "origin": {"kind": "human"},
+                              "message": {"content": "<command-name>/exit</command-name>"}}) + "\n")
+    _rate_rows = load_user_messages(Path(_fh.name))
+    ok.append(("rate mode: an origin-human row is judged by is_human_row only (definition unchanged)",
+               _rate_rows == ["<command-name>/exit</command-name>"] if is_human_row(
+                   {"origin": {"kind": "human"}}, "<command-name>/exit</command-name>") else _rate_rows == []))
+    ok.append(("paste mode: a JSON-escaped phrase (quote, non-ASCII) is still counted", resq["counts"][PHQ] == 1))
+    ok.append(("last_record_utc: full-scan fallback when the tail holds no timestamp",
+               lr1 is not None and lr1.month == 2))
+    ok.append(("last_record_utc: tail read returns the LAST timestamp", lr2 is not None and lr2.month == 3))
     # PROVENANCE (2026-09-27): only the user's own words count. Real row shapes, from transcripts.
     import tempfile
     rows = [
@@ -281,6 +413,51 @@ def self_check() -> int:
     return 1 if bad else 0
 
 
+def phrase_counts(paths: list, phrases: list, since_days: int, as_json: bool, root: Path | None = None) -> int:
+    """PASTE-COUNT MODE — sessions whose OWN-WORDS user text contains each fixed string.
+
+    WHY (2026-09-29, session 1bdb029f): every ~/.claude/rules/*.md file states its baseline and effect
+    measure as "pasted by the user into N of M sessions", counted by ad-hoc greps. A whole-file
+    `grep -lF` counts ANY record holding the phrase (tool results, subagent prompts, peer messages,
+    the agent's own grep, and — once a rules file exists — its own loaded text): measured 1.4x-8x above
+    user-text counts for all nine rules phrases, and 27 vs 9 for the TRIGGERS directive. One counter
+    with a printed population and unit, shared by every rules file, retires that class.
+    Population: top-level transcripts only (projects/<project>/<session>.jsonl), because 1,003 of
+    1,181 transcripts touched in 30 days were NESTED subagent files whose 'user' rows are an agent's
+    prompt. Unit: load_user_messages() (is_human_row), the same provenance rule as the rate mode."""
+    sessions = [p for p in paths if p.parent.parent == (root or PROJECTS)]
+    hits = {ph: 0 for ph in phrases}
+    forms = {ph: phrase_needles(ph) for ph in phrases}
+    for p in sessions:
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            continue
+        # Cheap pre-filter on BYTES (no decode, no second copy): skip files where no record holds any
+        # form of the phrase. The first uncapped run took 3m22s; the read_text version peaked at 846 MB.
+        present = [ph for ph in phrases if any(n.encode("utf-8") in raw for n in forms[ph])]
+        del raw
+        if not present:
+            continue
+        needles = tuple(n for ph in present for n in forms[ph])
+        text = "\n".join(load_user_messages(p, include_queued=True, needles=needles))
+        for ph in present:
+            if ph in text:
+                hits[ph] += 1
+    win = f"last {since_days}d" if since_days else "all time"
+    if as_json:
+        print(json.dumps({"population": len(sessions), "window": win, "unit": "sessions (own-words user "
+                          "text, is_human_row, incl. mid-turn queued_command)", "counts": hits}, indent=2))
+        return 0 if sessions else 2        # nothing measured is not a zero (review LOW)
+    print(f"PASTE COUNT — population: {len(sessions)} top-level session transcript(s), {win}; "
+          f"nested subagent transcripts excluded")
+    print(f"  unit: sessions whose OWN-WORDS user text contains the fixed string ({DEFINITION[:60]}…)")
+    for ph, n in hits.items():
+        share = f"{n / len(sessions):.1%}" if sessions else "n/a"
+        print(f"  {n:5d}  ({share})  {ph[:70]!r}")
+    return 0 if sessions else 2
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--session", help="session uuid; default = every transcript found")
@@ -291,6 +468,12 @@ def main() -> int:
                          "Without this the tool rescans all history and reports the all-time "
                          "worst session, which never changes -- so a weekly alert built on it "
                          "carries no information and cannot show a trend.")
+    ap.add_argument("--phrase", action="append", default=None,
+                    help="PASTE-COUNT MODE (repeatable): count SESSIONS whose own-words user text "
+                         "contains this fixed string. Population: top-level session transcripts "
+                         "(projects/<project>/<session>.jsonl; nested subagent transcripts are "
+                         "excluded, their 'user' rows are an agent's prompt). Unit: this file's "
+                         "is_human_row provenance rule. The rules/*.md effect measures point here.")
     ap.add_argument("--alert-above", type=float, default=None,
                     help="SUCCESS/FAILURE CRITERION. If the windowed mean rate is >= this, "
                          "print the ADVERSE: marker. Without it this tool has no defined "
@@ -308,6 +491,11 @@ def main() -> int:
         # "a check that could not RUN must shout". Returning 0 here would report health.
         print("ADVERSE: no transcripts found — cannot measure, which is not a good score")
         return 2
+
+    if args.phrase:
+        # population restriction FIRST: the window filter below reads every file it is given, and
+        # 1,003 of 1,181 recent transcripts are nested subagent files this mode excludes anyway.
+        paths = [p for p in paths if p.parent.parent == PROJECTS]
 
     if args.since_days and not args.session:
         cutoff = datetime.now(timezone.utc) - timedelta(days=args.since_days)
@@ -334,6 +522,9 @@ def main() -> int:
         if not paths:
             print(f"ADVERSE: no sessions in the last {args.since_days}d — cannot measure")
             return 2
+
+    if args.phrase:
+        return phrase_counts(paths, args.phrase, args.since_days, args.json)
 
     rows = []
     for p in paths:

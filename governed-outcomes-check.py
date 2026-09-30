@@ -418,6 +418,7 @@ EXPECTED_CADENCE_H = {
     "artifact-sweep": 12, "gate-ledger-archive": 1, "selfcheck-canary": 168,
     "anomaly-conversion": 168, "correction-rate": 168, "gate-ack": 24,
     "governed-outcomes": 168,
+    "drg-backstop": 24,   # 2026-09-30: --only drg_gate_silent_or_alarm_undelivered, daily (session 1bdb029f)
     # 2026-09-26 (session 9945d90f): 29 wrapped checks were live in crontab but absent here, so
     # none was audited for going silent -- outcome_marker_cannot_fire reported the same 29 as
     # registration drift every week, a constant red nobody acted on. Cadences derived from each
@@ -899,7 +900,166 @@ def outcome_marker_cannot_fire(crontab_text: str | None = None) -> dict:
                     "joins them, so a silent check looks exactly like a clean one"}
 
 
-def run(days: int) -> dict:
+DRG_LOG = Path.home() / ".claude" / "logs" / "decision-recommendation-gate.jsonl"
+DRG_ALARMS = Path.home() / ".claude" / "logs" / "decision-recommendation-gate.alarms.json"
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+
+
+DRG_SRC = Path.home() / ".claude/hooks/stop/decision_recommendation_gate.py"
+# PRODUCER CONTRACT: this row reads the gate's files by duplicated names (a hook cannot be imported from here).
+# Each pattern matches how the gate WRITES the name (an assignment or call, comments stripped), so a renamed key
+# cannot be satisfied by a comment or another writer's use of the same word (delta review MEDIUM, 2026-09-30).
+# A refactor of the writer (s.update(attempted=...), single quotes) gives a FALSE FAIL: the row turns ADVERSE, the
+# loud direction; update the pattern with the refactor. Deploy order: the gate first, then this row.
+DRG_CONTRACT = {
+    "state key attempted": r'\[\s*"attempted"\s*\]\s*=',
+    "state key delivered": r'\[\s*"delivered"\s*\]\s*=',
+    "state key first_undelivered": r'setdefault\(\s*"first_undelivered"',
+    "loop: key prefix": r'f"loop:\{',
+    "disabled outcome row": r'"outcome":\s*"disabled"',
+    "gate log name": r'"decision-recommendation-gate\.jsonl"',
+    "alarm state name": r'"decision-recommendation-gate\.alarms\.json"',
+}
+
+
+def drg_contract_missing(src: str) -> list[str]:
+    """Contract items the gate source no longer writes (comment lines ignored)."""
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    return [k for k, rx in DRG_CONTRACT.items() if not re.search(rx, code)]
+
+
+def outcome_drg_gate_silent_or_alarm_undelivered(log: Path | None = None, alarms: Path | None = None,
+                                                 projects: Path | None = None,
+                                                 now: datetime | None = None,
+                                                 drg_src: Path | None = None) -> dict:
+    """THE OUTCOME: the decision-recommendation Stop gate went SILENT while sessions ran, or one of
+    its in-process alarms never reached the user.
+
+    Added 2026-09-29 (session 1bdb029f, Dart EUVVnvFyRHeJ; the user's TRIGGERS question). The gate
+    raises its own alarms IN-PROCESS, event-driven, for everything it can see: a crashed check, a
+    3x block loop, a noisy block share (decision_recommendation_gate._health_event). Its own
+    SILENCE is the one failure it cannot report, so this date-driven row covers that and only that.
+    Every Stop the gate evaluates writes a row, including `clean`, so a session active in the last
+    24 h with no gate row in that window means the hook is deregistered, crashing before it logs,
+    or timing out.
+
+    v2 (two review legs, FIX-FIRST): a LAG test instead of a 24 h window, so it is right at any
+    cadence — ADVERSE when the newest top-level session transcript is more than 6 h newer than the
+    newest gate row that is not `disabled` (a kill-switched gate is a silent gate). Epoch arithmetic;
+    the whole log is streamed (it rotates at 2 MB); malformed alarm state or an absent projects dir is
+    UNKNOWN (None), never a crash and never CLEAN. The reason is in `where`, which main() prints.
+
+    HONEST LIMITS: transcript mtime is the activity proxy; a transcript touched without a Stop (e.g.
+    a compaction write, or a turn interrupted before its Stop) could make a quiet gate look silent —
+    the 6 h grace absorbs ordinary cases. It presumes the gate is registered for EVERY project under
+    ~/.claude/projects (activity in an unregistered project reads as silence). Detection latency is this
+    row's schedule plus the 6 h grace: weekly today (inside the aggregate); ~30 h once its own daily runner
+    line (approved 2026-09-29) is installed. Reported, never gated.
+    """
+    import math
+    now_ts = now.timestamp() if isinstance(now, datetime) else float(now or datetime.now().timestamp())
+    log, alarms, projects = log or DRG_LOG, alarms or DRG_ALARMS, projects or CLAUDE_PROJECTS
+    where, unreadable = [], []
+    # 6 h: longer than any single session's idle gap between Stops seen in the replay, so a quiet but live
+    # gate does not read as silent; shorter than the ~30 h daily-runner latency it is added to.
+    grace = 6 * 3600
+    newest_tx = None
+    if not projects.is_dir():
+        unreadable.append(f"projects dir absent: {projects}")
+    else:
+        try:
+            mt = [p.stat().st_mtime for p in projects.glob("*/*.jsonl")]
+            newest_tx = max(mt) if mt else None
+        except OSError as e:
+            unreadable.append(f"projects dir: {e}")
+    newest_row, rows, corrupt = None, 0, 0
+    if log.exists():
+        try:
+            with open(log, encoding="utf-8", errors="replace") as f:
+                for ln in f:
+                    if not ln.strip():
+                        continue
+                    try:
+                        r = json.loads(ln)
+                        # the gate writes NAIVE LOCAL isoformat (drg log_event); a naive datetime's
+                        # .timestamp() reads it as local, which is right here. Do NOT use _any_ts, which
+                        # treats naive as UTC and would skew by the host offset (7 h) against the 6 h grace.
+                        ts = datetime.fromisoformat(str(r.get("timestamp", "")).replace("Z", "+00:00")).timestamp()
+                    except (ValueError, AttributeError, TypeError, OverflowError):
+                        corrupt += 1
+                        continue
+                    rows += 1
+                    if r.get("outcome") != "disabled" and (newest_row is None or ts > newest_row):
+                        newest_row = ts
+        except OSError as e:
+            unreadable.append(f"gate log unreadable: {e}")
+        if corrupt and not rows:
+            unreadable.append(f"gate log has {corrupt} row(s), none parseable")
+    if newest_tx is not None and (newest_row is None or newest_tx - newest_row > grace):
+        age = "never" if newest_row is None else f"{(newest_tx - newest_row) / 3600:.1f} h before the newest session activity"
+        where.append(f"decision gate silent: newest non-disabled gate row {age} (hook deregistered, crashing "
+                     "before it logs, timing out, or kill-switched)")
+    # The contract is checked IN the outcome row, so a broken contract is ADVERSE in every real run, not
+    # only in a self-check that other, host-dependent FAILs keep red (delta review MEDIUM).
+    src_path = drg_src or Path(os.environ.get("GOC_DRG_SRC") or DRG_SRC)
+    try:
+        missing = drg_contract_missing(src_path.read_text(errors="replace"))
+        if missing:
+            where.append(f"producer contract broken: the decision gate ({src_path}) no longer writes "
+                         f"{', '.join(missing)} — this row would read nothing and report clean")
+    except OSError as e:
+        unreadable.append(f"decision gate source unreadable: {e}")
+    state, stale = {}, []
+    if alarms.exists():
+        try:
+            with open(alarms, encoding="utf-8", errors="replace") as fa:
+                state = json.loads(fa.read(1_000_000))     # bounded READ, not a slice of a full read
+            if not isinstance(state, dict):
+                unreadable.append("alarm state is not a JSON object")
+                state = {}
+        except (OSError, ValueError) as e:
+            unreadable.append(f"alarm state: {e}")
+    for key, s in state.items():
+        if not isinstance(s, dict) or "attempted" not in s:
+            continue
+        att, dlv = s.get("attempted"), s.get("delivered", 0)
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (att, dlv)):
+            unreadable.append(f"alarm {key!r}: non-numeric timestamps")
+            continue
+        # measured from the FIRST undelivered attempt (the producer re-stamps `attempted` on each hourly retry,
+        # so the latest attempt alone hid an alarm that kept failing — review MEDIUM-1)
+        first = s.get("first_undelivered", att)
+        first = first if isinstance(first, (int, float)) and math.isfinite(first) else att
+        if dlv < att and now_ts - first > 3600:
+            if key.startswith("loop:") and now_ts - first > 7 * 86400:
+                stale.append(key)          # a per-session key is only retried if that session loops again
+                continue
+            where.append(f"alarm {key!r} undelivered since {datetime.fromtimestamp(first).isoformat(timespec='seconds')}"
+                         " — check notify.sh; a later successful delivery clears it")
+    return {"outcome": "drg_gate_silent_or_alarm_undelivered",
+            # adverse: a count when anything was found or every input was read; None (unknown, not clean)
+            # when nothing was found but an input could not be read.
+            "adverse": len(where) if (where or not unreadable) else None,
+            "where": where, "unreadable": unreadable, "stale_loop_alarms": stale,
+            "note": "the gate alarms in-process for crash/loop/noisy; this row covers its silence"}
+
+
+# Rows that can run ALONE on their own schedule (--only). The decision-gate backstop gets a DAILY runner line
+# (approved 2026-09-29) instead of waiting for the weekly aggregate: detection latency ~30 h, not ~7 days.
+ONLY_ROWS = {"drg_gate_silent_or_alarm_undelivered": lambda days: outcome_drg_gate_silent_or_alarm_undelivered()}
+
+
+def run(days: int, only: str | None = None) -> dict:
+    if only:
+        try:
+            checks = [ONLY_ROWS[only](days)]
+        except Exception as e:  # noqa: BLE001 — a crashing row is UNKNOWN (rc 2, pages), never a silent pass
+            checks = [{"outcome": only, "adverse": None, "where": [],
+                       "unreadable": [f"row raised {type(e).__name__}: {e}"[:300]]}]
+        adverse, unknown, expected_hits, verdict = _verdict(checks)
+        return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
+                "expected_pattern_hits": expected_hits, "checks": checks, "unknown_count": len(unknown),
+                "only": only}
     checks = [outcome_credential_in_history(days), outcome_artifacts_lost(),
               outcome_destructive_overrides(days), outcome_canary_survivors(),
               outcome_handoff_log_artifact_disagreement(days),
@@ -907,7 +1067,8 @@ def run(days: int) -> dict:
               outcome_check_not_running(),
               outcome_marker_cannot_fire(),
               outcome_qc_not_run(days),
-              outcome_notification_undelivered(days)]
+              outcome_notification_undelivered(days),
+              outcome_drg_gate_silent_or_alarm_undelivered()]
     adverse, unknown, expected_hits, verdict = _verdict(checks)
     # UNKNOWN outranks CLEAN: a check that could not run is not evidence of a good outcome.
     return {"verdict": verdict, "adverse_total": adverse, "window_days": days,
@@ -1354,6 +1515,78 @@ def self_check() -> int:
         ok.append(("an OK heartbeat needs no notification",
                    outcome_notification_undelivered(7, _n, _h)["adverse"] == 0))
 
+    # drg_gate_silent_or_alarm_undelivered (2026-09-29, v2 after two FIX-FIRST review legs): positive and
+    # negative controls for every branch, one control per mutant the review found surviving.
+    import tempfile as _tf6
+    _GOOD_SRC = ('s["attempted"] = now\ns["delivered"] = t\ns.setdefault("first_undelivered", 0)\n'
+                 'k = f"loop:{sid}"\nrow = {"outcome": "disabled"}\n'
+                 'LOG = "decision-recommendation-gate.jsonl"\nA = "decision-recommendation-gate.alarms.json"\n')
+    with _tf6.TemporaryDirectory() as _td:
+        _td = Path(_td)
+        (_td / "drg_good.py").write_text(_GOOD_SRC)
+        _f = lambda *a: outcome_drg_gate_silent_or_alarm_undelivered(*a, drg_src=_td / "drg_good.py")
+        (_td / "p" / "s").mkdir(parents=True)
+        (_td / "p" / "s" / "a.jsonl").write_text("{}\n")          # session activity: now
+        _now = datetime.now()
+        _t = _now.timestamp()
+        _lg, _al = _td / "g.jsonl", _td / "al.json"
+        _row = lambda h, o="clean": json.dumps({"timestamp": (_now - timedelta(hours=h)).isoformat(), "outcome": o}) + "\n"
+        _lg.write_text(_row(30))
+        ok.append(("decision gate silent 30 h behind session activity is ADVERSE", _f(_lg, _al, _td / "p", _now)["adverse"] == 1))
+        _lg.write_text(_row(1))
+        ok.append(("decision gate that logged 1 h ago is not silent", _f(_lg, _al, _td / "p", _now)["adverse"] == 0))
+        _lg.write_text(_row(30) + _row(0.1, "disabled"))
+        ok.append(("only `disabled` rows recently = a silent (kill-switched) gate", _f(_lg, _al, _td / "p", _now)["adverse"] == 1))
+        _lg.write_text(_row(30) * 1200 + _row(0.1))                # > 64 KB: the newest row is at the end
+        ok.append(("a recent row after > 64 KB of old rows is found (whole-file stream)",
+                   _f(_lg, _al, _td / "p", _now)["adverse"] == 0))
+        _lg.write_text("not json\n{also not}\n")
+        _r = _f(_lg, _al, _td / "p", _now)
+        ok.append(("a gate log with no parseable row is ADVERSE when silent, and flagged unreadable",
+                   _r["adverse"] == 1 and _r["unreadable"]))
+        _lg.write_text(_row(1))
+        ok.append(("an absent projects dir is UNKNOWN (None), never CLEAN", _f(_lg, _al, _td / "nope", _now)["adverse"] is None))
+        _al.write_text(json.dumps({"crash": {"attempted": _t - 7200}}))
+        ok.append(("a gate alarm attempted 2 h ago and never delivered is ADVERSE", _f(_lg, _al, _td / "p", _now)["adverse"] == 1))
+        _al.write_text(json.dumps({"crash": {"attempted": _t - 7200, "delivered": _t - 7200}}))
+        ok.append(("delivered == attempted (the producer's success shape) is not ADVERSE", _f(_lg, _al, _td / "p", _now)["adverse"] == 0))
+        _al.write_text(json.dumps({"crash": {"attempted": _t - 1800}}))
+        ok.append(("an undelivered alarm inside its 1 h retry grace is not ADVERSE yet", _f(_lg, _al, _td / "p", _now)["adverse"] == 0))
+        _al.write_text("[1, 2]")
+        _r = _f(_lg, _al, _td / "p", _now)
+        ok.append(("alarm state that is valid JSON but not an object is UNKNOWN, not a crash", _r["adverse"] is None))
+        _al.write_text(json.dumps({"crash": {"attempted": "yesterday"}}))
+        ok.append(("a non-numeric alarm timestamp is UNKNOWN, not a crash", _f(_lg, _al, _td / "p", _now)["adverse"] is None))
+        _lg.write_text(_row(30))
+        ok.append(("ADVERSE outranks UNKNOWN (silent gate + malformed alarm)", _f(_lg, _al, _td / "p", _now)["adverse"] == 1))
+        _lg.write_text(_row(1))
+        _al.write_text(json.dumps({"crash": {"attempted": _t - 600, "first_undelivered": _t - 5 * 3600}}))
+        ok.append(("an alarm failing since 5 h is ADVERSE even though its latest retry was 10 min ago",
+                   _f(_lg, _al, _td / "p", _now)["adverse"] == 1))
+        _al.write_text(json.dumps({"loop:s-9": {"attempted": _t - 9 * 86400}}))
+        _r = _f(_lg, _al, _td / "p", _now)
+        ok.append(("a per-session loop alarm undelivered for > 7 days is listed as stale, not ADVERSE forever",
+                   _r["adverse"] == 0 and _r["stale_loop_alarms"] == ["loop:s-9"]))
+
+    # PRODUCER CONTRACT (delta review MEDIUM): writer-shaped patterns, both polarities, and the rename the
+    # substring version let through ("disabled" -> "gate-off" while a comment and another writer still say it).
+    ok.append(("producer contract: a source that writes every name has nothing missing", drg_contract_missing(_GOOD_SRC) == []))
+    _renamed = _GOOD_SRC.replace('{"outcome": "disabled"}', '{"outcome": "gate-off"}') + \
+        '# "outcome": "disabled" in a comment\nx = {"status": "disabled"}\n'
+    ok.append(("producer contract: a renamed outcome is caught despite a comment and another writer",
+               drg_contract_missing(_renamed) == ["disabled outcome row"]))
+    with _tf6.TemporaryDirectory() as _td:
+        _td = Path(_td)
+        (_td / "p" / "s").mkdir(parents=True)
+        (_td / "p" / "s" / "a.jsonl").write_text("{}\n")
+        (_td / "bad.py").write_text(_renamed)
+        _lg = _td / "g.jsonl"
+        _lg.write_text(json.dumps({"timestamp": datetime.now().isoformat(), "outcome": "clean"}) + "\n")
+        _r = outcome_drg_gate_silent_or_alarm_undelivered(_lg, _td / "none.json", _td / "p", datetime.now(), _td / "bad.py")
+        ok.append(("producer contract: a broken contract makes the REAL outcome row ADVERSE", _r["adverse"] == 1))
+        _r = outcome_drg_gate_silent_or_alarm_undelivered(_lg, _td / "none.json", _td / "p", datetime.now(), _td / "no.py")
+        ok.append(("producer contract: an unreadable gate source is UNKNOWN, not clean", _r["adverse"] is None))
+
     failed = [m for m, good in ok if not good]
     for m in failed:
         print(f"  [FAIL/self-check] {m}")
@@ -1368,13 +1601,16 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--log", action="store_true")
     ap.add_argument("--self-check", action="store_true")
+    ap.add_argument("--only", choices=sorted(ONLY_ROWS), help="run one row alone (its own schedule)")
     args = ap.parse_args()
+    if args.only and args.log:
+        ap.error("--only with --log would append a ONE-row run to the weekly log; not allowed")
 
     if args.self_check:
         print("GOVERNED OUTCOMES: self-check")
         return self_check()
 
-    r = run(args.days)
+    r = run(args.days, args.only)
     r["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     if args.log:
@@ -1389,7 +1625,7 @@ def main() -> int:
         print(json.dumps(r, indent=2))
         return 0 if r["verdict"] == "CLEAN" else (2 if r["verdict"] == "UNKNOWN" else 1)
 
-    print(f"GOVERNED OUTCOMES ({args.days}d): {r['verdict']}")
+    print(f"GOVERNED OUTCOMES ({'only ' + args.only if args.only else str(args.days) + 'd'}): {r['verdict']}")
     for c in r["checks"]:
         mark = "  " if c.get("adverse") == 0 else "! "
         print(f"{mark}{c['outcome']:36} adverse={c.get('adverse')}")
