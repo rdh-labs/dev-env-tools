@@ -38,6 +38,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 SECRET_RE = re.compile(
     r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"          # jwt
@@ -919,7 +920,15 @@ DRG_CONTRACT = {
     "disabled outcome row": r'"outcome":\s*"disabled"',
     "gate log name": r'"decision-recommendation-gate\.jsonl"',
     "alarm state name": r'"decision-recommendation-gate\.alarms\.json"',
+    "declared-class advisory rows": r'log_event\(f"adv-declared-\{verdict\}"',
 }
+# v5.5 declared-class rollout (Dart EUVVnvFyRHeJ): the classes are ADVISORY until a per-class promotion decision based on
+# fresh held-out labels. The decision is a human/agent review, so this row cannot make it; it makes the review
+# UNMISSABLE: after the window ends and no decision is recorded, the row is ADVERSE (the daily runner pages) and prints
+# the adoption it measured. Record the decision by writing DRG_PROMOTION_DECISION as a JSON OBJECT with a non-empty "decision" value
+# (an empty, keyless, falsey or unparseable file does NOT count, and the row stays ADVERSE).
+DRG_DECLARED_WINDOW_END = datetime(2026, 10, 7, 23, 59, 59, tzinfo=ZoneInfo("America/Vancouver"))  # explicit, not host TZ
+DRG_PROMOTION_DECISION = Path.home() / ".claude" / "state" / "drg-v55-promotion-decision.json"
 
 
 def drg_contract_missing(src: str) -> list[str]:
@@ -931,7 +940,8 @@ def drg_contract_missing(src: str) -> list[str]:
 def outcome_drg_gate_silent_or_alarm_undelivered(log: Path | None = None, alarms: Path | None = None,
                                                  projects: Path | None = None,
                                                  now: datetime | None = None,
-                                                 drg_src: Path | None = None) -> dict:
+                                                 drg_src: Path | None = None,
+                                                 decision: Path | None = None) -> dict:
     """THE OUTCOME: the decision-recommendation Stop gate went SILENT while sessions ran, or one of
     its in-process alarms never reached the user.
 
@@ -973,6 +983,8 @@ def outcome_drg_gate_silent_or_alarm_undelivered(log: Path | None = None, alarms
         except OSError as e:
             unreadable.append(f"projects dir: {e}")
     newest_row, rows, corrupt = None, 0, 0
+    adv_total = adv_undeclared = adv_fail = 0
+    adv_by_class: dict = {}
     if log.exists():
         try:
             with open(log, encoding="utf-8", errors="replace") as f:
@@ -991,6 +1003,15 @@ def outcome_drg_gate_silent_or_alarm_undelivered(log: Path | None = None, alarms
                     rows += 1
                     if r.get("outcome") != "disabled" and (newest_row is None or ts > newest_row):
                         newest_row = ts
+                    _o = str(r.get("outcome") or "")
+                    # ALLOWLIST of the gate's verdict rows (PASS/FAIL/DELEGATED); a denylist missed debt-scan-capped
+                    if _o in ("adv-declared-pass", "adv-declared-fail", "adv-declared-delegated"):
+                        adv_total += 1
+                        adv_undeclared += "class=undeclared" in str(r.get("detail") or "")
+                        adv_fail += _o == "adv-declared-fail"
+                        _mc = re.search(r"class=([\w/?-]+)", str(r.get("detail") or ""))
+                        _c = _mc.group(1) if _mc else "?"
+                        adv_by_class[_c] = adv_by_class.get(_c, 0) + 1
         except OSError as e:
             unreadable.append(f"gate log unreadable: {e}")
         if corrupt and not rows:
@@ -1009,6 +1030,21 @@ def outcome_drg_gate_silent_or_alarm_undelivered(log: Path | None = None, alarms
                          f"{', '.join(missing)} — this row would read nothing and report clean")
     except OSError as e:
         unreadable.append(f"decision gate source unreadable: {e}")
+    # v5.5 promotion review due: date-driven by nature (a review window ends); the event side is in the gate itself.
+    decision = decision or DRG_PROMOTION_DECISION
+    try:   # a decision counts only when it PARSES and carries a non-empty "decision" (round-1 CLI: empty/keyless files)
+        _dec = json.loads(decision.read_text())
+        decided = isinstance(_dec, dict) and bool(_dec.get("decision"))
+    except (OSError, ValueError):
+        decided = False
+    if now_ts > DRG_DECLARED_WINDOW_END.timestamp() and not decided:
+        adoption = f"{(adv_total - adv_undeclared) / adv_total:.0%}" if adv_total else "n/a (no rows)"
+        per_class = ", ".join(f"{c} {n}" for c, n in sorted(adv_by_class.items(), key=lambda t: -t[1])[:8])
+        where.append(f"decision gate v5.5 declared-class review OVERDUE since {DRG_DECLARED_WINDOW_END:%Y-%m-%d %Z}: "
+                     f"{adv_total} declared-segment rows in the CURRENT log file only (rotated files not read: a "
+                     f"sample, not the window), adoption {adoption}, advisory fails {adv_fail}, rows per class: "
+                     f"{per_class or 'none'} — label >= 20 fresh rows per class (verifier != author), decide per "
+                     f"class, then write {decision} as JSON with a non-empty \"decision\"")
     state, stale = {}, []
     if alarms.exists():
         try:
@@ -1520,7 +1556,8 @@ def self_check() -> int:
     import tempfile as _tf6
     _GOOD_SRC = ('s["attempted"] = now\ns["delivered"] = t\ns.setdefault("first_undelivered", 0)\n'
                  'k = f"loop:{sid}"\nrow = {"outcome": "disabled"}\n'
-                 'LOG = "decision-recommendation-gate.jsonl"\nA = "decision-recommendation-gate.alarms.json"\n')
+                 'LOG = "decision-recommendation-gate.jsonl"\nA = "decision-recommendation-gate.alarms.json"\n'
+                 'log_event(f"adv-declared-{verdict}", detail=d)\n')
     with _tf6.TemporaryDirectory() as _td:
         _td = Path(_td)
         (_td / "drg_good.py").write_text(_GOOD_SRC)
@@ -1567,6 +1604,41 @@ def self_check() -> int:
         _r = _f(_lg, _al, _td / "p", _now)
         ok.append(("a per-session loop alarm undelivered for > 7 days is listed as stale, not ADVERSE forever",
                    _r["adverse"] == 0 and _r["stale_loop_alarms"] == ["loop:s-9"]))
+
+    # v5.5 declared-class promotion review: overdue without a recorded decision is ADVERSE; recorded, or before the
+    # window ends, is not; the adoption figure is computed from the adv-declared rows (both polarities).
+    with _tf6.TemporaryDirectory() as _td:
+        _td = Path(_td)
+        (_td / "drg_good.py").write_text(_GOOD_SRC)
+        (_td / "p" / "s").mkdir(parents=True)
+        (_td / "p" / "s" / "a.jsonl").write_text("{}\n")
+        _late = DRG_DECLARED_WINDOW_END + timedelta(days=2)
+        _lg = _td / "g.jsonl"
+        _lg.write_text("".join(json.dumps({"timestamp": (_late - timedelta(minutes=m)).isoformat(), "outcome": o,
+                                           "detail": dt}) + "\n" for m, o, dt in
+                               [(4, "adv-declared-debt-scan-capped", "simplify: 5000 newest runs scanned"),
+                                (3, "adv-declared-fail", "closure handoff class=undeclared: x"),
+                                (2, "adv-declared-pass", "closure reflexion class=covered: y"),
+                                (1, "clean", "")]))
+        _pf = lambda dec: outcome_drg_gate_silent_or_alarm_undelivered(
+            _lg, _td / "none.json", _td / "p", _late, _td / "drg_good.py", dec)
+        _r = _pf(_td / "no-decision.json")
+        ok.append(("v5.5 promotion review overdue with no decision is ADVERSE and reports adoption 50%",
+                   _r["adverse"] == 1 and any("adoption 50%" in w for w in _r["where"])))
+        (_td / "decision.json").write_text('{"decision": "stay advisory"}')
+        ok.append(("v5.5 promotion review with a recorded decision is not ADVERSE",
+                   _pf(_td / "decision.json")["adverse"] == 0))
+        for _bad, _txt in (("empty", ""), ("keyless", "{}"), ("malformed", "{not json"), ("blank", '{"decision": ""}')):
+            (_td / f"{_bad}.json").write_text(_txt)
+            ok.append((f"v5.5 promotion decision file that is {_bad} does NOT count as a decision",
+                       _pf(_td / f"{_bad}.json")["adverse"] == 1))
+        ok.append(("v5.5 adoption excludes non-verdict adv-declared rows (debt-scan-capped) and reports per class",
+                   any("covered 1" in w and "undeclared 1" in w for w in _r["where"])))
+        _r = outcome_drg_gate_silent_or_alarm_undelivered(_lg, _td / "none.json", _td / "p",
+                                                          DRG_DECLARED_WINDOW_END - timedelta(days=1),
+                                                          _td / "drg_good.py", _td / "no-decision.json")
+        ok.append(("v5.5 promotion review before the window ends raises nothing",
+                   not any("OVERDUE" in w for w in _r["where"])))
 
     # PRODUCER CONTRACT (delta review MEDIUM): writer-shaped patterns, both polarities, and the rename the
     # substring version let through ("disabled" -> "gate-off" while a comment and another writer still say it).
