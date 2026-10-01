@@ -928,7 +928,8 @@ DRG_CONTRACT = {
 # the adoption it measured. Record the decision by writing DRG_PROMOTION_DECISION as a JSON OBJECT with a non-empty "decision" value
 # (an empty, keyless, falsey or unparseable file does NOT count, and the row stays ADVERSE).
 DRG_DECLARED_WINDOW_END = datetime(2026, 10, 7, 23, 59, 59, tzinfo=ZoneInfo("America/Vancouver"))  # explicit, not host TZ
-DRG_PROMOTION_DECISION = Path.home() / ".claude" / "state" / "drg-v55-promotion-decision.json"
+_ADV_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+DRG_PROMOTION_DECISION =Path.home() / ".claude" / "state" / "drg-v55-promotion-decision.json"
 
 
 def drg_contract_missing(src: str) -> list[str]:
@@ -985,6 +986,7 @@ def outcome_drg_gate_silent_or_alarm_undelivered(log: Path | None = None, alarms
     newest_row, rows, corrupt = None, 0, 0
     adv_total = adv_undeclared = adv_fail = 0
     adv_by_class: dict = {}
+    adv_seen: set = set()
     if log.exists():
         try:
             with open(log, encoding="utf-8", errors="replace") as f:
@@ -1005,7 +1007,12 @@ def outcome_drg_gate_silent_or_alarm_undelivered(log: Path | None = None, alarms
                         newest_row = ts
                     _o = str(r.get("outcome") or "")
                     # ALLOWLIST of the gate's verdict rows (PASS/FAIL/DELEGATED); a denylist missed debt-scan-capped
-                    if _o in ("adv-declared-pass", "adv-declared-fail", "adv-declared-delegated"):
+                    # UNIQUE (session, segment) from REAL sessions only (session-end critique: 60% of rows came from
+                    # one looping session re-judging the same close, plus probe/port buckets with no session uuid)
+                    _sk = (str(r.get("session_id") or ""), str(r.get("detail") or ""))
+                    if (_o in ("adv-declared-pass", "adv-declared-fail", "adv-declared-delegated")
+                            and _ADV_UUID_RE.fullmatch(_sk[0]) and _sk not in adv_seen):
+                        adv_seen.add(_sk)
                         adv_total += 1
                         adv_undeclared += "class=undeclared" in str(r.get("detail") or "")
                         adv_fail += _o == "adv-declared-fail"
@@ -1614,12 +1621,16 @@ def self_check() -> int:
         (_td / "p" / "s" / "a.jsonl").write_text("{}\n")
         _late = DRG_DECLARED_WINDOW_END + timedelta(days=2)
         _lg = _td / "g.jsonl"
+        _s1, _s2 = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
         _lg.write_text("".join(json.dumps({"timestamp": (_late - timedelta(minutes=m)).isoformat(), "outcome": o,
-                                           "detail": dt}) + "\n" for m, o, dt in
-                               [(4, "adv-declared-debt-scan-capped", "simplify: 5000 newest runs scanned"),
-                                (3, "adv-declared-fail", "closure handoff class=undeclared: x"),
-                                (2, "adv-declared-pass", "closure reflexion class=covered: y"),
-                                (1, "clean", "")]))
+                                           "detail": dt, "session_id": sid}) + "\n" for m, o, dt, sid in
+                               [(7, "adv-declared-debt-scan-capped", "simplify: 5000 newest runs scanned", _s1),
+                                (6, "adv-declared-fail", "closure handoff class=undeclared: x", _s1),
+                                (5, "adv-declared-fail", "closure handoff class=undeclared: x", _s1),   # re-judged
+                                (4, "adv-declared-fail", "closure handoff class=undeclared: x", _s1),   # (loop)
+                                (3, "adv-declared-pass", "closure reflexion class=covered: z", "39996"),  # probe
+                                (2, "adv-declared-pass", "closure reflexion class=covered: y", _s2),
+                                (1, "clean", "", _s2)]))
         _pf = lambda dec: outcome_drg_gate_silent_or_alarm_undelivered(
             _lg, _td / "none.json", _td / "p", _late, _td / "drg_good.py", dec)
         _r = _pf(_td / "no-decision.json")
