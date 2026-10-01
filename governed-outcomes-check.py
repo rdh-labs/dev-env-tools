@@ -928,7 +928,7 @@ DRG_CONTRACT = {
 # the adoption it measured. Record the decision by writing DRG_PROMOTION_DECISION as a JSON OBJECT with a non-empty "decision" value
 # (an empty, keyless, falsey or unparseable file does NOT count, and the row stays ADVERSE).
 DRG_DECLARED_WINDOW_END = datetime(2026, 10, 7, 23, 59, 59, tzinfo=ZoneInfo("America/Vancouver"))  # explicit, not host TZ
-_ADV_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_ADV_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)   # any case (review)
 DRG_PROMOTION_DECISION =Path.home() / ".claude" / "state" / "drg-v55-promotion-decision.json"
 
 
@@ -1631,6 +1631,22 @@ def self_check() -> int:
                                 (3, "adv-declared-pass", "closure reflexion class=covered: z", "39996"),  # probe
                                 (2, "adv-declared-pass", "closure reflexion class=covered: y", _s2),
                                 (1, "clean", "", _s2)]))
+        # pair semantics (review): one session, two DISTINCT details count twice; two sessions sharing ONE detail count
+        # twice; an UPPERCASE uuid is a real session. Expected: 6 unique pairs, 3 undeclared -> adoption 50%.
+        _s3 = "33333333-3333-4333-8333-33333333AAAA"
+        _lg2 = _td / "g2.jsonl"
+        _lg2.write_text("".join(json.dumps({"timestamp": (_late - timedelta(minutes=m)).isoformat(), "outcome": o,
+                                            "detail": dt, "session_id": sid}) + "\n" for m, o, dt, sid in
+                                [(6, "adv-declared-fail", "closure handoff class=undeclared: a", _s1),
+                                 (5, "adv-declared-pass", "closure reflexion class=covered: b", _s1),
+                                 (4, "adv-declared-fail", "closure handoff class=undeclared: a", _s2),
+                                 (3, "adv-declared-pass", "closure reflexion class=covered: b", _s2),
+                                 (2, "adv-declared-fail", "closure handoff class=undeclared: a", _s3),
+                                 (1, "adv-declared-pass", "closure reflexion class=covered: c", _s3)]))
+        _r2 = outcome_drg_gate_silent_or_alarm_undelivered(_lg2, _td / "none.json", _td / "p", _late, _td / "drg_good.py",
+                                                           _td / "no-decision.json")
+        ok.append(("v5.5 adoption dedupes by the (session, detail) PAIR and accepts uppercase uuids",
+                   any("6 declared-segment rows" in w and "adoption 50%" in w for w in _r2["where"])))
         _pf = lambda dec: outcome_drg_gate_silent_or_alarm_undelivered(
             _lg, _td / "none.json", _td / "p", _late, _td / "drg_good.py", dec)
         _r = _pf(_td / "no-decision.json")
