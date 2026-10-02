@@ -326,6 +326,24 @@ def self_check() -> int:
         with contextlib.redirect_stdout(buf):
             phrase_counts(allp, [PH], 30, True, root)
         res = json.loads(buf.getvalue())
+        # The share here is 2/5 = 40 %: at the threshold, just above it, no threshold, and JSON.
+        def _alert(threshold, as_json):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = phrase_counts(allp, [PH], 30, as_json, root, alert_above=threshold)
+            return rc, out.getvalue()
+        rc_at, out_at = _alert(0.40, False)
+        rc_below, out_below = _alert(0.41, False)
+        rc_none, out_none = _alert(None, False)
+        rc_js, out_js = _alert(0.40, True)
+    ok.append(("paste alert: share at the threshold is ADVERSE (rc 1, a line starting 'ADVERSE:')",
+               rc_at == 1 and "\nADVERSE:" in "\n" + out_at))
+    ok.append(("paste alert: share below the threshold is within criterion (rc 0, no ADVERSE line)",
+               rc_below == 0 and "ADVERSE:" not in out_below))
+    ok.append(("paste alert: no threshold says it cannot fail (rc 0)",
+               rc_none == 0 and "NO DEFINED FAILURE CRITERION" in out_none))
+    ok.append(("paste alert: JSON lists the adverse phrase and returns 1",
+               rc_js == 1 and json.loads(out_js)["adverse"] == [PH]))
     ok.append(("paste mode: population is top-level session files only (nested subagent excluded)",
                res["population"] == 5))
     ok.append(("paste mode: human pastes count ONCE per session (typed s1 + MID-TURN queued s4); peer, "
@@ -413,7 +431,8 @@ def self_check() -> int:
     return 1 if bad else 0
 
 
-def phrase_counts(paths: list, phrases: list, since_days: int, as_json: bool, root: Path | None = None) -> int:
+def phrase_counts(paths: list, phrases: list, since_days: int, as_json: bool, root: Path | None = None,
+                  alert_above: float | None = None) -> int:
     """PASTE-COUNT MODE — sessions whose OWN-WORDS user text contains each fixed string.
 
     WHY (2026-09-29, session 1bdb029f): every ~/.claude/rules/*.md file states its baseline and effect
@@ -445,17 +464,36 @@ def phrase_counts(paths: list, phrases: list, since_days: int, as_json: bool, ro
             if ph in text:
                 hits[ph] += 1
     win = f"last {since_days}d" if since_days else "all time"
+    # FAILURE CRITERION (2026-10-02, session 01a58447, plan PB-6): the weekly cron used the marker
+    # "highest", which the rate mode prints on EVERY run, so the check was adverse 5/5 weeks and carried
+    # no information. A phrase whose session share is >= alert_above is ADVERSE. The rules/*.md files
+    # state the target (<= 10 % of sessions by 2026-10-21), so cron passes 0.10.
+    adverse = [ph for ph, n in hits.items() if sessions and is_adverse(n / len(sessions), alert_above)]
     if as_json:
         print(json.dumps({"population": len(sessions), "window": win, "unit": "sessions (own-words user "
-                          "text, is_human_row, incl. mid-turn queued_command)", "counts": hits}, indent=2))
-        return 0 if sessions else 2        # nothing measured is not a zero (review LOW)
+                          "text, is_human_row, incl. mid-turn queued_command)", "counts": hits,
+                          "alert_above": alert_above, "adverse": adverse}, indent=2))
+        if not sessions:
+            return 2                       # nothing measured is not a zero (review LOW)
+        return 1 if adverse else 0
     print(f"PASTE COUNT — population: {len(sessions)} top-level session transcript(s), {win}; "
           f"nested subagent transcripts excluded")
     print(f"  unit: sessions whose OWN-WORDS user text contains the fixed string ({DEFINITION[:60]}…)")
     for ph, n in hits.items():
         share = f"{n / len(sessions):.1%}" if sessions else "n/a"
         print(f"  {n:5d}  ({share})  {ph[:70]!r}")
-    return 0 if sessions else 2
+    if not sessions:
+        return 2
+    if alert_above is None:
+        print("  no --alert-above set: NO DEFINED FAILURE CRITERION, so this run cannot fail.")
+        return 0
+    if adverse:
+        for ph in adverse:
+            print(f"ADVERSE: {hits[ph] / len(sessions):.1%} of sessions pasted {ph[:60]!r} "
+                  f"(>= threshold {alert_above:.0%})")
+        return 1
+    print(f"  within criterion: every phrase < {alert_above:.0%} of sessions")
+    return 0
 
 
 def main() -> int:
@@ -479,6 +517,8 @@ def main() -> int:
                          "print the ADVERSE: marker. Without it this tool has no defined "
                          "failure condition and its consumer cannot distinguish good from bad.")
     args = ap.parse_args()
+    if args.alert_above is not None and not 0 < args.alert_above <= 1:
+        ap.error("--alert-above must be a fraction in (0, 1]; 0 flags every phrase and >1 never fires")
 
     if args.self_check:
         print("USER CORRECTION RATE: self-check")
@@ -524,7 +564,7 @@ def main() -> int:
             return 2
 
     if args.phrase:
-        return phrase_counts(paths, args.phrase, args.since_days, args.json)
+        return phrase_counts(paths, args.phrase, args.since_days, args.json, alert_above=args.alert_above)
 
     rows = []
     for p in paths:
