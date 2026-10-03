@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# BUDGET: 3600
+# (DEC-366 pilot budget for scheduled-check-runner, artifact-sweep at 07:00/19:00; measured 2026-09-02..10-02:
+#  p50 84 s over 47 runs; the only 3 runs past 30 min (7,224 s, 32,626 s, 3,740 s) were all adverse rc 1.
+#  The same file backs gate-ledger-archive, which is not enabled in the pilot and is unaffected.)
 """Compare a session's EPHEMERAL /tmp artifacts against its DURABLE rescue directory.
 
 WHY: on 2026-08-11 a rescue globbed `*.md` and `*.txt` only. Three `.py` analysis scripts —
