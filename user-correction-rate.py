@@ -59,8 +59,11 @@ PRIOR-ART:   Huang et al. ICLR 2024 (arXiv:2310.01798) on intrinsic self-correct
              route_ledger.py (promptSource); anomaly-initiation-rate.py (interaction-scoped measure).
 PROMOTION:   never blocking, by design: it measures the user, not an agent action, so there is
              nothing to gate. Its numbers feed decisions about promoting the rules' own gates.
-predicate-rung: occurrence -- --self-check (16 checks, including 2 provenance cases); a mutant without
-             the provenance filter fails both.
+predicate-rung: occurrence -- --self-check (it prints its own check count), including 2 provenance cases and 3
+             correction-JSON verdict cases. Mutants are run BY HAND, not by a checked-in runner: a mutant
+             without the provenance filter fails both provenance cases; a mutant with json_verdict forced to 0
+             fails "correction JSON: mean at the threshold returns 1" (witnessed 2026-10-07, session 7850c65d).
+             A shared mutation harness is tracked on the harness-consolidation Dart task (see ikXmHJ4VE4PZ).
 """
 from __future__ import annotations
 
@@ -218,6 +221,20 @@ def is_adverse(mean_rate: float | None, threshold: float | None) -> bool:
     return mean_rate >= threshold
 
 
+def windowed_mean(rows: list[dict]) -> tuple[list[dict], float | None]:
+    """(rated rows, mean per-session rate), shared by the text and JSON paths so their verdicts
+    cannot drift. Rows with a None rate are filtered explicitly (see the F1 note in main())."""
+    rated = [r for r in rows if r.get("correction_rate") is not None]
+    mean = sum(r["correction_rate"] for r in rated) / len(rated) if rated else None
+    return rated, mean
+
+
+def json_verdict(rows: list[dict], threshold: float | None) -> int:
+    """Exit code for --json: 1 when the windowed mean breaches --alert-above, else 0. Before
+    2026-10-07 the JSON path returned 0 unconditionally, so `--json --alert-above` could not fail."""
+    return 1 if is_adverse(windowed_mean(rows)[1], threshold) else 0
+
+
 def last_record_utc(path: Path) -> datetime | None:
     """Timestamp of the session's LAST record. mtime is a cheap PRE-filter only: a file can be
     touched without a new record, and norm-compliance-monitor.py documents mtime-vs-record drift
@@ -344,6 +361,16 @@ def self_check() -> int:
                rc_none == 0 and "NO DEFINED FAILURE CRITERION" in out_none))
     ok.append(("paste alert: JSON lists the adverse phrase and returns 1",
                rc_js == 1 and json.loads(out_js)["adverse"] == [PH]))
+    # Correction-rate mode's --json path used to return 0 before the threshold check (2026-10-07).
+    # Both polarities, plus the no-threshold case. Values are exact in binary (mean 0.25), so the
+    # at-threshold case does not depend on float rounding.
+    _jrows = [{"correction_rate": 0.375}, {"correction_rate": 0.125}, {"correction_rate": None}]
+    ok.append(("correction JSON: mean at the threshold returns 1 (the --json path can fail)",
+               json_verdict(_jrows, 0.25) == 1))
+    ok.append(("correction JSON: mean below the threshold returns 0",
+               json_verdict(_jrows, 0.375) == 0))
+    ok.append(("correction JSON: no threshold returns 0 (and None rates are skipped, not a crash)",
+               json_verdict(_jrows, None) == 0))
     ok.append(("paste mode: population is top-level session files only (nested subagent excluded)",
                res["population"] == 5))
     ok.append(("paste mode: human pastes count ONCE per session (typed s1 + MID-TURN queued s4); peer, "
@@ -582,8 +609,13 @@ def main() -> int:
 
     rows.sort(key=lambda r: r["correction_rate"] or 0, reverse=True)
     if args.json:
+        # --json used to `return 0` BEFORE the threshold check, so `--json --alert-above X` could
+        # never fail: a flag combination that silently disabled the failure criterion (found
+        # 2026-10-07, session 7850c65d review leg; Dart g3Oaz2ifW7rx E5). Paste mode's JSON path
+        # already honoured the threshold; this makes the two modes agree. The JSON schema (a list
+        # of rows) is unchanged for existing readers; the verdict travels in the exit code.
         print(json.dumps(rows, indent=2))
-        return 0
+        return json_verdict(rows, args.alert_above)
 
     print(f"USER CORRECTION RATE — {len(rows)} session(s) with >=5 user messages")
     print(f"  (shorter sessions excluded: too few messages for the rate to mean anything)")
@@ -624,8 +656,7 @@ def main() -> int:
     # guard above means total >= 5, so measure() never takes its `else None` branch. That is an
     # IMPLICIT invariant across two distant lines; lower the threshold to 0 and this becomes a
     # TypeError. Filter explicitly rather than rely on the coupling.
-    rated = [r for r in rows if r["correction_rate"] is not None]
-    mean = sum(r["correction_rate"] for r in rated) / len(rated) if rated else None
+    rated, mean = windowed_mean(rows)
     win = f"last {args.since_days}d" if args.since_days else "all time"
     print(f"\n  windowed mean rate ({win}): "
           f"{mean:.0%} over {len(rated)} session(s)" if mean is not None else "  no rows")
