@@ -19,6 +19,7 @@ Exit 0 when conversion >= THRESHOLD or with --report-only; 1 below it; 2 on unre
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -178,12 +179,20 @@ def parse_jsonl(text: str, repo: Path | None) -> list[tuple[str, str]]:
 
 
 # ── repo-qualified pointer grading ────────────────────────────────────────────────────
-LEDGER_REPOS = {
-    "bin":            Path.home()/"bin",
-    "share":          Path.home()/"dev/share",
-    "tools":          Path.home()/"dev/infrastructure/tools",
-    "dev-env-config": Path.home()/"dev/infrastructure/dev-env-config",
-}
+# The repo map is SHARED (~/bin/lib/anomaly_repos.py) with anomaly-log (the writer) and
+# anomaly-ledger-report (the reader). This file's own copy held 4 of 8 repos, so every
+# security-tooling, dev-env-docs, memory or workflows closure graded PROSE: a built hook fix counted
+# as no fix (2026-10-07, Dart 0VNuvUixexrh, shape S9). ANOMALY_REPOS_LIB points the suite at a
+# candidate or mutant lib; a missing lib is CANNOT-ASSESS (exit 2), never a silent PROSE.
+_REPOS_LIB = os.environ.get("ANOMALY_REPOS_LIB", str(Path.home()/"bin/lib"))
+if _REPOS_LIB not in sys.path:
+    sys.path.insert(0, _REPOS_LIB)
+try:
+    import anomaly_repos  # noqa: E402
+except ImportError as _e:
+    print(f"CANNOT-ASSESS: anomaly_repos not importable from {_REPOS_LIB} ({_e})", file=sys.stderr)
+    sys.exit(2)
+LEDGER_REPOS = anomaly_repos.repos()
 HEARTBEAT = Path.home()/".metrics/scheduled-check-heartbeat.jsonl"
 _PROMOTED_BY: dict = {}   # spec -> the changed file that earned BUILT (audit trail for the over-count above)
 
