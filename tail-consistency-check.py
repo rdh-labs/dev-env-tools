@@ -65,7 +65,8 @@ DISPOSITION_RE = re.compile(
 
 # An imperative aimed at the user, i.e. an actual assignment.
 IMPERATIVE = re.compile(
-    r"\b(run|read|install|decide|confirm|approve|tell me|say the word|paste|check)\b", re.I)
+    r"\b(run|read|install|decide|confirm|approve|tell me|say the word|paste|check"
+    r"|start (?:session|the session|a (?:new|fresh) session)|switch to|resume from)\b", re.I)
 
 # DECLARATIVE assignment — the recall gap found 2026-08-12 by running this tool on its own
 # author's tail. `You: Nothing — R2 is the only item needing your decision` passed clean:
@@ -79,9 +80,23 @@ ASSIGNS_TO_USER = re.compile(
     r"|\bfor\s+you\s+to\s+(?:decide|approve|choose)", re.I)
 
 
+def _unfenced(text: str) -> str:
+    """Text with fenced lines removed (``` and ~~~ toggles). Under the 2026-10-09 tail order a launch block
+    (a fence) sits ABOVE Done:, and a line inside it such as 'You are resuming ...' is not the tail."""
+    out, in_fence = [], False
+    for line in text.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            out.append(line)
+    return "\n".join(out)
+
+
 def field(text: str, name: str) -> str | None:
-    m = re.search(rf"^\s*\**{re.escape(name)}\**\s*:?\s*(.+)$", text, re.I | re.M)
-    return m.group(1).strip() if m else None
+    """The LAST unfenced line labelled `name`: the final Done/Open/Sessions/You block is the tail."""
+    found = list(re.finditer(rf"^\s*\**{re.escape(name)}\**\s*:?\s*(.+)$", _unfenced(text), re.I | re.M))
+    return found[-1].group(1).strip() if found else None
 
 
 def check(text: str) -> tuple[list[str], bool]:

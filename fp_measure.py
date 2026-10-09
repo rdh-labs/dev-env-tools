@@ -276,6 +276,25 @@ def _a94_evidence(text: str) -> list[str]:
     return out
 
 
+# ── a14g / a14h (session 780cdf81, 2026-10-09): closing orientation, shared/tail_order.py ─────────────────
+# Registered for MEASUREMENT. a14h is advisory permanently; a14g may be promoted only when its artifact is fully
+# labelled with zero confirmed FP, and then it is wired into evidence_gate._fp_streams (plan peppy-marble step 5).
+# Guarded import: if the module is absent (an older dev-env-config checkout), the two ids are simply not
+# registered and that is SAID on stderr, so the rest of this tool keeps working and the gap is visible.
+try:
+    sys.path.insert(0, str(Path.home() / "dev/infrastructure/dev-env-config/claude/hooks"))
+    from shared import tail_order as _tail_order  # noqa: E402
+except ImportError as _e:  # pragma: no cover - depends on the checkout
+    _tail_order = None
+    print(f"fp_measure: a14g/a14h not registered (shared.tail_order unavailable: {_e})", file=sys.stderr)
+
+
+def _tail_evidence(findings, text: str) -> list[str]:
+    """The exact line each finding names, verbatim, so the excerpt CONTAINS what fired."""
+    lines = text.splitlines()
+    return [lines[f.line].strip() for f in findings if 0 <= f.line < len(lines) and lines[f.line].strip()]
+
+
 EVIDENCE_EXTRACTORS: dict[str, tuple[Callable[[str], list[str]], str]] = {
     "a94": (_a94_evidence, "scanned-region"),
     "a14c": (_a14c_evidence, "matched-span"),
@@ -392,6 +411,31 @@ SCANNER_PREDICATES: dict[str, tuple[Callable[[str], bool], list[re.Pattern], str
         None,  # no single necessary substring covers all 3 trigger phrases; full scan
     ),
 }
+
+
+if _tail_order is not None:
+    _T = _tail_order
+    # Non-regex settings are bound into the fingerprint as a synthetic pattern: changing any of them voids a
+    # stored artifact exactly as a regex edit does.
+    # The module SOURCE hash too: a control-flow edit in _order/_wording (no regex changed) must also void a stored
+    # zero-FP artifact before any promotion (review L3).
+    import hashlib as _hl
+    try:
+        _src = Path(_T.__file__).read_bytes() + Path(_T.fence_line_mask.__code__.co_filename).read_bytes()
+    except OSError as _oe:   # never crash fp_measure at import; an unreadable source just voids nothing
+        print(f"fp_measure: tail_order source hash unavailable ({_oe})", file=__import__("sys").stderr)
+        _src = b"unreadable"
+    _TAIL_CONSTS_RE = re.compile(f"budget={_T.BUDGET_ROWS};width={_T.ROW_WIDTH};min={_T.MIN_CHARS};"
+                                 f"youcont={_T.MAX_YOU_CONTINUATION};src={_hl.sha256(_src).hexdigest()[:16]}")
+    _TAIL_SHARED = [_T.HANDOFF_RE, _T.TAIL_LABEL_RE, _T.AFTER_TAIL_LABEL_RE, _T.SOURCES_RE, _TAIL_CONSTS_RE]
+    for _sid, _idx, _pats, _pre in (
+        ("a14g", 0, [_T.SESSIONS_LINE_RE, _T.LAUNCH_RE, _T.LAUNCH_NAME_RE, _T.NEXT_LABEL_RE, _T.SESSIONS_NEXT_RE],
+         None),                                  # Done:/Open:/You: casing and bold vary; full scan
+        ("a14h", 1, [_T.YOU_LINE_RE, _T.LIST_ITEM_RE, _T.OFFER_RE, _T.TIMING_RE, _T.CHOICE_TOKEN_RE,
+                     _T.SESSIONS_LINE_RE], "you:"),   # a You: line is a NECESSARY condition of firing
+    ):
+        SCANNER_PREDICATES[_sid] = ((lambda t, i=_idx: bool(_T.analyze(t)[i])), _TAIL_SHARED + _pats, _pre)
+        EVIDENCE_EXTRACTORS[_sid] = ((lambda t, i=_idx: _tail_evidence(_T.analyze(t)[i], t)), "matched-span")
 
 
 # ── Corpus walk ──────────────────────────────────────────────────────────────
