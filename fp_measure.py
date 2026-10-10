@@ -519,14 +519,49 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
     total_scanned = 0
     files_scanned = 0
     parse_failures = 0
+    read_errors = 0
+    files_prefiltered = 0
+    # PREFILTER AUDIT (2026-10-10, session 780cdf81). A prefilter is only a speedup if it is a
+    # NECESSARY condition of firing, and until now that was asserted by a comment alone. The
+    # a14h/a14c prefilter "you:" is NOT necessary per line (YOU_LINE_RE accepts "**You**:",
+    # "You :", "You need to:"); a full differential over 3,183 files found 0 lost fires only
+    # because the test is per FILE. So every Nth skipped file is parsed and judged; any fire
+    # there makes the run refuse to write, and the counts go into the artifact so a reader never
+    # mistakes "files scanned < total" for truncation (the misreading that produced this fix).
+    # SAMPLED by default (every 10th skipped file): a cheap tripwire, not a proof. Set
+    # FP_PREFILTER_AUDIT_EVERY=1 for a complete audit; the artifact records which one ran.
+    _audit_env = os.environ.get("FP_PREFILTER_AUDIT_EVERY", "10")
+    try:
+        audit_every = int(_audit_env)
+    except ValueError:
+        audit_every = 0
+    if audit_every < 1:
+        raise RuntimeError(f"FP_PREFILTER_AUDIT_EVERY must be a positive integer, got {_audit_env!r}")
+    audit_files = 0
+    audit_fires = 0
+    audit_fire_files = 0
+    audit_parse_failures = 0
+    audit_examples: list[str] = []
     fires: list[dict] = []
     for fp in files:
         try:
             with open(fp, encoding="utf-8", errors="replace") as fh:
                 raw = fh.read()
         except OSError:
+            read_errors += 1
             continue
         if prefilter_re is not None and not prefilter_re.search(raw):
+            files_prefiltered += 1
+            if files_prefiltered % audit_every == 0:
+                audit_files += 1
+                skipped_texts, skipped_failed = _assistant_texts_from_raw(raw)
+                audit_parse_failures += skipped_failed
+                hit = sum(1 for t in skipped_texts if t and predicate(t))
+                if hit:
+                    audit_fires += hit
+                    audit_fire_files += 1
+                    if len(audit_examples) < 5:
+                        audit_examples.append(os.path.basename(fp))
             continue   # necessary-condition skip (case-insensitive substring) — no JSON parse
         files_scanned += 1
         texts, failed = _assistant_texts_from_raw(raw)
@@ -564,6 +599,12 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
                     "label": "unlabeled",   # reviewer sets TP / FP
                     "rationale": "",
                 })
+    if audit_fires:
+        raise RuntimeError(
+            f"{scanner_id}: prefilter {prefilter!r} is NOT a necessary condition: the predicate "
+            f"fired {audit_fires} time(s) in {audit_fire_files} audited file(s) the prefilter "
+            f"skipped (e.g. {audit_examples}). The fire count would be an undercount. Widen the "
+            f"prefilter in SCANNER_PREDICATES (or set it to None) and re-run.")
     art = {
         "scanner_id": scanner_id,
         "schema_v": SCHEMA_V,
@@ -580,6 +621,22 @@ def measure(scanner_id: str, corpus_glob: str = CORPUS_GLOB) -> dict:
         "sidechain_policy": SIDECHAIN_POLICY,
         "corpus_files_total": len(files),
         "corpus_files_scanned": files_scanned,
+        # total = scanned + prefiltered + read_errors. A prefiltered file was read and judged
+        # unable to fire by the prefilter, not lost. prefilter_audit says how far that was
+        # checked: "complete" only when every skipped file was audited (EVERY=1); otherwise a
+        # sampled tripwire, which can miss a hidden fire (test_mutant_unaudited_skip_...).
+        "prefilter": prefilter,
+        "corpus_files_prefiltered": files_prefiltered,
+        "corpus_read_errors": read_errors,
+        # "complete" is claimed only when every skipped file was audited AND parsed cleanly: an
+        # unparseable record is content the predicate never judged (both review legs, 2026-10-10).
+        "prefilter_audit": {"mode": ("none" if files_prefiltered == 0
+                                     else "sampled" if audit_files < files_prefiltered
+                                     else "complete_with_parse_failures" if audit_parse_failures
+                                     else "complete"),
+                            "every_nth_skipped": audit_every, "files_audited": audit_files,
+                            "fires_in_skipped": audit_fires,
+                            "parse_failures_in_audited": audit_parse_failures},
         "corpus_parse_failures": parse_failures,
         "corpus_size_responses": total_scanned,
         "fires_total": len(fires),
