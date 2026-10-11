@@ -95,6 +95,15 @@ PATTERNS = {
     "demanded_no_premature_conclusion": re.compile(r"DO NOT JUMP TO CONCLUSIONS", re.I),
     "demanded_multi_line_inquiry":      re.compile(r"(multiple|single) lines? of inquiry", re.I),
     "demanded_prior_art_check":         re.compile(r"reinvent the wheel", re.I),
+    # Added 2026-10-10 (session d26c9f40, plan estate-defaults bundle 2). Four rules files name this counter as
+    # their effect measure (claude/rules/{investigation,self-healing,pm-provenance,session-closure}.md, "target
+    # <= 10 % of sessions issuing this block by 2026-10-21"); only the investigation block had a regex here, so
+    # three measures read 0 while the blocks were still pasted (their own headers: 46, 37 and 29 of ~76 transcripts
+    # on 2026-09-21). Each regex is a literal fragment of the user's pasted block, and the same string is what the
+    # rules bullet passes as --phrase, so ~/bin/rules-consumer-check can prove the measure is counted.
+    "demanded_self_healing":            re.compile(r"self-healing and self-optimization", re.I),
+    "demanded_pm_provenance":           re.compile(r"program management and portfolio management are all critical", re.I),
+    "demanded_session_closure":         re.compile(r"run all session closure processes", re.I),
 }
 
 
