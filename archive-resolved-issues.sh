@@ -151,13 +151,15 @@ cd "$HOME/dev/infrastructure/dev-env-docs"
 
 if ! git diff --quiet ISSUES-TRACKER.md archive/governance/ISSUES-TRACKER-archive.md 2>/dev/null; then
     count=$(git diff --stat HEAD -- ISSUES-TRACKER.md | grep -oP '\d+(?= deletion)' || echo "?")
-    git add ISSUES-TRACKER.md archive/governance/ISSUES-TRACKER-archive.md
-    git commit -m "chore: archive resolved issues from ISSUES-TRACKER.md (monthly maintenance)
+    # Commit ONLY these two paths (Dart dGlSfsnPdPpv H2): `git add` + a bare `git commit` committed
+    # the whole shared index, so anything a peer session had staged in dev-env-docs rode along.
+    # Both paths are tracked, so `--only -- <paths>` takes their working-tree content directly.
+    git commit --only -m "chore: archive resolved issues from ISSUES-TRACKER.md (monthly maintenance)
 
 Automated archival of RESOLVED and ISSUE-R entries. Keeps tracker under
 the 470KB pre-commit warning threshold. See ISSUE-2060.
 
-Co-Authored-By: archive-resolved-issues.sh (automated)"
+Co-Authored-By: archive-resolved-issues.sh (automated)" -- ISSUES-TRACKER.md archive/governance/ISSUES-TRACKER-archive.md
     git push
     echo "Committed and pushed."
     ~/bin/notify.sh "ISSUES-TRACKER Archival" "Archived resolved issues. Tracker now $(wc -c < "$TRACKER") bytes." --priority low --channel auto 2>/dev/null || true
